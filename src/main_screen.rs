@@ -18,14 +18,9 @@ pub struct MainScreenPlugin;
 impl Plugin for MainScreenPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TooltipPlugin);
-        app.add_systems(Startup, setup_camera);
         app.add_systems(OnEnter(Screen::Main), setup_ui);
         app.add_systems(OnEnter(Screen::Help), setup_help);
     }
-}
-
-fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2d);
 }
 
 fn setup_ui(mut commands: Commands) {
