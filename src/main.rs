@@ -1,7 +1,8 @@
 use bevy::{feathers::FeathersPlugins, prelude::*};
 
-use crate::screens::ScreenPlugin;
+use crate::{camera::CameraPlugin, screens::ScreenPlugin};
 
+mod camera;
 mod gameplay;
 mod main_screen;
 mod screens;
@@ -12,6 +13,7 @@ fn main() -> AppExit {
         .add_plugins((
             DefaultPlugins.set(ImagePlugin::default_nearest()),
             FeathersPlugins,
+            CameraPlugin,
             ScreenPlugin,
         ))
         .run()
