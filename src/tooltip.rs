@@ -130,7 +130,6 @@ pub fn spawn_tooltip(
                             row.spawn((
                         clickable_text(
                             FeathersButtonProps::default(),
-                            (),
                             Spawn((
                                 Text::new(tooltip.name.as_str()),
                                 TextFont::from_font_size(font_size),
@@ -179,9 +178,8 @@ pub fn spawn_tooltip(
     stack.push((entity, closable));
 }
 
-pub fn clickable_text<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bundle>(
+pub fn clickable_text<C: SpawnableList<ChildOf> + Send + Sync + 'static>(
     props: FeathersButtonProps,
-    overrides: B,
     children: C,
     asset_server: &AssetServer,
 ) -> impl Bundle {
@@ -198,7 +196,6 @@ pub fn clickable_text<C: SpawnableList<ChildOf> + Send + Sync + 'static, B: Bund
             font_size: FontSize::Px(14.0),
             ..Default::default()
         },
-        overrides,
         Children::spawn(children),
     )
 }
