@@ -5,9 +5,14 @@
 //! covers a disc and a road spans hundreds of tiles, so both are planned once
 //! the *whole* world exists and then written back over it as tile edits.
 //!
-//! The plan runs while the player is already walking around, so cities and roads
-//! appear chunk by chunk as each edit lands. It is a state machine over one
-//! session: wait for the terrain, plan the cities, then route the roads.
+//! The plan runs while the player is already walking around, so rivers, cities
+//! and roads appear chunk by chunk as each edit lands. It is a state machine
+//! over one session: wait for the terrain, cut the rivers, plan the cities, then
+//! route the roads.
+//!
+//! The order is not arbitrary. Each stage is stamped into `WorldMap` before the
+//! next one is planned, and each takes its snapshot afterwards, so a city sees
+//! the rivers it must not pave and a road sees both.
 
 use bevy::{
     prelude::*,
@@ -17,10 +22,11 @@ use bevy::{
 use crate::{
     gameplay::{
         city::{City, CityMap, PlannedCity, plan_cities},
+        river::{RiverPlan, plan_rivers},
         road::{RoadNetwork, RoutedRoad, choose_pairs, route_road},
         terrain::TerrainConfig,
         world::{
-            BackgroundGeneration, DirtyChunks, WorldMap, WorldSnapshot, WorldSystems,
+            BackgroundGeneration, DirtyChunks, TileEdit, WorldMap, WorldSnapshot, WorldSystems,
             tile_translation,
         },
     },
@@ -74,6 +80,59 @@ pub struct WorldPlanConfig {
     /// 384 finding nothing more — so below ~192 the box, not the water, is what
     /// is turning pairs down.
     pub route_padding_tiles: u32,
+    /// What crossing one tile of river costs a road, in tiles of detour. A road
+    /// may cross a river where it may not cross the sea, because a river runs
+    /// from the mountains down to the sea and refusing it outright would cut the
+    /// continent into pieces the network cannot span.
+    ///
+    /// A crossing lays a `Road` tile like any other step, so the next route this
+    /// way sees road rather than river and pays the reuse discount instead of
+    /// this — which is what makes roads converge on the same crossings rather
+    /// than each fording the river wherever it happens to meet it.
+    pub road_river_crossing_penalty: f32,
+    /// The world is cut into squares this wide, each proposing at most one
+    /// spring. With `TerrainConfig::river_source_threshold` this is the lever on
+    /// how many rivers the world has, and it has to be pushed harder than it
+    /// looks: the elevation field's longest wavelength is about 25 tiles, so a
+    /// descent reaches water within a few steps and one spring per mountain
+    /// leaves the map bare.
+    ///
+    /// Measured on the default world, in share of tiles that end up river: 48
+    /// gives 0.011%, 24 gives 0.042%, 16 gives 0.090%, 12 gives 0.229% and 8
+    /// gives 0.360%. Roads cover 0.24%, which is the mark for "reads as a
+    /// feature of the map rather than as speckle".
+    pub river_source_cell_tiles: u32,
+    /// Tiles between lattice nodes when a particle descends. Anchored on the
+    /// world origin, so this is also the resolution at which two rivers merge
+    /// instead of running alongside each other.
+    pub river_step_tiles: u32,
+    /// How far a particle may walk before it is abandoned. A backstop against a
+    /// descent the terrain has talked into wandering, not a shape control.
+    pub river_max_steps: u32,
+    /// How many particles must cross a tile for its channel to widen by one.
+    ///
+    /// Low, and it has to be. Flow only accumulates where two descents meet, and
+    /// on this terrain they hardly ever do: at the default spacing the busiest
+    /// segment in the whole world carries 3 particles, so anything above 2 would
+    /// mean every river in the world came out one tile wide. Of ~11k segments,
+    /// 2 gives about 350 that are two tiles across and none wider — the width
+    /// machinery is right, but the landscape rarely feeds it. Long rivers with a
+    /// real hierarchy of tributaries would need an elevation field with
+    /// something longer than a 25-tile wavelength in it.
+    pub river_flow_per_width: u32,
+    /// A basin that spills before it holds this much water leaves no lake at
+    /// all. Load-bearing: fbm at this stride is full of dips a tile or two deep,
+    /// and a pond at every one of them would turn each river into a string of
+    /// beads.
+    pub river_lake_min_tiles: u32,
+    /// A basin that has not found a way out by this size is a closed lake, and
+    /// the river feeding it ends there. This is what stops one unlucky basin
+    /// from flooding half a continent.
+    pub river_lake_max_tiles: u32,
+    /// How many chunks of river are stamped into the world per frame. Doing the
+    /// whole world in one frame would be a visible stall; spread out, it is the
+    /// rivers filling in across the map, which is worth watching.
+    pub river_chunks_stamped_per_frame: u32,
 }
 
 impl Default for WorldPlanConfig {
@@ -88,6 +147,14 @@ impl Default for WorldPlanConfig {
             road_elevation_penalty: 400.0,
             road_reuse_discount: 0.25,
             route_padding_tiles: 192,
+            road_river_crossing_penalty: 60.0,
+            river_source_cell_tiles: 12,
+            river_step_tiles: 4,
+            river_max_steps: 2048,
+            river_flow_per_width: 2,
+            river_lake_min_tiles: 64,
+            river_lake_max_tiles: 512,
+            river_chunks_stamped_per_frame: 64,
         }
     }
 }
@@ -100,9 +167,26 @@ impl Default for WorldPlanConfig {
 #[derive(Resource)]
 pub enum WorldPlan {
     WaitingForTerrain,
+    Rivers(RiverStamping),
     Cities(Task<Vec<PlannedCity>>),
     Roads(RoadPlanning),
     Done,
+}
+
+/// The river stage's working set.
+///
+/// One task cuts every river in the world at once — unlike a road, a river needs
+/// nothing from the river before it, since the particles share their flow
+/// through the lattice rather than through the map. What cannot be done at once
+/// is the *stamping*: a world of rivers is on the order of 10^5 edits, so they
+/// are written a batch of chunks at a time and the map fills in over about a
+/// second of play.
+pub struct RiverStamping {
+    in_flight: Option<Task<RiverPlan>>,
+    /// Chunks still to stamp. Reversed on arrival so that `pop` yields them in
+    /// chunk order, and the fill sweeps the world one way rather than jumping
+    /// about.
+    pending: Vec<Vec<TileEdit>>,
 }
 
 /// The road stage's working set.
@@ -141,7 +225,12 @@ impl Plugin for WorldPlanPlugin {
         app.add_systems(OnExit(Screen::Gameplay), tear_down_plan);
         app.add_systems(
             Update,
-            (start_city_plan, apply_city_plan, drive_road_plan)
+            (
+                start_river_plan,
+                apply_river_plan,
+                apply_city_plan,
+                drive_road_plan,
+            )
                 .chain()
                 .in_set(WorldSystems::Planning),
         );
@@ -160,9 +249,9 @@ fn tear_down_plan(mut commands: Commands) {
     commands.remove_resource::<RoadNetwork>();
 }
 
-/// Hands the finished world to the city planner, once there is a finished world
-/// to hand over.
-fn start_city_plan(
+/// Hands the finished world to the river planner, once there is a finished world
+/// to hand over. This is the first stage, so it is what the whole plan waits on.
+fn start_river_plan(
     mut plan: ResMut<WorldPlan>,
     map: Res<WorldMap>,
     generation: Res<BackgroundGeneration>,
@@ -181,6 +270,58 @@ fn start_city_plan(
     let terrain = terrain.clone();
     let config = config.clone();
 
+    let task =
+        AsyncComputeTaskPool::get().spawn(async move { plan_rivers(&terrain, &config, &world) });
+    *plan = WorldPlan::Rivers(RiverStamping {
+        in_flight: Some(task),
+        pending: Vec::new(),
+    });
+}
+
+/// Stamps the rivers a batch of chunks at a time, and opens the city stage once
+/// the last of them is down.
+///
+/// The city stage starts from here rather than from a system of its own, because
+/// the snapshot it plans against has to be the one *with* the rivers in it — a
+/// city must be clipped by a river the same way it is clipped by a coast.
+fn apply_river_plan(
+    mut plan: ResMut<WorldPlan>,
+    mut map: ResMut<WorldMap>,
+    mut dirty: ResMut<DirtyChunks>,
+    terrain: Res<TerrainConfig>,
+    config: Res<WorldPlanConfig>,
+) {
+    let WorldPlan::Rivers(state) = &mut *plan else {
+        return;
+    };
+
+    if let Some(task) = &mut state.in_flight {
+        let Some(planned) = block_on(poll_once(task)) else {
+            return;
+        };
+        state.in_flight = None;
+        state.pending = planned.by_chunk;
+        // Popped from the back, so reversing here is what makes the fill sweep
+        // the world in chunk order instead of backwards.
+        state.pending.reverse();
+    }
+
+    for _ in 0..config.river_chunks_stamped_per_frame.max(1) {
+        let Some(edits) = state.pending.pop() else {
+            break;
+        };
+        map.apply_edits(&edits, &mut dirty);
+    }
+
+    if !state.pending.is_empty() {
+        return;
+    }
+
+    let world = map
+        .snapshot()
+        .expect("the world was complete when the plan started");
+    let terrain = terrain.clone();
+    let config = config.clone();
     let task =
         AsyncComputeTaskPool::get().spawn(async move { plan_cities(&terrain, &config, &world) });
     *plan = WorldPlan::Cities(task);
@@ -288,7 +429,7 @@ fn drive_road_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gameplay::city::CitySize;
+    use crate::gameplay::{city::CitySize, terrain::TerrainKind};
 
     /// The whole plan, against the world the game actually generates.
     ///
@@ -301,7 +442,15 @@ mod tests {
     fn the_default_config_lays_out_cities_of_every_size_and_roads_between_them() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let world = WorldSnapshot::generated(&terrain);
+        let base = WorldSnapshot::generated(&terrain);
+
+        // The stages in the order the plan runs them: the cities are laid out
+        // over a world that already has its rivers, because that is the world
+        // the game plans them against.
+        let rivers = plan_rivers(&terrain, &config, &base);
+        let river_edits: Vec<TileEdit> = rivers.by_chunk.iter().flatten().copied().collect();
+        report_rivers(&base, &rivers, &river_edits);
+        let world = base.with_edits(&river_edits);
 
         let planned = plan_cities(&terrain, &config, &world);
         let cities: Vec<City> = planned.iter().map(|p| p.city).collect();
@@ -374,8 +523,8 @@ mod tests {
 
         let network = lay_roads(&terrain, &config, &world, &cities, &pairs);
         println!(
-            "{} of them got a road, {} tiles of road in all",
-            network.roads, network.tiles
+            "{} of them got a road, {} tiles of road in all, bridging a river {} times",
+            network.roads, network.tiles, network.crossings
         );
         assert!(network.roads > 0, "not one pair could be joined over land");
 
@@ -403,9 +552,43 @@ mod tests {
         );
     }
 
+    /// What the river stage produced, and the checks that only mean anything
+    /// against the world the game actually generates.
+    fn report_rivers(world: &WorldSnapshot, plan: &RiverPlan, edits: &[TileEdit]) {
+        let river = edits
+            .iter()
+            .filter(|edit| edit.kind == TerrainKind::River)
+            .count();
+        let lake = edits
+            .iter()
+            .filter(|edit| edit.kind == TerrainKind::ShallowWater)
+            .count();
+        println!(
+            "{river} tiles of river and {lake} of lake, across {} chunks — {} frames of stamping",
+            plan.by_chunk.len(),
+            plan.by_chunk
+                .len()
+                .div_ceil(WorldPlanConfig::default().river_chunks_stamped_per_frame as usize),
+        );
+        assert!(river > 0, "the world has no rivers at all");
+
+        // Water is cut into land: a channel over the sea would run a river
+        // through the middle of the ocean it is supposed to end at.
+        for edit in edits {
+            assert!(
+                !world.tile(edit.tile).expect("inside the world").is_water(),
+                "{} was already water",
+                edit.tile
+            );
+        }
+    }
+
     struct Network {
         roads: usize,
         tiles: usize,
+        /// Tiles of road laid over a river — every one of them a bridge, and the
+        /// only place `road_river_crossing_penalty` shows up in the result.
+        crossings: usize,
     }
 
     /// Walks the road stage the way the driver does — one road at a time, each
@@ -419,7 +602,11 @@ mod tests {
         pairs: &[(usize, usize)],
     ) -> Network {
         let mut world = world.clone();
-        let mut network = Network { roads: 0, tiles: 0 };
+        let mut network = Network {
+            roads: 0,
+            tiles: 0,
+            crossings: 0,
+        };
 
         // From the back, which is the longest first — the same order the queue
         // is popped in, and the order that decides which roads become trunks.
@@ -428,13 +615,18 @@ mod tests {
                 continue;
             };
             for edit in &road.edits {
+                let under = world.tile(edit.tile).expect("inside the world");
+                // The sea and a lake are refused outright; a river is bridged.
                 assert!(
-                    !world.tile(edit.tile).expect("inside the world").is_water(),
+                    !under.is_water(),
                     "road {}-{} crosses water at {}",
                     road.link.from,
                     road.link.to,
                     edit.tile
                 );
+                if under == TerrainKind::River {
+                    network.crossings += 1;
+                }
             }
             network.roads += 1;
             network.tiles += road.edits.len();

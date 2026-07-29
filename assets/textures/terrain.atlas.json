@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tile_size": 8,
-  "width_in_tiles": 7,
+  "width_in_tiles": 8,
   "height_in_tiles": 1,
   "palette": {
     "colors": [

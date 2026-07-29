@@ -373,9 +373,14 @@ fn search(
                 };
 
                 let climb = (elevation[node] - elevation[next]).abs();
+                // The crossing is charged on top of the discounted step rather
+                // than inside it: a bridge costs what it costs, and the fact
+                // that the approach runs on an existing road does not make the
+                // river any narrower.
                 let step = (here_position.as_vec2().distance(next_position.as_vec2())
                     + climb * config.road_elevation_penalty)
-                    * reuse_discount(&span, world, config.road_reuse_discount);
+                    * reuse_discount(&span, world, config.road_reuse_discount)
+                    + crossings(&span, world) as f32 * config.road_river_crossing_penalty;
                 let candidate = cost[node] + step;
                 if candidate >= cost[next] {
                     continue;
@@ -431,9 +436,24 @@ fn reuse_discount(span: &[IVec2], world: &WorldSnapshot, discount: f32) -> f32 {
     1.0 + reused * (discount - 1.0)
 }
 
+/// How many tiles of river a step fords.
+///
+/// A river is not `is_water`, so a route may cross one — a river runs from the
+/// mountains down to the sea, and refusing it the way the sea is refused would
+/// cut the continent into pieces the network could not span. It is charged for
+/// instead, which makes a road go a long way round to find a narrows and cross
+/// where an earlier road already has: a crossing lays a `Road` tile, so the next
+/// route this way finds road rather than river and pays the reuse discount
+/// instead of the crossing.
+fn crossings(span: &[IVec2], world: &WorldSnapshot) -> usize {
+    span.iter()
+        .filter(|&&tile| world.tile(tile) == Some(TerrainKind::River))
+        .count()
+}
+
 /// The tiles a straight run from `from` to `to` covers, or `None` if any of them
 /// is water. Checking the whole line and not just its ends is what keeps a road
-/// out of the water at tile resolution.
+/// out of the sea and out of a lake at tile resolution.
 fn walk_line(from: IVec2, to: IVec2, world: &WorldSnapshot) -> Option<Vec<IVec2>> {
     let delta = to - from;
     let steps = delta.x.abs().max(delta.y.abs());
