@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 
+mod city;
 mod noise;
+mod plan;
+mod road;
 mod terrain;
 mod world;
 

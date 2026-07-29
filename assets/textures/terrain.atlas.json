@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tile_size": 8,
-  "width_in_tiles": 6,
+  "width_in_tiles": 7,
   "height_in_tiles": 1,
   "palette": {
     "colors": [
@@ -216,7 +216,7 @@
         "a": 1.0
       }
     ],
-    "selected_index": 12
+    "selected_index": 19
   },
   "generated": {
     "ramps": [
