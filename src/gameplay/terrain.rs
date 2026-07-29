@@ -58,8 +58,8 @@ impl TerrainKind {
 ///
 /// The settlement and humidity figures are not read here at all — nothing in
 /// this module samples those fields. They live here because they describe the
-/// same landscape as the rest; [`crate::gameplay::city`] and
-/// [`crate::gameplay::river`] are their only readers.
+/// same landscape as the rest; [`crate::gameplay::city`],
+/// [`crate::gameplay::river`] and [`crate::gameplay::weather`] are their readers.
 #[derive(Resource, Clone)]
 pub struct TerrainConfig {
     pub seed: u32,
@@ -128,8 +128,10 @@ impl TerrainConfig {
         NoiseField::new(self.seed, SETTLEMENT_SALT, self.settlement_scale)
     }
 
-    /// How much rain falls. Read only by [`crate::gameplay::river`], to decide
-    /// which mountains are wet enough for a river to rise in them.
+    /// How much rain falls. Read by [`crate::gameplay::river`], to decide which
+    /// mountains are wet enough for a river to rise in them, and by
+    /// [`crate::gameplay::weather`], which bakes it into the map that says where the
+    /// clouds are — so it rains over the country the rivers rise in.
     pub fn humidity_field(&self) -> NoiseField {
         NoiseField::new(self.seed, HUMIDITY_SALT, self.humidity_scale)
     }

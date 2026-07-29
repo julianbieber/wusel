@@ -43,6 +43,53 @@ impl NoiseField {
     }
 }
 
+/// One fbm field that repeats exactly every `period` noise units in both axes.
+///
+/// The seam is the point: a field that tiles can be baked into a small texture and
+/// scrolled forever, which is how the weather overlay animates without evaluating
+/// any noise per fragment. Nothing in the terrain wants this — a world that repeats
+/// every few hundred tiles would be visible from the ground.
+pub struct TilingNoiseField {
+    offset: Vec2,
+    period: u32,
+    octaves: u32,
+}
+
+impl TilingNoiseField {
+    /// `period` must be a power of two: every octave wraps at `period * frequency`,
+    /// and with a lacunarity of 2 that is only an integer if `period` is one.
+    ///
+    /// `octaves` is a parameter here rather than the module's constant because the
+    /// field is baked into a texture: octaves finer than a couple of texels cannot
+    /// survive the sampling, and asking for them only buys aliasing.
+    pub fn new(seed: u32, salt: u32, period: u32, octaves: u32) -> Self {
+        debug_assert!(
+            period.is_power_of_two(),
+            "a tiling period must be a power of two"
+        );
+        let h = hash2(seed as i32, salt as i32);
+        Self {
+            offset: Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0),
+            period,
+            octaves,
+        }
+    }
+
+    /// Sample the field, remapped to [0, 1]. `u` and `v` are in noise units, of
+    /// which the field holds `period` before it repeats.
+    pub fn sample(&self, u: f32, v: f32) -> f32 {
+        let n = tiling_fbm(
+            u + self.offset.x,
+            v + self.offset.y,
+            self.period,
+            self.octaves,
+            NOISE_PERSISTENCE,
+            NOISE_LACUNARITY,
+        );
+        (0.5 + n * NOISE_GAIN * 0.5).clamp(0.0, 1.0)
+    }
+}
+
 /// Hash function to generate pseudo-random gradients from integer coordinates.
 /// No external crates — uses a simple bit-mixing hash.
 pub fn hash2(x: i32, y: i32) -> u32 {
@@ -75,6 +122,19 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 /// 2D gradient (Perlin-style) noise, returns values roughly in [-1, 1].
 pub fn gradient_noise_2d(x: f32, y: f32) -> f32 {
+    gradient_noise_with(x, y, gradient)
+}
+
+/// The same lattice, with the corner lookups wrapped, so the noise repeats every
+/// `period` units. Generic over the lookup so the untiled path above monomorphizes
+/// to exactly what it was before — this is the only interpolation in the crate.
+fn tiling_gradient_noise_2d(x: f32, y: f32, period: i32) -> f32 {
+    gradient_noise_with(x, y, |ix, iy| {
+        gradient(ix.rem_euclid(period), iy.rem_euclid(period))
+    })
+}
+
+fn gradient_noise_with(x: f32, y: f32, grad: impl Fn(i32, i32) -> (f32, f32)) -> f32 {
     let x0 = x.floor() as i32;
     let y0 = y.floor() as i32;
     let x1 = x0 + 1;
@@ -85,7 +145,7 @@ pub fn gradient_noise_2d(x: f32, y: f32) -> f32 {
 
     // Dot product of gradient and distance vector at each corner.
     let dot_grad = |ix: i32, iy: i32, dx: f32, dy: f32| -> f32 {
-        let (gx, gy) = gradient(ix, iy);
+        let (gx, gy) = grad(ix, iy);
         gx * dx + gy * dy
     };
 
@@ -126,4 +186,68 @@ pub fn fbm(
 
     // Normalize so output stays roughly in [-1, 1] regardless of octave count.
     total / max_amplitude
+}
+
+/// [`fbm`], with every octave's lattice wrapped so the sum repeats every `period`
+/// units. Octave `n` runs at `period * lacunarity^n` lattice cells, which is why the
+/// period has to be a power of two.
+pub fn tiling_fbm(
+    x: f32,
+    y: f32,
+    period: u32,
+    octaves: u32,
+    persistence: f32,
+    lacunarity: f32,
+) -> f32 {
+    let mut total = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut max_amplitude = 0.0;
+
+    for _ in 0..octaves {
+        let lattice_period = (period as f32 * frequency) as i32;
+        total += tiling_gradient_noise_2d(x * frequency, y * frequency, lattice_period) * amplitude;
+        max_amplitude += amplitude;
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+
+    total / max_amplitude
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam is the whole reason the field exists: the weather overlay bakes one
+    /// period into a texture and scrolls it forever, so a discontinuity at the wrap
+    /// would be a line marching across the sky.
+    #[test]
+    fn a_tiling_field_matches_itself_across_the_seam() {
+        let field = TilingNoiseField::new(0x5eed, 0xc10d, 8, 4);
+        let period = 8.0;
+
+        for i in 0..64 {
+            let t = i as f32 / 64.0 * period;
+            for (u, v) in [(t, 1.7), (1.7, t), (t, t)] {
+                assert!(
+                    (field.sample(u, v) - field.sample(u + period, v + period)).abs() < 1e-5,
+                    "the field does not repeat at ({u}, {v})"
+                );
+            }
+        }
+    }
+
+    /// Wrapping the lattice must not flatten the field into a constant — a tiling
+    /// field that is all one value would also "match across the seam".
+    #[test]
+    fn a_tiling_field_still_varies_across_its_period() {
+        let field = TilingNoiseField::new(0x5eed, 0xc10d, 8, 4);
+        let samples: Vec<f32> = (0..64)
+            .map(|i| field.sample(i as f32 / 8.0, 3.25))
+            .collect();
+        let min = samples.iter().copied().fold(f32::MAX, f32::min);
+        let max = samples.iter().copied().fold(f32::MIN, f32::max);
+        assert!(max - min > 0.2, "a tiling field spanning only {min}..{max}");
+    }
 }
