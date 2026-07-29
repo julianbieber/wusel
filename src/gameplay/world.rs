@@ -206,6 +206,17 @@ pub fn tile_translation(tile: IVec2) -> Vec2 {
     (tile.as_vec2() + Vec2::splat(0.5)) * TILE_DISPLAY_SIZE.as_vec2() - world_half_extent()
 }
 
+/// Where a world-space position sits in *continuous* global tile space: tile `t`
+/// covers `t..t + 1`, so a tile's centre comes back as `t + 0.5`.
+///
+/// The inverse of [`tile_translation`], and the only one of these conversions that
+/// keeps its fraction — the weather overlay needs to know where between two tiles a
+/// screen pixel falls, which [`chunk_at`] floors away. Not clamped: a caller that
+/// samples outside the world has to decide for itself what that means.
+pub fn tile_position_at(position: Vec2) -> Vec2 {
+    (position + world_half_extent()) / TILE_DISPLAY_SIZE.as_vec2()
+}
+
 /// How far the resident region has to reach to cover the screen, in chunks.
 ///
 /// Derived rather than fixed, because zooming out multiplies how much world is
@@ -708,6 +719,31 @@ mod tests {
         let far = world_half_extent() * 4.0;
         assert_eq!(chunk_at(far), WORLD_CHUNKS - UVec2::ONE);
         assert_eq!(chunk_at(-far), UVec2::ZERO);
+    }
+
+    /// The weather overlay maps screen pixels back to tile space to sample its
+    /// maps there, so an error in this conversion would slide the whole sky off
+    /// the terrain — and, because the maps are sampled clamped, would show up as a
+    /// flat sky rather than as anything that looks like a bug.
+    #[test]
+    fn a_tile_centre_converts_back_to_its_own_tile() {
+        for tile in [
+            IVec2::ZERO,
+            IVec2::splat(1),
+            WORLD_TILES.as_ivec2() / 2,
+            WORLD_TILES.as_ivec2() - IVec2::ONE,
+        ] {
+            let position = tile_position_at(tile_translation(tile));
+            assert_eq!(position.floor().as_ivec2(), tile);
+            assert!((position - tile.as_vec2() - Vec2::splat(0.5)).length() < 1e-3);
+        }
+    }
+
+    /// The camera sits at the origin on entering gameplay, and the maps are indexed
+    /// from the world's corner, so this is the offset that has to be there.
+    #[test]
+    fn the_origin_is_the_middle_of_tile_space() {
+        assert_eq!(tile_position_at(Vec2::ZERO), WORLD_TILES.as_vec2() / 2.0);
     }
 
     #[test]

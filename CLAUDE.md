@@ -50,6 +50,10 @@ and never despawned. The menus need it to render their UI and gameplay needs it 
 don't add a second one per screen. UI is laid out in screen space, so driving the camera around with
 WASD moves the world without disturbing anything on top of it.
 
+Because it outlives every screen, anything hung *on* the camera cannot use `DespawnOnExit` and has to
+be removed by hand — `gameplay/weather.rs` adds its `WeatherOverlay` on entering gameplay and takes it
+off on leaving, and the whole weather pass is gated on that component being there.
+
 Zoom is the orthographic scale, held to powers of two between `MIN_ZOOM_SCALE` and `MAX_ZOOM_SCALE`
 (0.25 to 4) by `+`/`-` or the wheel. Powers of two because the 8px tiles are drawn with nearest
 filtering and anything else makes them crawl; bounded because chunk entities cover the screen, so
@@ -91,7 +95,8 @@ generated. `the_terrain_never_produces_a_town_a_road_or_a_river` guards it.
 Everything is driven by the `TerrainConfig` resource — thresholds, scales, seed. Changing a default
 there will break `the_default_config_produces_every_base_kind`, which is the point: it guards against
 a config that quietly yields a single-biome world. The settlement figures live there but are read only
-by `gameplay/city.rs`, and the humidity ones only by `gameplay/river.rs`.
+by `gameplay/city.rs`, and the humidity ones by `gameplay/river.rs` and `gameplay/weather.rs` — the
+rivers rise where it rains and the clouds are drawn from the same field, which is why they agree.
 
 **The world is fine-grained, and it constrains what can be built on it.** `elevation_scale` is 0.04,
 so the *longest* wavelength in the elevation field is ~25 tiles: there are no continents and no
@@ -195,7 +200,69 @@ refresh at all: the edit went into `WorldMap`, so it is there when the chunk is 
 
 Three coordinate spaces are in play and the helpers at the top of the module are the only sanctioned
 way between them: chunk coordinates (`0..WORLD_CHUNKS`), global tile coordinates (what the noise is
-sampled in), and world space in pixels.
+sampled in), and world space in pixels. `tile_position_at` is the odd one out and the weather overlay
+is why: it is the only conversion that keeps its fraction, since a screen pixel falls *between* tiles.
+
+### Weather (`gameplay/weather.rs`, `assets/shaders/weather.wgsl`)
+
+Cloud patches drifting over the world, the shadow each throws, and rain in the thick of them. It is
+**cosmetic**: nothing here reads or writes `WorldMap`, so no tile can depend on the weather.
+
+Two baked textures and one full-screen pass, and the split is the design:
+
+- **Where** it is cloudy is `TerrainConfig::humidity_field()` — the same field the river springs read
+  — sampled over the whole world at one texel per 8 tiles. That map never moves, so a wet range is
+  reliably overcast and a dry one reliably clear.
+- **What** a cloud looks like is a second map holding one *tiling* period of the same noise
+  (`noise::TilingNoiseField`, whose seam `a_tiling_field_matches_itself_across_the_seam` guards). The
+  shader scrolls it at two scales and two speeds. That scrolling is the entire animation.
+
+So **the shader evaluates no noise**, and that is load-bearing twice over: an fbm per fragment, needed
+twice for cloud plus shadow, measures ~4 ms at 1080p and the whole frame at 4K on an iGPU; and it would
+put a second noise implementation in a crate whose determinism tests rest on there being one. Both maps
+are baked on `AsyncComputeTaskPool` (~50 ms) rather than in `OnEnter`, which already generates the
+first screenful of chunks unbudgeted. Until they land there is no `WeatherMaps` and the sky is clear —
+absence is the fallback, and it is deliberately clear rather than overcast.
+
+The field is anchored in **world** space. The view centre and half extent are filled in during
+`ExtractComponent`, from the camera itself, after the whole main-world frame — not by a system that
+races `camera.rs`'s pan. A frame of slip there would shear the sky 34 px against the terrain at
+`MIN_ZOOM_SCALE` for as long as you held a key, so it is worth knowing that no ordering protects this:
+the extract point does.
+
+Two things about the composite:
+
+- **A shadow is the cloud field one constant offset away**, so every cloud has exactly one — no second
+  field, nothing to keep in step. Within `shadow_offset_tiles` of the viewport border the cloud casting
+  a visible shadow is off screen, which is a property of the trick rather than a bug.
+- **Rain is cut on the raw field and multiplied by the density.** Cutting on the *density* instead
+  looks natural and is wrong: the density saturates, so nearly every cloud clears any cut placed on it
+  and it rained on 28.6% of the world at once. The multiply is what makes "no rain from a clear sky"
+  true for any setting of the knobs rather than only for ones whose cuts are ordered.
+
+`WeatherConfig` is a knob, so like `TerrainConfig` it outlives a session; `WeatherMaps`, `WeatherClock`
+and `WeatherBake` are world state and go on `OnExit`. The clock's offsets are wrapped to a map period
+rather than accumulated — unwrapped they quantize the streak phase after a few hours.
+
+Defaults carry their measurements, taken with the `#[ignore]`d `the_default_config_measures_the_sky`
+(`cargo test --release -- --ignored --nocapture`).
+
+### Weather shader coupling
+
+`WeatherUniform` in `weather.rs` and `WeatherUniform` in `weather.wgsl` are the same struct written
+twice: **field order is the binding layout**. Vectors are declared before scalars so std140 padding
+agrees on both sides, including under WebGL2. The shader is loaded by path at runtime, so a mismatch is
+a shader-compile failure when you enter gameplay, not a build error — and `just check-web` only
+type-checks Rust, so it will not catch a wgsl construct the web backend rejects. Adding a knob means
+touching the Rust struct, the wgsl struct, `sync_weather_overlay` and the config doc comment together.
+
+The pass is registered `.in_set(Core2dSystems::PostProcess).after(tonemapping)`. Bevy 0.19 has **no
+node-based render graph** for Core2d — no `Node2d`, no `bevy_render::render_graph` — so a post-process
+effect is an ordinary system in the `Core2d` schedule taking `ViewQuery` and `RenderContext`;
+`bevy_core_pipeline::fullscreen_material` is the in-tree template it was written from (it cannot be
+used directly, since its bind group layout is fixed at three entries and cannot carry the two maps).
+That placement is what keeps weather off the UI: `bevy_ui_render` orders `ui_pass` *after* the whole
+`PostProcess` set.
 
 ### Tileset coupling
 
