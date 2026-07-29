@@ -1,16 +1,20 @@
 //! Turns a position in the world into a terrain kind.
 //!
-//! Everything here is a pure function of `(TerrainConfig, global tile position)`.
-//! That is what lets the world be cut into chunks at all: a tile must come out
-//! the same no matter which chunk happened to generate it, and no matter whether
-//! its neighbours have been generated yet.
+//! Everything here is a pure function of `(TerrainConfig, global tile position)`,
+//! and — since cities and roads moved out to [`crate::gameplay::plan`] — a pure
+//! function of *that tile alone*. No rule here looks at a neighbour any more, so
+//! a chunk needs no padding and a tile cannot depend on where the chunk boundary
+//! fell.
 
 use bevy::prelude::*;
 
 use crate::gameplay::noise::NoiseField;
 
-/// The six tiles of `assets/textures/terrain.png`, in atlas column order — the
+/// The seven tiles of `assets/textures/terrain.png`, in atlas column order — the
 /// discriminant *is* the tileset index, so the two can never drift apart.
+///
+/// `Town` and `Road` are never produced here: they are stamped over the base
+/// terrain once the whole world exists, by [`crate::gameplay::plan`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TerrainKind {
@@ -20,39 +24,50 @@ pub enum TerrainKind {
     Town = 3,
     Mountain = 4,
     DeepWater = 5,
+    Road = 6,
 }
 
 /// Number of layers the terrain atlas is split into.
-pub const TERRAIN_KIND_COUNT: u32 = 6;
+pub const TERRAIN_KIND_COUNT: u32 = 7;
 
 impl TerrainKind {
     pub fn tileset_index(self) -> u16 {
         self as u16
     }
 
-    /// Only these two kinds can be replaced by a Town.
-    fn is_habitable(self) -> bool {
+    /// Only these two kinds can be built on — a city is clipped by coast and
+    /// mountain rather than paving them.
+    pub fn is_habitable(self) -> bool {
         matches!(self, TerrainKind::Forest | TerrainKind::Grass)
+    }
+
+    /// What a road may never cross.
+    pub fn is_water(self) -> bool {
+        matches!(self, TerrainKind::ShallowWater | TerrainKind::DeepWater)
     }
 }
 
 /// Thresholds and noise scales that decide what a tile becomes.
+///
+/// The settlement figures are not read here at all — nothing in this module
+/// samples that field. They live here because they describe the same landscape
+/// as the rest, and [`crate::gameplay::city`] is their only reader.
 #[derive(Resource, Clone)]
 pub struct TerrainConfig {
     pub seed: u32,
-    elevation_scale: f32,
-    vegetation_scale: f32,
-    settlement_scale: f32,
+    pub elevation_scale: f32,
+    pub vegetation_scale: f32,
+    pub settlement_scale: f32,
     /// Elevation bands, in ascending order; anything above `lowland_max` is mountain.
-    deep_water_max: f32,
-    shallow_water_max: f32,
-    lowland_max: f32,
+    pub deep_water_max: f32,
+    pub shallow_water_max: f32,
+    pub lowland_max: f32,
     /// Vegetation at or above this turns a lowland tile from grass into forest.
-    forest_threshold: f32,
-    town_threshold: f32,
-    town_coast_bonus: f32,
-    town_min_spacing: u32,
-    coast_radius: u32,
+    pub forest_threshold: f32,
+    /// A candidate city site must clear this settlement score to be founded.
+    pub town_threshold: f32,
+    pub town_coast_bonus: f32,
+    pub coast_radius: u32,
 }
 
 impl Default for TerrainConfig {
@@ -68,7 +83,6 @@ impl Default for TerrainConfig {
             forest_threshold: 0.5,
             town_threshold: 0.62,
             town_coast_bonus: 0.06,
-            town_min_spacing: 5,
             coast_radius: 2,
         }
     }
@@ -78,6 +92,23 @@ impl Default for TerrainConfig {
 const ELEVATION_SALT: u32 = 0x0000_0001;
 const VEGETATION_SALT: u32 = 0x9e37_79b9;
 const SETTLEMENT_SALT: u32 = 0x85eb_ca6b;
+
+impl TerrainConfig {
+    /// The elevation field, which the road router costs its steps against —
+    /// `WorldMap` only records which band a tile fell in, not how high it is.
+    pub fn elevation_field(&self) -> NoiseField {
+        NoiseField::new(self.seed, ELEVATION_SALT, self.elevation_scale)
+    }
+
+    pub fn vegetation_field(&self) -> NoiseField {
+        NoiseField::new(self.seed, VEGETATION_SALT, self.vegetation_scale)
+    }
+
+    /// What makes one habitable tile a likelier city site than another.
+    pub fn settlement_field(&self) -> NoiseField {
+        NoiseField::new(self.seed, SETTLEMENT_SALT, self.settlement_scale)
+    }
+}
 
 /// Maps an elevation sample plus a vegetation sample to a kind. Elevation alone
 /// decides water vs land vs mountain; vegetation only picks between kinds that
@@ -98,117 +129,12 @@ fn classify(config: &TerrainConfig, elevation: f32, vegetation: f32) -> TerrainK
     }
 }
 
-/// The sampled fields for a chunk, padded on every side so that tiles at the
-/// chunk border see the same neighbourhood they would in an unbounded world —
-/// without that margin a tile's kind would depend on where the chunk was cut.
-struct TerrainSamples {
-    /// Padding in tiles around the chunk: `town_min_spacing + coast_radius`.
-    margin: i32,
-    stride: usize,
-    base_kind: Vec<TerrainKind>,
-    /// Settlement score, only valid within `town_min_spacing` of the chunk.
-    score: Vec<f32>,
-}
-
-impl TerrainSamples {
-    /// `origin` is the global tile coordinate of the chunk's lower-left tile;
-    /// every sample below is taken in that global space, never chunk-locally.
-    fn generate(config: &TerrainConfig, origin: IVec2, chunk_size: UVec2) -> Self {
-        let coast_radius = config.coast_radius as i32;
-        let margin = config.town_min_spacing as i32 + coast_radius;
-        let stride = chunk_size.x as usize + 2 * margin as usize;
-        let rows = chunk_size.y as usize + 2 * margin as usize;
-
-        let elevation_field = NoiseField::new(config.seed, ELEVATION_SALT, config.elevation_scale);
-        let vegetation_field =
-            NoiseField::new(config.seed, VEGETATION_SALT, config.vegetation_scale);
-        let settlement_field =
-            NoiseField::new(config.seed, SETTLEMENT_SALT, config.settlement_scale);
-
-        let mut elevation = Vec::with_capacity(stride * rows);
-        let mut base_kind = Vec::with_capacity(stride * rows);
-        for row in 0..rows {
-            for column in 0..stride {
-                let x = (origin.x + column as i32 - margin) as f32;
-                let y = (origin.y + row as i32 - margin) as f32;
-                let e = elevation_field.sample(x, y);
-                let v = vegetation_field.sample(x, y);
-                elevation.push(e);
-                base_kind.push(classify(config, e, v));
-            }
-        }
-
-        // The coast bonus needs an elevation window of `coast_radius`, so the
-        // score is only defined on the region inset that far from the padding.
-        let mut score = vec![f32::MIN; stride * rows];
-        for row in coast_radius as usize..rows - coast_radius as usize {
-            for column in coast_radius as usize..stride - coast_radius as usize {
-                let x = (origin.x + column as i32 - margin) as f32;
-                let y = (origin.y + row as i32 - margin) as f32;
-                let mut s = settlement_field.sample(x, y);
-
-                let coastal = (row as i32 - coast_radius..=row as i32 + coast_radius).any(|ny| {
-                    (column as i32 - coast_radius..=column as i32 + coast_radius).any(|nx| {
-                        elevation[ny as usize * stride + nx as usize] < config.shallow_water_max
-                            && elevation[ny as usize * stride + nx as usize]
-                                >= config.deep_water_max
-                    })
-                });
-                if coastal {
-                    s += config.town_coast_bonus;
-                }
-
-                score[row * stride + column] = s;
-            }
-        }
-
-        Self {
-            margin,
-            stride,
-            base_kind,
-            score,
-        }
-    }
-
-    /// Index by chunk-local tile coordinates, which may be negative inside the margin.
-    fn index(&self, x: i32, y: i32) -> usize {
-        (y + self.margin) as usize * self.stride + (x + self.margin) as usize
-    }
-
-    fn base_kind(&self, x: i32, y: i32) -> TerrainKind {
-        self.base_kind[self.index(x, y)]
-    }
-
-    fn score(&self, x: i32, y: i32) -> f32 {
-        self.score[self.index(x, y)]
-    }
-}
-
-/// Decides whether a habitable tile becomes a Town: its settlement score must
-/// clear the threshold and be the strict maximum among the habitable tiles
-/// around it, which spreads towns out as isolated points instead of blobs.
-fn is_town(samples: &TerrainSamples, config: &TerrainConfig, x: i32, y: i32) -> bool {
-    let score = samples.score(x, y);
-    if score < config.town_threshold {
-        return false;
-    }
-
-    let spacing = config.town_min_spacing as i32;
-    for ny in y - spacing..=y + spacing {
-        for nx in x - spacing..=x + spacing {
-            if (nx, ny) == (x, y) || !samples.base_kind(nx, ny).is_habitable() {
-                continue;
-            }
-            if samples.score(nx, ny) >= score {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Generates the kind of every tile in the chunk whose lower-left tile sits at
 /// the global tile coordinate `origin`, in row-major order from that corner.
+///
+/// Every sample is taken in global tile space, never chunk-locally — that, and
+/// the fact that no rule here reads a neighbouring tile, is what lets the world
+/// be cut into chunks at all.
 ///
 /// This is the only expensive call in the crate — roughly 4 ms for a 64x64
 /// chunk — which is why [`crate::gameplay::world`] keeps it off the main thread
@@ -218,19 +144,18 @@ pub fn generate_chunk(
     origin: IVec2,
     chunk_size: UVec2,
 ) -> Box<[TerrainKind]> {
-    let samples = TerrainSamples::generate(config, origin, chunk_size);
+    let elevation_field = config.elevation_field();
+    let vegetation_field = config.vegetation_field();
 
     (0..chunk_size.element_product())
         .map(|i| {
-            let x = (i % chunk_size.x) as i32;
-            let y = (i / chunk_size.x) as i32;
-
-            let base = samples.base_kind(x, y);
-            if base.is_habitable() && is_town(&samples, config, x, y) {
-                TerrainKind::Town
-            } else {
-                base
-            }
+            let x = (origin.x + (i % chunk_size.x) as i32) as f32;
+            let y = (origin.y + (i / chunk_size.x) as i32) as f32;
+            classify(
+                config,
+                elevation_field.sample(x, y),
+                vegetation_field.sample(x, y),
+            )
         })
         .collect()
 }
@@ -246,10 +171,6 @@ mod tests {
 
     fn kinds(config: &TerrainConfig) -> Box<[TerrainKind]> {
         generate_chunk(config, ORIGIN, CHUNK)
-    }
-
-    fn position(i: usize) -> (i32, i32) {
-        ((i as u32 % CHUNK.x) as i32, (i as u32 / CHUNK.x) as i32)
     }
 
     #[test]
@@ -305,50 +226,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn towns_only_replace_forest_or_grass() {
-        let config = TerrainConfig::default();
-        let samples = TerrainSamples::generate(&config, ORIGIN, CHUNK);
-
-        for (i, &kind) in kinds(&config).iter().enumerate() {
-            if kind == TerrainKind::Town {
-                let (x, y) = position(i);
-                assert!(samples.base_kind(x, y).is_habitable());
-            }
-        }
-    }
-
-    #[test]
-    fn towns_are_never_closer_together_than_the_minimum_spacing() {
-        let config = TerrainConfig::default();
-        let spacing = config.town_min_spacing as i32;
-        let towns: Vec<(i32, i32)> = kinds(&config)
-            .iter()
-            .enumerate()
-            .filter(|&(_, &kind)| kind == TerrainKind::Town)
-            .map(|(i, _)| position(i))
-            .collect();
-
-        for (i, &(ax, ay)) in towns.iter().enumerate() {
-            for &(bx, by) in &towns[i + 1..] {
-                assert!(
-                    (ax - bx).abs() > spacing || (ay - by).abs() > spacing,
-                    "towns at ({ax},{ay}) and ({bx},{by}) are within {spacing}"
-                );
-            }
-        }
-    }
-
     /// The thresholds are only useful if the default config actually produces a
     /// mixed map — a single-biome world would pass every other test here.
     #[test]
-    fn the_default_config_produces_every_kind() {
+    fn the_default_config_produces_every_base_kind() {
         let tiles = kinds(&TerrainConfig::default());
         for kind in [
             TerrainKind::Forest,
             TerrainKind::ShallowWater,
             TerrainKind::Grass,
-            TerrainKind::Town,
             TerrainKind::Mountain,
             TerrainKind::DeepWater,
         ] {
@@ -359,5 +245,15 @@ mod tests {
                 CHUNK.y
             );
         }
+    }
+
+    /// The two stamped kinds belong to the plan, not to the terrain — if one
+    /// ever came out of here, a chunk's contents would depend on its neighbours
+    /// again.
+    #[test]
+    fn the_terrain_never_produces_a_town_or_a_road() {
+        let tiles = kinds(&TerrainConfig::default());
+        assert!(!tiles.contains(&TerrainKind::Town));
+        assert!(!tiles.contains(&TerrainKind::Road));
     }
 }
