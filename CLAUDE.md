@@ -83,25 +83,41 @@ salts hashed into a domain offset, `NoiseField::new`, not separate generators), 
 elevation to a band (deep water / shallow water / lowland / mountain) with vegetation only breaking
 the Grass/Forest tie *within* the lowland band.
 
-**Anything with a neighbourhood radius belongs in `gameplay/plan.rs`, not here.** A city is a disc and
-a road spans hundreds of tiles; neither fits in any margin, which is why `Town` and `Road` are stamped
-over finished terrain rather than generated. `the_terrain_never_produces_a_town_or_a_road` guards it.
+**Anything with a neighbourhood radius belongs in `gameplay/plan.rs`, not here.** A city is a disc, a
+road spans hundreds of tiles and a river is decided uphill of where it runs; none of them fits in any
+margin, which is why `Town`, `Road` and `River` are stamped over finished terrain rather than
+generated. `the_terrain_never_produces_a_town_a_road_or_a_river` guards it.
 
 Everything is driven by the `TerrainConfig` resource — thresholds, scales, seed. Changing a default
 there will break `the_default_config_produces_every_base_kind`, which is the point: it guards against
 a config that quietly yields a single-biome world. The settlement figures live there but are read only
-by `gameplay/city.rs`.
+by `gameplay/city.rs`, and the humidity ones only by `gameplay/river.rs`.
+
+**The world is fine-grained, and it constrains what can be built on it.** `elevation_scale` is 0.04,
+so the *longest* wavelength in the elevation field is ~25 tiles: there are no continents and no
+valleys, just a mottled archipelago where 32% of tiles are water and no point on land is far from a
+shore. Cities and roads work at 200+ tiles and ride over that happily. Rivers do not — see below.
 
 This is the only expensive call in the crate: **~4 ms per 64×64 chunk** in release. Treat it as
 something to keep off the main thread.
 
-### Cities and roads (`gameplay/plan.rs`, `city.rs`, `road.rs`)
+### Rivers, cities and roads (`gameplay/plan.rs`, `river.rs`, `city.rs`, `road.rs`)
 
 Once `WorldMap` is complete, `WorldPlan` walks one session through
-`WaitingForTerrain → Cities → Roads → Done`, editing tiles under the plan while the player is already
-walking around. The in-flight tasks live *inside* the enum, so dropping the resource on leaving
+`WaitingForTerrain → Rivers → Cities → Roads → Done`, editing tiles under the plan while the player is
+already walking around. The in-flight tasks live *inside* the enum, so dropping the resource on leaving
 gameplay cancels them — a route planned for one world can never land in the next.
 
+The stage order is load-bearing: each stamps into `WorldMap` and the next takes its snapshot
+*afterwards*, so a city is clipped by a river the way it is clipped by a coast, and a road sees both.
+That is also why there is no `start_city_plan` — `apply_river_plan` opens the city stage itself, since
+only it knows when the last river tile is down.
+
+- **Rivers** — one spring per `river_source_cell_tiles` square, kept if the tile is `Mountain` and the
+  **humidity** field clears `river_source_threshold`. Each spring is a particle walking downhill on a
+  lattice **anchored on the world origin** (same trick as roads, same reason: two particles that pass
+  through a place step between the same nodes, so paths coincide and flow accumulates). A tile's
+  channel width is its flow, capped at `MAX_RIVER_WIDTH` = 4.
 - **Cities** — one candidate per `region_size_tiles` square, jittered by hash, kept if habitable and
   clearing `town_threshold`. Size tier from how far it clears; the outline is a disc whose radius
   wobbles over three hashed harmonics, clipped to habitable tiles. `City` is a component; `CityMap`
@@ -117,10 +133,31 @@ is already on the ground. The order is therefore part of the result and is fixed
 long routes become trunks. Both ends of a route enter the lattice at the nearest *reachable* node,
 which is not always the nearest one.
 
+A river is **not** `is_water()`. Folding it in would cut the continent into pieces the road network
+cannot span, so a route crosses one for `road_river_crossing_penalty` per tile and lays plain `Road`
+over it. Because the crossing is now road, the next route finds road rather than river and pays the
+reuse discount instead — which is what makes roads converge on the same bridges. Lakes *are*
+`ShallowWater`, so roads go round them and lakeside cities get the coast bonus, both without anything
+learning what a lake is.
+
+Two things about rivers are worth knowing before tuning them:
+
+- **A particle never steps uphill; it floods.** With nowhere lower to go it fills the basin by
+  priority-flood, and the filled nodes are then **raised to the level they filled to** — a full basin
+  is a flat sheet of water. Without that raise the particle spills to the rim and, on its very next
+  step, walks straight back into the hollow it just filled; that bug capped every river in the world
+  at two steps. Every filled basin is recorded so the next particle can cross it; only ones over
+  `river_lake_min_tiles` are *drawn*, or each river becomes a string of beads.
+- **The terrain cannot feed the width machinery.** With a 25-tile elevation wavelength, a descent
+  meets water in a few steps, so descents rarely meet and the busiest segment in the world carries 3
+  particles. `river_flow_per_width` is 2 for that reason and channels wider than 2 essentially do not
+  occur. Real trunk rivers would need a low-frequency component in the elevation field — a terrain
+  change that moves every existing tile, not a river knob.
+
 Config defaults in `WorldPlanConfig` carry their measurements in the doc comments; the
 `#[ignore]`d `the_default_config_lays_out_cities_of_every_size_and_roads_between_them` in `plan.rs`
-generates the whole world in ~1.5 s and is how those numbers were taken —
-`cargo test -- --ignored --nocapture`.
+generates the whole world in ~2 s and is how those numbers were taken —
+`cargo test --release -- --ignored --nocapture`.
 
 ### The world (`gameplay/world.rs`)
 
@@ -151,7 +188,9 @@ budgets so the first frame is complete.
 
 `WorldSystems` orders the frame `Streaming → Planning → Refresh`, which is what puts the plan's tile
 edits between the streamer that spawns chunk entities and `refresh_edited_chunks` that rebuilds the
-stale ones — so an edit is visible in the frame it lands. A chunk that is *not* resident needs no
+stale ones — so an edit is visible in the frame it lands. The river stage leans on that: it stamps
+`river_chunks_stamped_per_frame` chunks a frame (~44 frames for the default world) rather than
+~38k edits at once, because `apply_edits` scans its touched-chunk list linearly. A chunk that is *not* resident needs no
 refresh at all: the edit went into `WorldMap`, so it is there when the chunk is next spawned.
 
 Three coordinate spaces are in play and the helpers at the top of the module are the only sanctioned

@@ -10,11 +10,11 @@ use bevy::prelude::*;
 
 use crate::gameplay::noise::NoiseField;
 
-/// The seven tiles of `assets/textures/terrain.png`, in atlas column order — the
+/// The eight tiles of `assets/textures/terrain.png`, in atlas column order — the
 /// discriminant *is* the tileset index, so the two can never drift apart.
 ///
-/// `Town` and `Road` are never produced here: they are stamped over the base
-/// terrain once the whole world exists, by [`crate::gameplay::plan`].
+/// `Town`, `Road` and `River` are never produced here: they are stamped over the
+/// base terrain once the whole world exists, by [`crate::gameplay::plan`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TerrainKind {
@@ -25,23 +25,30 @@ pub enum TerrainKind {
     Mountain = 4,
     DeepWater = 5,
     Road = 6,
+    River = 7,
 }
 
 /// Number of layers the terrain atlas is split into.
-pub const TERRAIN_KIND_COUNT: u32 = 7;
+pub const TERRAIN_KIND_COUNT: u32 = 8;
 
 impl TerrainKind {
     pub fn tileset_index(self) -> u16 {
         self as u16
     }
 
-    /// Only these two kinds can be built on — a city is clipped by coast and
-    /// mountain rather than paving them.
+    /// Only these two kinds can be built on — a city is clipped by coast,
+    /// mountain and river rather than paving them.
     pub fn is_habitable(self) -> bool {
         matches!(self, TerrainKind::Forest | TerrainKind::Grass)
     }
 
-    /// What a road may never cross.
+    /// What a road may never cross. `River` is deliberately not in here: a river
+    /// runs from the mountains to the sea, so refusing it outright would cut the
+    /// continent into pieces the road network cannot span. A road crosses one at
+    /// a price instead — see `road_river_crossing_penalty`.
+    ///
+    /// A lake is `ShallowWater` and so is covered by this without lakes being a
+    /// kind of their own.
     pub fn is_water(self) -> bool {
         matches!(self, TerrainKind::ShallowWater | TerrainKind::DeepWater)
     }
@@ -49,15 +56,17 @@ impl TerrainKind {
 
 /// Thresholds and noise scales that decide what a tile becomes.
 ///
-/// The settlement figures are not read here at all — nothing in this module
-/// samples that field. They live here because they describe the same landscape
-/// as the rest, and [`crate::gameplay::city`] is their only reader.
+/// The settlement and humidity figures are not read here at all — nothing in
+/// this module samples those fields. They live here because they describe the
+/// same landscape as the rest; [`crate::gameplay::city`] and
+/// [`crate::gameplay::river`] are their only readers.
 #[derive(Resource, Clone)]
 pub struct TerrainConfig {
     pub seed: u32,
     pub elevation_scale: f32,
     pub vegetation_scale: f32,
     pub settlement_scale: f32,
+    pub humidity_scale: f32,
     /// Elevation bands, in ascending order; anything above `lowland_max` is mountain.
     pub deep_water_max: f32,
     pub shallow_water_max: f32,
@@ -68,6 +77,11 @@ pub struct TerrainConfig {
     pub town_threshold: f32,
     pub town_coast_bonus: f32,
     pub coast_radius: u32,
+    /// How wet a mountain must be for a river to rise there. Together with
+    /// `WorldPlanConfig::river_source_cell_tiles` this is the lever on how many
+    /// rivers the world has: at the default spacing 0.6 gives 3236 springs, 0.55
+    /// gives 4466 and 0.5 gives 5826.
+    pub river_source_threshold: f32,
 }
 
 impl Default for TerrainConfig {
@@ -77,6 +91,9 @@ impl Default for TerrainConfig {
             elevation_scale: 0.04,
             vegetation_scale: 0.09,
             settlement_scale: 0.12,
+            // Coarser than the vegetation field: weather covers more ground than
+            // a wood does, so a whole range is wet rather than one peak in it.
+            humidity_scale: 0.02,
             deep_water_max: 0.32,
             shallow_water_max: 0.42,
             lowland_max: 0.72,
@@ -84,6 +101,7 @@ impl Default for TerrainConfig {
             town_threshold: 0.62,
             town_coast_bonus: 0.06,
             coast_radius: 2,
+            river_source_threshold: 0.55,
         }
     }
 }
@@ -92,6 +110,7 @@ impl Default for TerrainConfig {
 const ELEVATION_SALT: u32 = 0x0000_0001;
 const VEGETATION_SALT: u32 = 0x9e37_79b9;
 const SETTLEMENT_SALT: u32 = 0x85eb_ca6b;
+const HUMIDITY_SALT: u32 = 0xc2b2_ae35;
 
 impl TerrainConfig {
     /// The elevation field, which the road router costs its steps against —
@@ -107,6 +126,12 @@ impl TerrainConfig {
     /// What makes one habitable tile a likelier city site than another.
     pub fn settlement_field(&self) -> NoiseField {
         NoiseField::new(self.seed, SETTLEMENT_SALT, self.settlement_scale)
+    }
+
+    /// How much rain falls. Read only by [`crate::gameplay::river`], to decide
+    /// which mountains are wet enough for a river to rise in them.
+    pub fn humidity_field(&self) -> NoiseField {
+        NoiseField::new(self.seed, HUMIDITY_SALT, self.humidity_scale)
     }
 }
 
@@ -247,13 +272,32 @@ mod tests {
         }
     }
 
-    /// The two stamped kinds belong to the plan, not to the terrain — if one
+    /// The three stamped kinds belong to the plan, not to the terrain — if one
     /// ever came out of here, a chunk's contents would depend on its neighbours
     /// again.
     #[test]
-    fn the_terrain_never_produces_a_town_or_a_road() {
+    fn the_terrain_never_produces_a_town_a_road_or_a_river() {
         let tiles = kinds(&TerrainConfig::default());
         assert!(!tiles.contains(&TerrainKind::Town));
         assert!(!tiles.contains(&TerrainKind::Road));
+        assert!(!tiles.contains(&TerrainKind::River));
+    }
+
+    /// Rivers rise where it rains, so the humidity field has to be its own
+    /// landscape rather than a second view of the elevation it is sampled
+    /// alongside.
+    #[test]
+    fn humidity_is_independent_of_the_other_fields() {
+        let config = TerrainConfig::default();
+        let humidity = config.humidity_field();
+        let elevation = config.elevation_field();
+        let vegetation = config.vegetation_field();
+
+        let differs = (0..64).filter(|i| {
+            let (x, y) = ((ORIGIN.x + i * 7) as f32, (ORIGIN.y + i * 13) as f32);
+            (humidity.sample(x, y) - elevation.sample(x, y)).abs() > 0.05
+                && (humidity.sample(x, y) - vegetation.sample(x, y)).abs() > 0.05
+        });
+        assert!(differs.count() > 48, "humidity tracks another field");
     }
 }
