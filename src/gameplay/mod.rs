@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 
+mod biome;
 mod city;
 mod noise;
 mod plan;

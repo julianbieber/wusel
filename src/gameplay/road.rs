@@ -320,11 +320,11 @@ impl Lattice {
     /// tile fell in, so the height a road is trying to avoid climbing has to
     /// come back from the noise field.
     fn sample_elevation(&self, terrain: &TerrainConfig) -> Vec<f32> {
-        let field = terrain.elevation_field();
+        let sampler = terrain.sampler();
         (0..self.node_count())
             .map(|index| {
                 let tile = self.position(self.node_at(index));
-                field.sample(tile.x as f32, tile.y as f32)
+                sampler.elevation(tile.x as f32, tile.y as f32)
             })
             .collect()
     }

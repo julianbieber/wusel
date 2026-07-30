@@ -27,9 +27,9 @@ use std::{cmp::Ordering, collections::BinaryHeap, collections::HashMap};
 use bevy::prelude::*;
 
 use crate::gameplay::{
-    noise::{NoiseField, hash2},
+    noise::hash2,
     plan::WorldPlanConfig,
-    terrain::{TerrainConfig, TerrainKind},
+    terrain::{TerrainConfig, TerrainKind, TerrainSampler},
     world::{
         TileEdit, WORLD_CHUNKS, WORLD_TILES, WorldSnapshot, chunk_index_of_tile, tile_in_world,
     },
@@ -86,7 +86,7 @@ pub fn plan_rivers(
 fn springs(terrain: &TerrainConfig, config: &WorldPlanConfig, world: &WorldSnapshot) -> Vec<IVec2> {
     let cell = config.river_source_cell_tiles.max(1) as i32;
     let cells = WORLD_TILES.as_ivec2() / cell;
-    let humidity = terrain.humidity_field();
+    let sampler = terrain.sampler();
 
     let mut springs = Vec::new();
     for cy in 0..cells.y {
@@ -102,7 +102,7 @@ fn springs(terrain: &TerrainConfig, config: &WorldPlanConfig, world: &WorldSnaps
             if world.tile(tile) != Some(TerrainKind::Mountain) {
                 continue;
             }
-            if humidity.sample(tile.x as f32, tile.y as f32) < terrain.river_source_threshold {
+            if sampler.humidity(tile.x as f32, tile.y as f32) < terrain.river_source_threshold {
                 continue;
             }
             springs.push(tile);
@@ -142,7 +142,9 @@ struct Lattice {
     stride: i32,
     /// Nodes along each axis.
     size: i32,
-    field: NoiseField,
+    /// The same sampler the visible terrain was generated from, so a particle
+    /// descends the hills that are actually drawn.
+    sampler: TerrainSampler,
     /// Height of the *water surface* at a node, which is the terrain until a
     /// basin fills and then the level it filled to. Sampled on demand — the
     /// particles only ever visit a thin slice of the world, so sampling all of
@@ -168,7 +170,7 @@ impl Lattice {
         Self {
             stride,
             size,
-            field: terrain.elevation_field(),
+            sampler: terrain.sampler(),
             elevation: vec![f32::NAN; count],
             flow: vec![0; count],
             next: vec![NONE; count],
@@ -216,7 +218,7 @@ impl Lattice {
             return cached;
         }
         let tile = self.tile_at(index);
-        let sampled = self.field.sample(tile.x as f32, tile.y as f32);
+        let sampled = self.sampler.elevation(tile.x as f32, tile.y as f32);
         self.elevation[index as usize] = sampled;
         sampled
     }
@@ -596,14 +598,15 @@ mod tests {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = sloping_world();
-        let humidity = terrain.humidity_field();
+        let sampler = terrain.sampler();
 
         let springs = springs(&terrain, &config, &world);
         assert!(!springs.is_empty(), "the world has no rivers at all");
         for spring in springs {
             assert_eq!(world.tile(spring), Some(TerrainKind::Mountain));
             assert!(
-                humidity.sample(spring.x as f32, spring.y as f32) >= terrain.river_source_threshold
+                sampler.humidity(spring.x as f32, spring.y as f32)
+                    >= terrain.river_source_threshold
             );
         }
     }
