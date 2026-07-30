@@ -50,9 +50,11 @@ pub const WORLD_TILES: UVec2 =
 /// before it is needed rather than popping in at the edge of the view.
 const RESIDENT_MARGIN_CHUNKS: i32 = 1;
 
-/// A chunk takes roughly 4 ms to generate, so this is the worst-case stall the
-/// streamer may add to a frame when the camera outruns the background pass.
-const MAX_BLOCKING_GENERATIONS_PER_FRAME: usize = 2;
+/// The worst-case stall the streamer may add to a frame when the camera outruns the
+/// background pass. This was two when a chunk cost ~4 ms; the biome rework made
+/// generation 1.9x dearer (~7.5 ms on the same footing), so two chunks would now be
+/// most of a frame at 60 fps and the budget buys the same stall with one.
+const MAX_BLOCKING_GENERATIONS_PER_FRAME: usize = 1;
 
 /// Chunk entities built per frame. Panning only ever brings a row of them into
 /// view, but a zoom step can bring hundreds at once, and building that many

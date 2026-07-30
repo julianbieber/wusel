@@ -59,7 +59,7 @@ use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
         noise::TilingNoiseField,
-        terrain::TerrainConfig,
+        terrain::{TerrainConfig, TerrainSampler},
         world::{TILE_DISPLAY_SIZE, WORLD_TILES, tile_position_at},
     },
     screens::Screen,
@@ -436,10 +436,13 @@ fn sync_weather_overlay(
 
 // -- The bake ----------------------------------------------------------------
 
-/// The probability that it is cloudy over a tile: the humidity field, unchanged.
-/// Rivers rise in the wet mountains, and it rains over the same country.
-fn cloud_probability_at(terrain: &TerrainConfig, tile: Vec2) -> f32 {
-    terrain.humidity_field().sample(tile.x, tile.y)
+/// The probability that it is cloudy over a tile: the humidity the terrain sampler
+/// reports there, unchanged. Rivers rise in the wet mountains and it rains over the
+/// same country — and since the biome's `humidity_bias` is part of that answer, a
+/// desert is reliably clear and a wetland reliably overcast without the sky knowing
+/// what a biome is.
+fn cloud_probability_at(sampler: &TerrainSampler, tile: Vec2) -> f32 {
+    sampler.humidity(tile.x, tile.y)
 }
 
 /// How much cloud is over a tile: the density, from the raw field there.
@@ -492,6 +495,9 @@ fn bake_maps(terrain: &TerrainConfig, config: &WeatherConfig) -> BakedMaps {
 fn bake_probability_map(terrain: &TerrainConfig, config: &WeatherConfig) -> Image {
     let side = config.probability_texels_per_side.max(1);
     let tiles_per_texel = WORLD_TILES.x as f32 / side as f32;
+    // Hoisted out of the loop: one sampler for the whole map, since building it
+    // costs six noise fields and a biome map.
+    let sampler = terrain.sampler();
 
     let mut texels = Vec::with_capacity((side * side) as usize);
     for y in 0..side {
@@ -499,7 +505,7 @@ fn bake_probability_map(terrain: &TerrainConfig, config: &WeatherConfig) -> Imag
             // The texel's centre, so the map is the humidity field at the points it
             // claims to sample rather than at their corners.
             let tile = (Vec2::new(x as f32, y as f32) + Vec2::splat(0.5)) * tiles_per_texel;
-            texels.push(to_byte(cloud_probability_at(terrain, tile)));
+            texels.push(to_byte(cloud_probability_at(&sampler, tile)));
         }
     }
 
@@ -804,6 +810,7 @@ mod tests {
             SHAPE_LATTICE_PERIOD,
             config.shape_octaves,
         );
+        let sampler = terrain.sampler();
 
         let step = 16.0;
         let steps = (WORLD_TILES.x as f32 / step) as u32;
@@ -811,7 +818,7 @@ mod tests {
         for y in 0..steps {
             for x in 0..steps {
                 let tile = Vec2::new(x as f32, y as f32) * step;
-                let probability = cloud_probability_at(&terrain, tile);
+                let probability = cloud_probability_at(&sampler, tile);
                 let cell = tile / config.shape_period_tiles * SHAPE_LATTICE_PERIOD as f32;
                 let raw = probability * shape_at(&field, &config, cell);
                 samples.push(Sky {
@@ -959,9 +966,10 @@ mod tests {
             SHAPE_LATTICE_PERIOD,
             config.shape_octaves,
         );
+        let sampler = terrain.sampler();
         let density_at = |tile: Vec2| {
             let cell = tile / config.shape_period_tiles * SHAPE_LATTICE_PERIOD as f32;
-            let raw = cloud_probability_at(&terrain, tile) * shape_at(&field, &config, cell);
+            let raw = cloud_probability_at(&sampler, tile) * shape_at(&field, &config, cell);
             cloud_density(&config, raw)
         };
 

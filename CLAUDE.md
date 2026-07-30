@@ -72,20 +72,103 @@ present in the `TooltipMap` resource becomes a clickable button that spawns a ne
 cursor. `TooltipStack` is a stack of `(Entity, closable)`; Escape pops one closable tooltip, and only
 returns to `Screen::Main` when none remain.
 
-### Terrain generation (`gameplay/noise.rs`, `gameplay/terrain.rs`)
+### Terrain generation (`gameplay/noise.rs`, `gameplay/terrain.rs`, `gameplay/biome.rs`)
 
-All noise is hand-rolled — `hash2` → `gradient_noise_2d` → `fbm`. No noise crate; keep it that way
-unless there's a reason, since determinism across platforms is what the tests assert.
+All noise is hand-rolled — `hash2` → `gradient_noise_2d` → `fbm` / `ridged_fbm`. No noise crate; keep
+it that way unless there's a reason, since determinism across platforms is what the tests assert.
 
 `generate_chunk(config, origin, chunk_size)` is a pure function of `(config, global tile position)` —
 and of *that tile alone*. Every sample is taken in **global tile space** (`origin` is the chunk's
-lower-left tile), never chunk-locally, and no rule reads a neighbouring tile, so a chunk needs no
-padding and a tile cannot depend on where the boundary fell.
+lower-left tile), never chunk-locally, and no rule reads a neighbouring **tile**, so a chunk needs no
+padding and a tile cannot depend on where the boundary fell. The biome lookup reads neighbouring
+*cells*, which are a function of their own integer coordinates, so that property survives it.
 `a_tile_does_not_depend_on_where_the_chunk_boundary_falls` is the test that catches a regression.
-The pipeline is two steps: sample the elevation and vegetation fields (independent through per-field
-salts hashed into a domain offset, `NoiseField::new`, not separate generators), then `classify` maps
-elevation to a band (deep water / shallow water / lowland / mountain) with vegetation only breaking
-the Grass/Forest tie *within* the lowland band.
+
+**The height is built in layers, and which layers apply is a function of where you are.** One field
+was the original defect: `relief_scale` is 0.04, so its longest wavelength is ~25 tiles, and no
+threshold can cut regions out of a field with no structure at the scale a player moves at. Three
+layers now, combined per tile:
+
+- **continent** (`continent_scale` 0.0015, ~670-tile wavelength) — what makes land masses. Displaces
+  a recipe's base height by ±`continent_relief`.
+- **relief** (the old `elevation_scale`, unchanged at 0.04) — demoted to the bumps on top. As
+  *relief* a 25-tile wavelength was always right; it was only wrong as the whole landscape.
+- **ridged** (`ridge_scale`, `noise::RidgedNoiseField`) — one-sided and crease-shaped, which is what
+  makes a mountain *range* instead of a field of lumps. Only `Biome::Highland` weights it, so it is
+  skipped where the blended weight is ~0 — most of the world, and that skip is what pays for the
+  extra layers.
+
+`TerrainSampler` is the **only** implementation of "how high, how green, how wet is it here", and
+that is load-bearing outside this module: `river.rs` walks its particles downhill against it and
+`road.rs` costs its steps by it. `TerrainConfig` used to hand out a bare `NoiseField` via
+`elevation_field()`/`humidity_field()`; it hands out a sampler instead, because two implementations
+would mean rivers running up the visible hills. `settlement_field()` is the one field still raw —
+`city.rs` compares scores between sites and nothing biome-dependent enters into it.
+
+Then `classify` cuts the result into bands: deep water / shallow water / **sand** / lowland /
+mountain / **rock** / **snow**. What the biome changes is what *fills* a band — the lowland pair comes
+from `Biome::kinds()` rather than being Grass and Forest everywhere, and the sand band above the water
+line is as wide as the recipe says, which is zero for a `Highland` coast and so gives a cliff instead
+of a beach.
+
+### Biomes (`gameplay/biome.rs`)
+
+A **jittered-grid Voronoi**: each cell of a 384-tile lattice hashes (once — jitter from the low bytes,
+biome draw from the high ones) to a site inside itself and to a `Biome`, and a tile belongs to the
+nearest site of the 3x3 cells around it. Jitter is confined to less than a cell, which is what makes
+3x3 sufficient. The query position is warped by `biome_warp_tiles` first, so a region has an organic
+outline rather than a polygon's. Voronoi rather than a latitude/humidity climate table on purpose: a
+climate table gives smooth gradients, and gradients are what this world already had too much of.
+
+**The blend is the feature, not the smoothing.** A biome carries a `HeightRecipe` — numbers only — and
+the recipe at a tile is the distance-weighted mix of the nearby sites' recipes. That is where boundary
+structure comes from: `Highland`·`Ocean` falls through sea level across the band and gives a cliffed
+shelf, `Highland`·`Plains` decays the ridge weight and gives foothills, `Plains`·`Plains` does nothing
+because a blend of like recipes is that recipe. **No rule anywhere names a pair of biomes** — six
+biomes would be fifteen pairs to tune, and the interesting boundaries are the ones nobody enumerated.
+
+**Two things fight the fact that a Voronoi edge is a straight line**, because on its own the diagram
+looks ruled and that is the first thing you notice from the ground:
+
+- **The domain warp has to be shorter than the edge it bends.** A warp only bends a boundary where it
+  has content at a wavelength *shorter* than that boundary; a single long octave translates the whole
+  edge bodily and leaves it exactly as straight. `WARP_CELLS` is therefore 0.75 of a cell with 3
+  octaves — the first attempt was 1.5 cells with 2, whose finest detail had a 288-tile wavelength
+  against ~200-tile edges, and it did nothing at all. Amplitude then buys crookedness against region
+  size: `biome_warp_tiles` 160 gives a 1.46× longer outline with regions still ~257 tiles across, and
+  `the_warp_trades_region_size_for_a_crooked_outline` has the curve out to 440. Note the *interior
+  fraction is useless as a guard here* — it sits at ~56% across that whole range, because warping the
+  query is locally structure-preserving; mean region run length is the metric that moves.
+- **The kind pair is dithered, not switched.** Even a perfectly wiggly boundary still flips Sand to
+  Grass along a line. So `BlendedBiome::cover` picks the biome supplying the tile's kinds by hashing
+  the tile and drawing against the blend weights, rather than taking the heaviest. In a region
+  interior one weight is 1.0 and this is exactly `dominant`, so nothing is speckled; inside the band
+  the two biomes' tiles interleave, dense on their own side and sparse on the other, and the line
+  stops existing. ~10.5% of the world takes its cover from a neighbouring region.
+  `the_cover_dither_is_a_no_op_inside_a_region` is the guard that matters — without it every region
+  would be flecked with tiles from biomes nowhere near it.
+
+Two more details hold the shape together:
+
+- **Weights are banded, not inverse-distance.** A site contributes only while its distance exceeds
+  the nearest site's by less than `2 * biome_blend_tiles`, so beyond `biome_blend_tiles` from a
+  boundary exactly one weight is non-zero and a region has an *interior*. Without that the world
+  would be an average of all six everywhere. `biome_blend_tiles` must stay well under the cell's
+  inradius (~192): at 96 only a quarter of the world was interior, which is why it is 48.
+- **`HeightRecipe` is numbers only; the kind pair lives on `Biome::kinds()`.** An enum cannot be
+  averaged, so the pair comes from a single biome — `cover`, per the dither above. It is therefore the
+  one thing about a tile that changes all at once, and deliberately the one thing elevation does *not*
+  depend on, which is what lets a boundary read as a treeline rather than a wall. `dominant` (the
+  argmax) is the separate question "which region is this", and only the measurements ask it.
+
+Six biomes, because the drawn palette supports six that look different: `Ocean`, `Plains`, `Forest`,
+`Highland`, `Desert`, `Wetland`. Tundra is absent — with no cold-grass or conifer tile the only thing
+it could lay down below the snow line is `Snow`, a flat sheet of one kind, which is the defect this
+replaced in white. Adding it is one tile and one table row.
+
+`Desert`'s `humidity_bias` is why it has neither springs nor clouds, and `Wetland`'s is why it has
+both: biome coherence across rivers and weather falls out of the shared sampler, with neither of those
+modules learning what a biome is.
 
 **Anything with a neighbourhood radius belongs in `gameplay/plan.rs`, not here.** A city is a disc, a
 road spans hundreds of tiles and a river is decided uphill of where it runs; none of them fits in any
@@ -98,13 +181,18 @@ a config that quietly yields a single-biome world. The settlement figures live t
 by `gameplay/city.rs`, and the humidity ones by `gameplay/river.rs` and `gameplay/weather.rs` — the
 rivers rise where it rains and the clouds are drawn from the same field, which is why they agree.
 
-**The world is fine-grained, and it constrains what can be built on it.** `elevation_scale` is 0.04,
-so the *longest* wavelength in the elevation field is ~25 tiles: there are no continents and no
-valleys, just a mottled archipelago where 32% of tiles are water and no point on land is far from a
-shore. Cities and roads work at 200+ tiles and ride over that happily. Rivers do not — see below.
+Everything is driven by `TerrainConfig`; the biome recipe table lives in `biome.rs` and carries its
+measured coverage in `the_default_config_produces_recognisably_different_regions` (`cargo test
+--release -- --ignored --nocapture`, and run it *alone* — three measurement tests in parallel contend
+for CPU and inflate the per-chunk figure). At the defaults the world is 33.5% water, and the four
+tiles the rework added all earn their column: Sand 14.6%, Rock 6.6%, Snow 2.8%, Marsh 2.1%. Biome
+coverage runs Ocean 30.6%, Forest 21.4%, Plains 15.9%, Highland 13.9%, Desert 11.9%, Wetland 6.4%.
 
-This is the only expensive call in the crate: **~4 ms per 64×64 chunk** in release. Treat it as
-something to keep off the main thread.
+This is the only expensive call in the crate, and the biome rework made it **2.1× dearer**: 1.75 ms
+per 64×64 chunk before against 3.70 ms now, measured on one machine, which scales the ~4 ms the older
+notes were written against to ~8.5 ms and the whole-world background pass from ~16 s to ~34 s. That is
+why `MAX_BLOCKING_GENERATIONS_PER_FRAME` came down from 2 to 1. Treat it as something to keep off the
+main thread.
 
 ### Rivers, cities and roads (`gameplay/plan.rs`, `river.rs`, `city.rs`, `road.rs`)
 
@@ -145,6 +233,11 @@ reuse discount instead — which is what makes roads converge on the same bridge
 `ShallowWater`, so roads go round them and lakeside cities get the coast bonus, both without anything
 learning what a lake is.
 
+**That bridge mechanism is barely exercised.** Since the biome rework the default world routes 87
+roads and bridges a river just **2** times, so the reuse-on-a-crossing path is very nearly live code
+with no coverage from the measurement run. The cause is in the terrain, not the router: see the lake note
+below.
+
 Two things about rivers are worth knowing before tuning them:
 
 - **A particle never steps uphill; it floods.** With nowhere lower to go it fills the basin by
@@ -158,6 +251,17 @@ Two things about rivers are worth knowing before tuning them:
   particles. `river_flow_per_width` is 2 for that reason and channels wider than 2 essentially do not
   occur. Real trunk rivers would need a low-frequency component in the elevation field — a terrain
   change that moves every existing tile, not a river knob.
+- **The low-frequency component arrived, and it fed the lakes instead.** The biome rework added the
+  continent layer the note above asked for, and the result was not trunk rivers: broad low-frequency
+  minima are broad *basins*, so the priority-flood has far more to fill. The default world went from
+  ~38k river-stage edits to 264k — **26.6k tiles of river against 238k of lake**, roughly 1.4% of the
+  world under inland water. Because a lake is `ShallowWater` and a hard barrier, routes mostly go round
+  the lakes rather than over the rivers, which is why bridging fell to 2 crossings in the whole world
+  (it was 0 before the warp retune moved the regions around). Raising
+  `river_lake_min_tiles` will not help: these basins are large, not marginal. It is a river-stage
+  retune against the new terrain, and it belongs with gh-9 rather than in a heightmap change. Note the
+  count is insensitive to `Wetland`'s flatness — that was tried, and the lake total did not move by a
+  single tile.
 
 Config defaults in `WorldPlanConfig` carry their measurements in the doc comments; the
 `#[ignore]`d `the_default_config_lays_out_cities_of_every_size_and_roads_between_them` in `plan.rs`
@@ -210,7 +314,7 @@ Cloud patches drifting over the world, the shadow each throws, and rain in the t
 
 Two baked textures and one full-screen pass, and the split is the design:
 
-- **Where** it is cloudy is `TerrainConfig::humidity_field()` — the same field the river springs read
+- **Where** it is cloudy is `TerrainSampler::humidity()` — the same answer the river springs read
   — sampled over the whole world at one texel per 8 tiles. That map never moves, so a wet range is
   reliably overcast and a dry one reliably clear.
 - **What** a cloud looks like is a second map holding one *tiling* period of the same noise
@@ -270,7 +374,8 @@ That placement is what keeps weather off the UI: `bevy_ui_render` orders `ui_pas
 `assets/textures/terrain.png` cannot drift. The atlas is a horizontal strip of 8×8 tiles loaded once
 (`world::load_tileset`) as an array texture via
 `ImageArrayLayout::GridCount { columns: TERRAIN_KIND_COUNT, rows: 1 }`; every chunk entity shares
-that one handle.
+that one handle. Twelve columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
+Marsh (11), so nothing existing moved.
 
 Adding a terrain kind means: append a column to the PNG, add the enum variant with the matching
 discriminant, bump `TERRAIN_KIND_COUNT`, and extend `the_default_config_produces_every_base_kind` —
