@@ -44,7 +44,8 @@ use bevy::{
             FragmentState, Operations, PipelineCache, RenderPassColorAttachment,
             RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler,
             SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, Specializer,
-            SpecializerKey, TextureDimension, TextureFormat, TextureSampleType, Variants,
+            SpecializerKey, TextureDimension, TextureFormat, TextureSampleType, TextureViewId,
+            Variants,
             binding_types::{sampler, texture_2d, uniform_buffer},
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
@@ -58,6 +59,7 @@ use bevy::{
 use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
+        ScreenEffectSystems,
         noise::TilingNoiseField,
         terrain::{TerrainConfig, TerrainSampler},
         world::{TILE_DISPLAY_SIZE, WORLD_TILES, tile_position_at},
@@ -335,11 +337,13 @@ impl Plugin for WeatherPlugin {
         );
         // After tonemapping, so the darkening works on the same values the screen
         // shows; in PostProcess, because `bevy_ui_render` puts its pass after that
-        // whole set — which is what keeps weather off the menus and tooltips.
+        // whole set — which is what keeps weather off the menus and tooltips. And
+        // over the terrain's own shading, which `ScreenEffectSystems` orders.
         render_app.add_systems(
             Core2d,
             weather_pass
                 .in_set(Core2dSystems::PostProcess)
+                .in_set(ScreenEffectSystems::Weather)
                 .after(tonemapping),
         );
     }
@@ -677,6 +681,12 @@ fn prepare_weather_pipelines(
 /// since which one is the source is only known inside the pass.
 #[derive(Component)]
 struct WeatherBindGroups {
+    /// Which view `a` samples. Recorded rather than re-derived, because
+    /// `post_process_write` flips the target *before* handing back its source, so
+    /// `main_texture_view()` inside the pass is the destination. With this pass
+    /// alone the parity worked out anyway; once the tint runs first, guessing it
+    /// picks the texture this pass is writing to.
+    a_view: TextureViewId,
     a: BindGroup,
     b: BindGroup,
 }
@@ -733,6 +743,7 @@ fn prepare_weather_bind_groups(
         };
 
         commands.entity(entity).insert(WeatherBindGroups {
+            a_view: target.main_texture_view().id(),
             a: bind_group(target.main_texture_view()),
             b: bind_group(target.main_texture_other_view()),
         });
@@ -761,10 +772,10 @@ fn weather_pass(
     };
 
     let post_process = target.post_process_write();
-    let bind_group = if post_process.source.id() == target.main_texture_view().id() {
-        &bind_groups.b
-    } else {
+    let bind_group = if post_process.source.id() == bind_groups.a_view {
         &bind_groups.a
+    } else {
+        &bind_groups.b
     };
 
     let mut pass = ctx

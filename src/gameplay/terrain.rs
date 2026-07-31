@@ -385,12 +385,40 @@ fn classify(config: &TerrainConfig, sample: &TileSample) -> TerrainKind {
     }
 }
 
-/// Generates the kind of every tile in the chunk whose lower-left tile sits at
-/// the global tile coordinate `origin`, in row-major order from that corner.
+/// One chunk's tiles: what each one is, and how high it was.
+///
+/// The two arrays are the same length and the same order, so index `i` is one
+/// tile's kind and that same tile's height. Keeping the height here rather than
+/// letting [`generate_chunk`] drop it is what makes the shading and the tile under
+/// it come from a single evaluation of the terrain — see [`height_byte`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChunkTerrain {
+    pub kinds: Box<[TerrainKind]>,
+    pub heights: Box<[u8]>,
+}
+
+/// An elevation as the byte the heightmap stores.
+///
+/// `TerrainSampler` already clamps its output to `0.0..=1.0`, so this is a
+/// quantization and not a guard. One byte is 1/255 of the height range, which is
+/// well under one 8-bit colour level once a tint ramp has scaled it down — so the
+/// quantization itself cannot band.
+pub fn height_byte(elevation: f32) -> u8 {
+    (elevation.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Generates the kind and the height of every tile in the chunk whose lower-left
+/// tile sits at the global tile coordinate `origin`, in row-major order from that
+/// corner.
 ///
 /// Every sample is taken in global tile space, never chunk-locally — that, and
 /// the fact that no rule here reads a neighbouring tile, is what lets the world
 /// be cut into chunks at all.
+///
+/// The height is the one `classify` cut the tile with, not a second sampling: the
+/// `TileSample` is bound rather than passed straight through, so a tile's kind and
+/// its shading cannot disagree about how high it is, and no second implementation
+/// of "how high is it here" enters the crate.
 ///
 /// This is the only expensive call in the crate, and this rework made it **2.1x**
 /// dearer: measured on one machine, the old two-field pipeline was 1.75 ms per 64x64
@@ -399,22 +427,24 @@ fn classify(config: &TerrainConfig, sample: &TileSample) -> TerrainKind {
 /// to ~34 s. `the_default_config_produces_recognisably_different_regions` is how
 /// that is taken. It is why [`crate::gameplay::world`] keeps this off the main thread
 /// wherever it can, and why the blocking budget there had to come down.
-pub fn generate_chunk(
-    config: &TerrainConfig,
-    origin: IVec2,
-    chunk_size: UVec2,
-) -> Box<[TerrainKind]> {
+pub fn generate_chunk(config: &TerrainConfig, origin: IVec2, chunk_size: UVec2) -> ChunkTerrain {
     // Hoisted: building one costs six noise fields and a biome map, and every tile
     // in the chunk wants the same one.
     let sampler = config.sampler();
 
-    (0..chunk_size.element_product())
+    let (kinds, heights): (Vec<TerrainKind>, Vec<u8>) = (0..chunk_size.element_product())
         .map(|i| {
             let x = (origin.x + (i % chunk_size.x) as i32) as f32;
             let y = (origin.y + (i / chunk_size.x) as i32) as f32;
-            classify(config, &sampler.sample(x, y))
+            let sample = sampler.sample(x, y);
+            (classify(config, &sample), height_byte(sample.elevation))
         })
-        .collect()
+        .unzip();
+
+    ChunkTerrain {
+        kinds: kinds.into(),
+        heights: heights.into(),
+    }
 }
 
 #[cfg(test)]
@@ -429,7 +459,7 @@ mod tests {
     const ORIGIN: IVec2 = IVec2::new(2048, 2048);
 
     fn kinds(config: &TerrainConfig) -> Box<[TerrainKind]> {
-        generate_chunk(config, ORIGIN, CHUNK)
+        generate_chunk(config, ORIGIN, CHUNK).kinds
     }
 
     #[test]
@@ -462,6 +492,9 @@ mod tests {
     /// The load-bearing property for a chunked world: two chunks that overlap a
     /// region must agree on it, which they only do because the samples are taken
     /// in global space and padded past the chunk border.
+    ///
+    /// Both halves of a tile, since the height is now kept as well: a heightmap
+    /// that depended on the chunking would show the chunk grid as a shading grid.
     #[test]
     fn a_tile_does_not_depend_on_where_the_chunk_boundary_falls() {
         let config = TerrainConfig::default();
@@ -472,15 +505,66 @@ mod tests {
 
         for y in 0..CHUNK.y as i32 - shift.y {
             for x in 0..CHUNK.x as i32 - shift.x {
-                let in_base = (y + shift.y) * CHUNK.x as i32 + (x + shift.x);
-                let in_shifted = y * CHUNK.x as i32 + x;
+                let in_base = ((y + shift.y) * CHUNK.x as i32 + (x + shift.x)) as usize;
+                let in_shifted = (y * CHUNK.x as i32 + x) as usize;
                 assert_eq!(
-                    base[in_base as usize],
-                    shifted[in_shifted as usize],
+                    (base.kinds[in_base], base.heights[in_base]),
+                    (shifted.kinds[in_shifted], shifted.heights[in_shifted]),
                     "tile ({}, {}) disagrees between the two chunks covering it",
                     ORIGIN.x + x + shift.x,
                     ORIGIN.y + y + shift.y,
                 );
+            }
+        }
+    }
+
+    /// The height kept beside a tile is the one it was cut with, so the shading and
+    /// the tile under it cannot disagree and no second implementation of "how high
+    /// is it here" enters the crate.
+    #[test]
+    fn every_tile_keeps_the_height_it_was_classified_from() {
+        let config = TerrainConfig::default();
+        let sampler = config.sampler();
+        let chunk = generate_chunk(&config, ORIGIN, CHUNK);
+
+        for i in 0..chunk.kinds.len() {
+            let x = (ORIGIN.x + (i as u32 % CHUNK.x) as i32) as f32;
+            let y = (ORIGIN.y + (i as u32 / CHUNK.x) as i32) as f32;
+            let sample = sampler.sample(x, y);
+
+            assert_eq!(chunk.kinds[i], classify(&config, &sample));
+            assert_eq!(chunk.heights[i], height_byte(sample.elevation));
+        }
+    }
+
+    /// The heightmap carries the water line with it, so the tint pass can leave the
+    /// sea alone without knowing what a `TerrainKind` is.
+    ///
+    /// The byte *on* the line is deliberately unconstrained, and has to be:
+    /// `107/255` is 0.4196 and `108/255` is 0.4235, so no byte lands on 0.42 and the
+    /// quantization cannot resolve which side of it a tile sat. That sliver is one
+    /// tile wide and falls on the coastline, where the tileset changes anyway.
+    #[test]
+    fn water_is_exactly_what_falls_below_the_tint_water_line() {
+        let config = TerrainConfig::default();
+        let line = height_byte(config.shallow_water_max);
+
+        for step in 0..16 {
+            let origin = IVec2::new((step % 4) * 1024 + 128, (step / 4) * 1024 + 128);
+            let chunk = generate_chunk(&config, origin, CHUNK);
+
+            for (kind, &height) in chunk.kinds.iter().zip(chunk.heights.iter()) {
+                if height < line {
+                    assert!(
+                        kind.is_water(),
+                        "{kind:?} at height {height} is under the sea"
+                    );
+                } else if height > line {
+                    assert!(
+                        !kind.is_water(),
+                        "{kind:?} at height {height} is above the sea"
+                    );
+                }
             }
         }
     }
@@ -587,7 +671,7 @@ mod tests {
             let centre = origin + IVec2::splat(32);
             let here = sampler.sample(centre.x as f32, centre.y as f32).dominant;
 
-            let tiles = generate_chunk(&config, origin, CHUNK);
+            let tiles = generate_chunk(&config, origin, CHUNK).kinds;
             let mut agreeing = 0;
             for i in 0..tiles.len() {
                 let tile =
@@ -875,8 +959,9 @@ mod tests {
         let mut checksum = 0u64;
         for i in 0..chunks {
             let origin = IVec2::new((i % 8) * 512, (i / 8) * 512);
-            for kind in generate_chunk(&config, origin, CHUNK).iter() {
-                checksum += kind.tileset_index() as u64;
+            let chunk = generate_chunk(&config, origin, CHUNK);
+            for (kind, height) in chunk.kinds.iter().zip(chunk.heights.iter()) {
+                checksum += kind.tileset_index() as u64 + *height as u64;
             }
         }
         println!(

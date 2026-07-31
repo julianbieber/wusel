@@ -82,7 +82,9 @@ and of *that tile alone*. Every sample is taken in **global tile space** (`origi
 lower-left tile), never chunk-locally, and no rule reads a neighbouring **tile**, so a chunk needs no
 padding and a tile cannot depend on where the boundary fell. The biome lookup reads neighbouring
 *cells*, which are a function of their own integer coordinates, so that property survives it.
-`a_tile_does_not_depend_on_where_the_chunk_boundary_falls` is the test that catches a regression.
+`a_tile_does_not_depend_on_where_the_chunk_boundary_falls` is the test that catches a regression, and
+it checks both halves of the `ChunkTerrain` the call returns — the kinds and, since the tint, the
+height each kind was cut from.
 
 **The height is built in layers, and which layers apply is a function of where you are.** One field
 was the original defect: `relief_scale` is 0.04, so its longest wavelength is ~25 tiles, and no
@@ -276,9 +278,10 @@ you can reach and world-space coordinates stay small enough for f32.
 Two different things are "loaded", and keeping them separate is the whole design:
 
 - **Tile data** (`WorldMap`) covers the entire world and lasts the session. One `TerrainKind` byte per
-  tile, so all 4096 chunks cost ~16 MB. A background pass on `AsyncComputeTaskPool` fills it in,
-  nearest-to-world-centre first. Chunks sit behind an `Arc` so `WorldMap::snapshot` can hand the
-  finished world to a planning task without copying it.
+  tile, so all 4096 chunks cost ~16 MB — and, since the tint, one height byte beside it for another
+  ~16 MB. A background pass on `AsyncComputeTaskPool` fills it in, nearest-to-world-centre first.
+  Chunks sit behind an `Arc` so `WorldMap::snapshot` can hand the finished world to a planning task
+  without copying it, and so queueing a chunk's heights for the GPU copies no tile data either.
 - **Chunk entities** exist only within `resident_radius` chunks of the camera. Each costs a mesh, a
   material and a per-chunk index image, which is why all 4096 cannot be resident — that was measured
   at ~400 MB and ~17 s of generation. Residency is derived from the entities' own `ChunkCoord` rather
@@ -367,6 +370,70 @@ effect is an ordinary system in the `Core2d` schedule taking `ViewQuery` and `Re
 used directly, since its bind group layout is fixed at three entries and cannot carry the two maps).
 That placement is what keeps weather off the UI: `bevy_ui_render` orders `ui_pass` *after* the whole
 `PostProcess` set.
+
+There are **two** passes in `PostProcess` now, and both ping-pong the same `ViewTarget`, so the second
+reads what the first wrote and the order is part of the result. It is stated in the `ScreenEffectSystems` set
+in `gameplay/mod.rs` — `Tint` then `Weather` — rather than with `.before(weather_pass)`, because a
+system is only usable as an ordering label where its parameter types are visible.
+
+### Terrain tint (`gameplay/tint.rs`, `assets/shaders/tint.wgsl`)
+
+Scales the rendered world's brightness by the height of the tile under each fragment, so a slope reads
+as a slope *inside* a kind's band rather than only where it crosses a `classify` edge. Cosmetic, like
+the weather: nothing here touches `WorldMap`.
+
+**The height is kept, not re-baked.** `classify` already computes every tile's elevation and used to
+drop it, so `generate_chunk` returns a `ChunkTerrain { kinds, heights }` and `WorldMap` stores both.
+Sampling the world a second time measured ~9 core-seconds against the ~34 s the chunks themselves cost,
+and would have put a second answer to "how high is it here" in a crate whose determinism tests rest on
+there being one. The cost is memory: 16 MB of heights beside the 16 MB of kinds, and 16 MB again on the
+GPU. `every_tile_keeps_the_height_it_was_classified_from` is the guard.
+
+**The map is not an `Image` asset**, because Bevy re-uploads a whole `Image` on any change and 16 MB
+per landed chunk is not a thing to do 4096 times. `tint.rs` owns a raw `WORLD_TILES` R8 texture and
+writes one chunk's 4 KB rect into it. `HeightUploadQueue` lives in `world.rs` beside `DirtyChunks`, and
+`WorldMap::insert` takes it as an argument — there is no way to store a chunk without queueing it, so
+"a chunk reaches the texture exactly once" is a property of the signature. The extract *moves* the
+queue across (`ResMut<MainWorld>`, not `Extract<Res<_>>`, which can only borrow), and the queue's
+absence is what retires the texture — it lives and dies with `WorldMap`, so a session can never be
+shown under the next session's terrain.
+
+`apply_edits` rewrites kinds only. What the map records is the height the terrain was *generated* at,
+never what was stamped over it, so a road or a town is shaded by the ground it sits on and no plan edit
+costs an upload.
+
+The shader reads with `textureLoad` at the tile's integer coordinate rather than sampling, so there is
+no sampler, no address mode and no filtering to get wrong — a brightness step lands on a tile boundary
+by construction. Chunk rows go up, matching the tiles' row-major-from-lower-left order, so no y flip
+exists anywhere. A texel nobody has written reads zero, which is below the water line, so an
+ungenerated world is untinted rather than wrong — the absence is the fallback, the way an unbaked sky
+is clear. `write_texture`'s 64-byte rows are legal: the 256-byte row alignment is
+`copy_buffer_to_texture`'s requirement, and `write_texture` waives it.
+
+Two things about the ramp:
+
+- **One ramp over the whole height range, not one per band.** A per-band ramp reverses at every band
+  edge and would draw a contour line along every coastline, treeline and snow line.
+- **Water passes through untouched**, at or below `TerrainConfig::shallow_water_max` — the water line
+  is read from there rather than restated. That leaves a `strength`-sized brightness step at the coast,
+  which is invisible because the coast is exactly where the tileset changes anyway. The cutout is exact
+  to within one quantization step: `107/255` and `108/255` straddle 0.42, so no byte lands on the line
+  and `water_is_exactly_what_falls_below_the_tint_water_line` leaves that byte unconstrained.
+
+`TerrainTintUniform` in `tint.rs` and in `tint.wgsl` are the same struct written twice, on the same
+terms as the weather's — vectors before scalars, and a mismatch is a runtime shader-compile failure.
+
+**Tune against a screenful, not against the world.** The ramp spans the whole height range, but a
+screen holds only a slice of it, so the visible spread is a fraction of `2 * strength` — 7.8% at the
+world centre, 12.1% over lowland, 5.5% over highland at the defaults. `strength` is linear in that and
+is the knob if it reads too flat. The `#[ignore]`d `the_default_ramp_measures_what_a_screenful_of_world_does`
+takes those figures. Note none of this is visible to a unit test: what proved the pass actually draws
+is a pair of captures at `strength` 0 and 0.85 with the weather plugin removed, diffed — the ratio came
+out 0.79..0.86 across the view, varying with the terrain under it.
+
+Only the height half of gh-13 is here. The noise half — a per-tile dither so identical tiles do not
+repeat exactly — is a second step with its own spec, and would be a small *tiling* dither map beside
+this one, the same trick the weather's shape map uses.
 
 ### Tileset coupling
 
