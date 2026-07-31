@@ -259,7 +259,8 @@ only it knows when the last river tile is down.
   **humidity** field clears `river_source_threshold`. Each spring is a particle walking downhill on a
   lattice **anchored on the world origin** (same trick as roads, same reason: two particles that pass
   through a place step between the same nodes, so paths coincide and flow accumulates). A tile's
-  channel width is its flow, capped at `MAX_RIVER_WIDTH` = 4.
+  channel width is its flow, capped at `MAX_RIVER_WIDTH` = 4. A step is **scored** rather than taken
+  steepest, and a segment is drawn as a curve through the node centres — see the notes below.
 - **Dry valleys** (`drainage.rs`) — the branching network the land drains through, drawn as a change of
   ground cover rather than as water: a wadi through desert sand, a gallery treeline down a lowland
   valley, reed along a marsh channel. **A drainage particle never floods** — that one rule is the whole
@@ -309,7 +310,7 @@ roads and bridges a river just **2** times, so the reuse-on-a-crossing path is v
 with no coverage from the measurement run. The cause is in the terrain, not the router: see the lake note
 below.
 
-Two things about rivers are worth knowing before tuning them:
+Some things about rivers are worth knowing before tuning them:
 
 - **A particle never steps uphill; it floods.** With nowhere lower to go it fills the basin by
   priority-flood, and the filled nodes are then **raised to the level they filled to** — a full basin
@@ -333,6 +334,61 @@ Two things about rivers are worth knowing before tuning them:
   retune against the new terrain, and it belongs with gh-9 rather than in a heightmap change. Note the
   count is insensitive to `Wetland`'s flatness — that was tried, and the lake total did not move by a
   single tile.
+
+  **That last claim was true and is now wrong**, and the reason is worth keeping. It was measured
+  before `Lattice::spill` existed, when raising the threshold only stopped a basin being *drawn*. Now
+  it also links the channel across it, so the knob trades lake for river instead of deleting water:
+  64 → 256 cut inland water by 19% while nearly doubling how far a river runs. The basins really are
+  large — that part stands — but "large" turned out to mean "worth crossing", not "impossible to
+  shift". Do not trust a measurement of a knob taken before the mechanism it feeds was written.
+- **A course is scored, not steepest** (gh-9). At most nodes several neighbours are below, so which
+  one the water takes is free shape — it costs nothing against "never climbs". Spending it on
+  steepness was what made rivers straight on a slope and a 4-tile staircase where the fall line fell
+  between two lattice directions. A step is now scored on **descent** (per tile travelled, against
+  `river_reference_drop`) + **persistence** (off the heading, `river_heading_weight`) + **meander**
+  (leaning to the side, signed by a low-frequency `SignedNoiseField`, `river_meander_weight`).
+  Measuring descent against a *fixed* reference and not against the best candidate is what lets the
+  terrain decide: steep ground swamps the other terms and the river runs the fall line, gentle ground
+  lets them lead. `river_reference_drop` is the p90 drop along a real course, read off the world by
+  the `#[ignore]`d `the_shape_of_the_worlds_rivers` — do not guess it.
+
+  Two consequences that are not optional. The heading gives a particle memory, so two particles
+  meeting would score a node differently and **braid**; hence a node's successor is fixed by the first
+  particle through and followed by every later one. And on flat ground the bias is the only thing
+  steering, so a course will curl into a closed ring — hence a particle may not step onto ground it
+  has already crossed, which turns the ring into a flood.
+- **Measure bends as excursion, never as sinuosity.** The obvious metric is a trap: steepest descent
+  already scored 1.18 sinuosity, because a staircase travels 1.2x the distance it covers without ever
+  leaving the straight line. Excursion — the furthest the course swings off its own straight line —
+  is what tells a bend from a staircase, and `the_bends_come_from_the_scoring_and_not_from_the_lattice`
+  asserts it against the same world with the shape terms switched off rather than against a constant.
+- **The thing that actually lengthened the rivers was none of the above.** A basin under
+  `river_lake_min_tiles` is filled and spilled through but not drawn, and no successor was recorded
+  across it — so the channel had an **invisible hole** every few nodes, and no course ran far enough to
+  hold a bend. Linking the entry node to the outlet (`Lattice::spill`) nearly doubled the courses long
+  enough to have a shape. A basin *over* the threshold is still left unlinked, because that is a lake:
+  the river ends at its shore and a new one leaves the far side. The lattice stride was the other
+  suspect and it is innocent — swept 4 to 16 it changes nothing, because a river floods a pit where a
+  drainage particle stops at one.
+
+  This also turns `river_lake_min_tiles` into **the** length knob, since every basin under it is now
+  crossed rather than ending a course — see its doc comment for the sweep. Raising it 64 → 256 is
+  where most of the length came from.
+
+  After all of it: 46.8k tiles of river (was 26.3k, and 0.28% of the world against roads' 0.24%),
+  190.7k of lake (was 234.7k), 680 courses of 8+ nodes (was 232), p90 course 108 tiles, mean
+  excursion 0.295, 6 road bridges (was 1 — the reuse-on-a-crossing path finally has coverage).
+
+  **Inland water is still the ceiling.** 190.7k tiles of lake against 46.8k of river: a course meets a
+  drawn lake every ~110 tiles now rather than every ~20, which is why bends became visible at all, but
+  a 50-tile meander wavelength still only fits twice between lakes. Getting further is a question
+  about how many basins the continent layer makes, not about river shape, and it wants its own task.
+
+  One knob here is inert and worth knowing about before reaching for it: `river_flat_run_nodes` does
+  not change a single tile of the default world at any value from 0 to 256. Level steps are what let a
+  course wander a flood plain, and on a continuous noise field an exactly-level step essentially never
+  comes up — the cap earns its place against a *synthetic* flat world, where without it the water
+  wanders to the step cap and stops in the middle of nowhere.
 
 Config defaults in `WorldPlanConfig` carry their measurements in the doc comments; the
 `#[ignore]`d `the_default_config_lays_out_cities_of_every_size_and_roads_between_them` in `plan.rs`

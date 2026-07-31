@@ -57,6 +57,51 @@ impl NoiseField {
     }
 }
 
+/// The same fbm read as a **signed** displacement rather than as a height.
+///
+/// Every other field here is remapped to [0, 1], because everything else asks it
+/// "how high / how green / how wet". A meander bias asks "which way does the
+/// water lean here", and that question has no natural zero at 0.5 — it has one at
+/// 0, where the river runs straight. Remapping and then subtracting a half would
+/// give the same numbers only until someone changed [`NOISE_GAIN`], which is
+/// tuned for the terrain thresholds and not for this.
+///
+/// Deliberately few octaves. The value of the field is that its *sign* holds over
+/// tens of tiles and then reverses — that alternation is what a meander is — and
+/// a fine octave on top only adds a wobble that the lattice cannot represent
+/// anyway.
+pub struct SignedNoiseField {
+    offset: Vec2,
+    scale: f32,
+    octaves: u32,
+}
+
+impl SignedNoiseField {
+    pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
+        let h = hash2(seed as i32, salt as i32);
+        Self {
+            offset: Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0),
+            scale,
+            octaves,
+        }
+    }
+
+    /// Sample at a global tile position, in [-1, 1]. Stretched by the same
+    /// reasoning as [`NOISE_GAIN`] — raw fbm rarely gets near its nominal range,
+    /// so an unstretched field would lean the water only feebly and never commit
+    /// to a side.
+    pub fn sample(&self, x: f32, y: f32) -> f32 {
+        let n = fbm(
+            x * self.scale + self.offset.x,
+            y * self.scale + self.offset.y,
+            self.octaves,
+            NOISE_PERSISTENCE,
+            NOISE_LACUNARITY,
+        );
+        (n * NOISE_GAIN).clamp(-1.0, 1.0)
+    }
+}
+
 /// The same lattice read for its creases instead of its peaks: a ridged field is
 /// large where the underlying noise crosses zero, so its maxima form connected
 /// *lines* rather than isolated blobs.

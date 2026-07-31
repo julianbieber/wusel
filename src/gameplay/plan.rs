@@ -121,10 +121,101 @@ pub struct WorldPlanConfig {
     /// real hierarchy of tributaries would need an elevation field with
     /// something longer than a 25-tile wavelength in it.
     pub river_flow_per_width: u32,
+    /// The drop per tile at which the terrain outvotes the shape rules.
+    ///
+    /// The first of six knobs that are **shape** controls, which is a category
+    /// this config did not have: until now a river's course was whatever
+    /// steepest descent produced, and every knob here was a density, a budget or
+    /// a backstop.
+    ///
+    /// A step's descent is scored against this rather than against the best
+    /// available step, and that choice is the whole reason the rule behaves
+    /// differently in different country. On a steep slope the drops are large
+    /// multiples of it, descent swamps the other two terms, and the river runs
+    /// near the fall line — which is what a river in steep ground does. On
+    /// gentle ground every drop is a fraction of it, the term goes quiet, and
+    /// the heading and meander terms decide. Score against the best candidate
+    /// instead and the terms keep the same proportions everywhere, so a
+    /// mountain torrent meanders exactly as hard as a lowland one.
+    ///
+    /// So it has to be read off the terrain rather than picked. The drop per tile
+    /// along a course on the default world runs 0.0008 at p10, 0.0049 at the
+    /// median and 0.0123 at p90, and the default is that p90 — nine steps in ten
+    /// are gentle enough for the shape terms to have a say, and the steepest
+    /// tenth is left to the hill. Measured against mean excursion, which is the
+    /// number `the_shape_of_the_worlds_rivers` exists to print: 0.002 gives
+    /// 0.202, 0.004 gives 0.205, 0.012 gives 0.228, 0.020 gives 0.249 and 0.040
+    /// gives 0.266. It keeps paying past p90 — but past there the descent term is
+    /// a rounding error, and a river that ignores the ground it is on except to
+    /// avoid climbing is not a river.
+    pub river_reference_drop: f32,
+    /// What continuing in the same direction is worth, against a drop of
+    /// `river_reference_drop`.
+    ///
+    /// This is the term that kills the staircase. Where the true fall direction
+    /// falls between two of the eight lattice directions, steepest descent flips
+    /// between them every node and lays a zigzag with 4-tile teeth; a particle
+    /// that pays to turn picks one and holds it.
+    pub river_heading_weight: f32,
+    /// What leaning to the side the meander field points is worth, on the same
+    /// scale as `river_heading_weight`.
+    ///
+    /// Against the heading term this is the sinuosity dial: heading alone gives
+    /// straighter rivers than steepest descent, meander alone gives a course
+    /// that wanders without committing, and the ratio between them is what makes
+    /// a bend a bend.
+    pub river_meander_weight: f32,
+    /// Noise scale of the meander field, so 1 / this is the wavelength in tiles
+    /// over which the water changes which way it leans — half a wavelength is
+    /// one bend.
+    ///
+    /// The default is ~50 tiles, which is about a screen at zoom 1: a bend you
+    /// can see the whole of without it reading as a wobble in a straight line.
+    pub river_meander_scale: f32,
+    /// How many level steps in a row are wandering rather than pooling.
+    ///
+    /// A particle may now take a step that does not descend, which is what lets
+    /// a river meander across a flood plain instead of flooding it — but only
+    /// this many in a row, or a broad flat would swallow the course entirely and
+    /// leave it stopping in the middle of nowhere at the step cap. Past this the
+    /// water is declared to be standing and the basin is flooded from where the
+    /// particle stands, which is the old behaviour arrived at late.
+    pub river_flat_run_nodes: u32,
+    /// Fewest points a channel segment's curve is sampled at.
+    ///
+    /// A floor, not a count: the sampling is dense enough to leave no gaps on
+    /// its own, and this only matters for a segment short enough that the
+    /// gap-free density would be one or two points.
+    pub river_curve_samples: u32,
     /// A basin that spills before it holds this much water leaves no lake at
     /// all. Load-bearing: fbm at this stride is full of dips a tile or two deep,
     /// and a pond at every one of them would turn each river into a string of
     /// beads.
+    ///
+    /// **Since `Lattice::spill` this is also the lever on how long a river is**,
+    /// and it is by a distance the strongest one. A basin under it is not merely
+    /// undrawn — the channel is drawn straight across it — so raising this
+    /// converts lakes into crossings, and every lake converted is one that is no
+    /// longer chopping a course in two. Measured on the default world:
+    ///
+    /// ```text
+    ///   min   courses>=8   p90 course   excursion   river     lake
+    ///    64          453      64 tiles       0.228   36418   234714
+    ///   128          560      81 tiles       0.256   40987   218674
+    ///   256          680     108 tiles       0.295   46842   190722
+    ///   512          779     151 tiles       0.358   57167   127460
+    /// ```
+    ///
+    /// It keeps paying, and past 512 it runs out of road: no basin can exceed
+    /// `river_lake_max_tiles`, so above that nothing is ever drawn and the world
+    /// has no inland water at all. 256 is the default because river coverage
+    /// lands at 0.28% against roads' 0.24% — the yardstick every other density
+    /// here was chosen against — where 512 gives 0.34%.
+    ///
+    /// What it costs is honesty about the water: a basin under this is *filled*,
+    /// so the river crosses standing water that is not drawn. At 256 that is a
+    /// hollow up to 16 tiles across, which reads as a river running over a damp
+    /// flat; at 512 it is 23 and starting to be a pond that is missing.
     pub river_lake_min_tiles: u32,
     /// A basin that has not found a way out by this size is a closed lake, and
     /// the river feeding it ends there. This is what stops one unlucky basin
@@ -208,7 +299,13 @@ impl Default for WorldPlanConfig {
             river_step_tiles: 4,
             river_max_steps: 2048,
             river_flow_per_width: 2,
-            river_lake_min_tiles: 64,
+            river_reference_drop: 0.012,
+            river_heading_weight: 0.6,
+            river_meander_weight: 1.0,
+            river_meander_scale: 0.02,
+            river_flat_run_nodes: 24,
+            river_curve_samples: 8,
+            river_lake_min_tiles: 256,
             river_lake_max_tiles: 512,
             river_chunks_stamped_per_frame: 64,
             drain_source_cell_tiles: 24,
