@@ -68,11 +68,34 @@ pub struct HeightRecipe {
     pub relief: f32,
     /// How much of the ridged layer to add. One-sided, so it only builds up.
     pub ridge: f32,
+    /// How much of the dune layer to add. Non-zero only for `Desert`, and the
+    /// epsilon skip on it is what keeps the aeolian sample off the other five
+    /// biomes' bill — the same trick `ridge` already earns.
+    pub dune: f32,
+    /// Shifts how much loose material this ground holds before slope strips any:
+    /// positive for a `Wetland`'s silt, negative for a `Highland`'s bare rock.
+    pub soil_bias: f32,
     pub vegetation_bias: f32,
     pub humidity_bias: f32,
     /// How far above the water line the sand band reaches, in elevation units.
     /// Zero means no beach: a `Highland` coast drops into the sea as rock.
     pub beach_width: f32,
+}
+
+/// The three kinds a biome's lowland band chooses between, in ascending
+/// vegetation order.
+///
+/// A triple rather than the pair it replaces, and that is half of what gh-14 is:
+/// a binary driven by one 11-tile field is a dither, not a landscape. With three
+/// steps a `vegetation_bias` shifts a region along the ladder instead of
+/// saturating it against a single cut — the measured symptom was `Desert`, whose
+/// bias put 92.5% of its tiles on one side of `forest_threshold` and so made it
+/// 80% Sand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverTriple {
+    pub bare: TerrainKind,
+    pub mid: TerrainKind,
+    pub lush: TerrainKind,
 }
 
 impl Biome {
@@ -91,7 +114,9 @@ impl Biome {
                 base_height: 0.20,
                 relief: 0.10,
                 ridge: 0.0,
-                vegetation_bias: 0.0,
+                dune: 0.0,
+                soil_bias: 0.0,
+                vegetation_bias: -0.12,
                 humidity_bias: 0.04,
                 beach_width: 0.06,
             },
@@ -99,17 +124,24 @@ impl Biome {
                 base_height: 0.52,
                 relief: 0.09,
                 ridge: 0.0,
-                vegetation_bias: -0.09,
+                dune: 0.0,
+                soil_bias: 0.05,
+                vegetation_bias: -0.18,
                 humidity_bias: 0.0,
                 beach_width: 0.04,
             },
-            // The same pair as Plains, and the bias is the whole difference: a wood
-            // with clearings against a field with copses.
+            // The same triple as Plains, and the bias is the whole difference: a
+            // wood with clearings against a field with copses.
             Biome::Forest => HeightRecipe {
                 base_height: 0.55,
                 relief: 0.13,
                 ridge: 0.02,
-                vegetation_bias: 0.13,
+                dune: 0.0,
+                // Leaf litter and a closed canopy: forest soil is the deepest in
+                // the table, which is what keeps a wood from going bald on every
+                // slope the way a highland does.
+                soil_bias: 0.04,
+                vegetation_bias: -0.04,
                 humidity_bias: 0.06,
                 beach_width: 0.03,
             },
@@ -119,17 +151,27 @@ impl Biome {
                 base_height: 0.70,
                 relief: 0.11,
                 ridge: 0.34,
-                vegetation_bias: 0.0,
+                dune: 0.0,
+                // Negative, so a highland is stripped to bedrock on a gentler slope
+                // than anywhere else. This is what puts Rock on the shoulders of a
+                // range rather than only above `scree_min`.
+                soil_bias: -0.15,
+                vegetation_bias: -0.09,
                 humidity_bias: 0.03,
                 beach_width: 0.0,
             },
-            // Same pair as Ocean's islands; the biases are what make it a desert.
-            // The dry one is also why no spring rises here and no cloud gathers.
+            // The one recipe that weighs the dune layer. The biases are what make
+            // it a desert; the dry one is also why no spring rises here and no
+            // cloud gathers.
             Biome::Desert => HeightRecipe {
                 base_height: 0.51,
                 relief: 0.11,
                 ridge: 0.04,
-                vegetation_bias: -0.30,
+                dune: 1.0,
+                // Thin: what is not under a dune is deflated to hardpan, which is
+                // what puts Gravel in the interdunes.
+                soil_bias: 0.0,
+                vegetation_bias: -0.24,
                 humidity_bias: -0.26,
                 beach_width: 0.08,
             },
@@ -139,31 +181,67 @@ impl Biome {
                 base_height: 0.47,
                 relief: 0.04,
                 ridge: 0.0,
-                vegetation_bias: 0.04,
+                dune: 0.0,
+                // Silt, and the deepest soil there is — a wetland is where the rest
+                // of the world's stripped material ends up.
+                soil_bias: 0.0,
+                vegetation_bias: -0.20,
                 humidity_bias: 0.22,
                 beach_width: 0.0,
             },
         }
     }
 
-    /// What this biome's lowland band lays down: the kind below the vegetation
-    /// threshold, then the kind at or above it.
+    /// What this biome's lowland band lays down, in ascending vegetation order.
     ///
     /// Not part of [`HeightRecipe`] because it cannot be blended — so at a boundary
     /// this is the one thing that changes all at once, and it is deliberately the
     /// thing elevation does *not* depend on. That is what makes a boundary read as a
     /// treeline rather than a wall.
-    pub fn kinds(self) -> (TerrainKind, TerrainKind) {
+    ///
+    /// `Scrub` is the tile that made three steps possible: it is the missing rung
+    /// between Sand and Grass *and* between Grass and Forest, so five of the six
+    /// biomes can now spend a `vegetation_bias` on moving along the ladder instead
+    /// of pinning themselves to one end of it.
+    pub fn kinds(self) -> CoverTriple {
         match self {
-            Biome::Ocean => (TerrainKind::Sand, TerrainKind::Grass),
-            Biome::Plains => (TerrainKind::Grass, TerrainKind::Forest),
-            // The same pair as Plains: the vegetation_bias is the whole difference,
-            // a wood with clearings against a field with copses.
-            Biome::Forest => (TerrainKind::Grass, TerrainKind::Forest),
-            Biome::Highland => (TerrainKind::Rock, TerrainKind::Forest),
-            // The same pair as Ocean's islands; the biases make it a desert.
-            Biome::Desert => (TerrainKind::Sand, TerrainKind::Grass),
-            Biome::Wetland => (TerrainKind::Marsh, TerrainKind::Forest),
+            // Bars and islands: bare sand, scrub where it holds, grass where it is
+            // wettest. Never Forest — an island in this world is not a wood.
+            Biome::Ocean => CoverTriple {
+                bare: TerrainKind::Sand,
+                mid: TerrainKind::Scrub,
+                lush: TerrainKind::Grass,
+            },
+            Biome::Plains => CoverTriple {
+                bare: TerrainKind::Scrub,
+                mid: TerrainKind::Grass,
+                lush: TerrainKind::Forest,
+            },
+            // The same triple as Plains: the vegetation_bias is the whole
+            // difference, a wood with clearings against a field with copses.
+            Biome::Forest => CoverTriple {
+                bare: TerrainKind::Scrub,
+                mid: TerrainKind::Grass,
+                lush: TerrainKind::Forest,
+            },
+            Biome::Highland => CoverTriple {
+                bare: TerrainKind::Rock,
+                mid: TerrainKind::Scrub,
+                lush: TerrainKind::Forest,
+            },
+            // The whole ladder shifted one rung dry of everyone else's: a desert's
+            // *lushest* lowland is scrub, and its bare end is the hardpan the wind
+            // has deflated to.
+            Biome::Desert => CoverTriple {
+                bare: TerrainKind::Gravel,
+                mid: TerrainKind::Sand,
+                lush: TerrainKind::Scrub,
+            },
+            Biome::Wetland => CoverTriple {
+                bare: TerrainKind::Marsh,
+                mid: TerrainKind::Reed,
+                lush: TerrainKind::Forest,
+            },
         }
     }
 
@@ -359,11 +437,13 @@ impl BiomeMap {
             base_height: 0.0,
             relief: 0.0,
             ridge: 0.0,
+            dune: 0.0,
+            soil_bias: 0.0,
             vegetation_bias: 0.0,
             humidity_bias: 0.0,
             beach_width: 0.0,
-            // Overwritten below; the dominant biome owns the kind pair, since an
-            // enum cannot be averaged.
+            // The kind triple is not here: the cover biome owns it, since an enum
+            // cannot be averaged.
         };
         for (slot, &(_, biome)) in sites.iter().enumerate() {
             if weights[slot] == 0.0 {
@@ -374,6 +454,10 @@ impl BiomeMap {
             recipe.base_height += part.base_height * share;
             recipe.relief += part.relief * share;
             recipe.ridge += part.ridge * share;
+            // Blended like every other weight, which is what decays a dune field
+            // out across a desert's border rather than ending it on the line.
+            recipe.dune += part.dune * share;
+            recipe.soil_bias += part.soil_bias * share;
             recipe.vegetation_bias += part.vegetation_bias * share;
             recipe.humidity_bias += part.humidity_bias * share;
             recipe.beach_width += part.beach_width * share;

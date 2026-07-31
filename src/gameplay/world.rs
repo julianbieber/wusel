@@ -52,8 +52,15 @@ const RESIDENT_MARGIN_CHUNKS: i32 = 1;
 
 /// The worst-case stall the streamer may add to a frame when the camera outruns the
 /// background pass. This was two when a chunk cost ~4 ms; the biome rework made
-/// generation 1.9x dearer (~7.5 ms on the same footing), so two chunks would now be
-/// most of a frame at 60 fps and the budget buys the same stall with one.
+/// generation 1.9x dearer and it came down to one. gh-14's substrate layers made it
+/// 1.8x dearer again — 6.6 ms per 64x64 chunk, measured by
+/// `terrain::the_default_config_produces_recognisably_different_regions` — so one
+/// chunk is now most of a 60 fps frame on its own and there is no room to go back up.
+///
+/// It cannot go to zero: the streamer is the only thing that fills a chunk the
+/// camera has already reached, so a budget of none would leave a hole on screen
+/// until the background pass happened to arrive. One late frame beats one empty
+/// chunk, which is why this is a stall budget and not a switch.
 const MAX_BLOCKING_GENERATIONS_PER_FRAME: usize = 1;
 
 /// Chunk entities built per frame. Panning only ever brings a row of them into
