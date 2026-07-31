@@ -22,6 +22,7 @@ use bevy::{
 use crate::{
     gameplay::{
         city::{City, CityMap, PlannedCity, plan_cities},
+        drainage::{DrainagePlan, plan_drainage},
         river::{RiverPlan, plan_rivers},
         road::{RoadNetwork, RoutedRoad, choose_pairs, route_road},
         terrain::TerrainConfig,
@@ -133,6 +134,61 @@ pub struct WorldPlanConfig {
     /// whole world in one frame would be a visible stall; spread out, it is the
     /// rivers filling in across the map, which is worth watching.
     pub river_chunks_stamped_per_frame: u32,
+    /// The world is cut into squares this wide, each proposing at most one valley
+    /// head. Coarser than the river spacing on purpose: these are the trunk
+    /// valleys a landscape reads by, not every rill in it.
+    ///
+    /// With `drain_min_flow`, the lever on how much of the network you see.
+    /// Measured on the default world as a share of tiles, at a step of 16:
+    ///
+    /// ```text
+    ///   cell   floor 2   floor 3
+    ///     48    0.063%    0.014%
+    ///     32    0.227%    0.081%
+    ///     24    0.452%    0.199%
+    ///     16    1.224%    0.633%
+    /// ```
+    ///
+    /// 24 against a floor of 3 gives 0.199%, next to roads at 0.24% — which is the
+    /// same yardstick `river_source_cell_tiles` was chosen against. Note the two
+    /// columns are different pictures at the same density and not a free choice:
+    /// tightening the cell adds *heads* and so lengthens the branching network,
+    /// while dropping the floor draws paths that fewer descents agreed on, which
+    /// adds isolated rills. See `the_drainage_density_against_its_two_knobs`.
+    pub drain_source_cell_tiles: u32,
+    /// Tiles between lattice nodes when a drainage particle descends.
+    ///
+    /// Four times the river stride, and that is what makes the stage work at all.
+    /// A drainage particle never floods, so it stops at the first node with nothing
+    /// lower beside it — and at the river's 4-tile stride the relief layer's own
+    /// fine octaves put a local minimum every few nodes, so the first cut of this
+    /// laid **404 tiles in the entire world** because no two descents ever met. The
+    /// pits are a property of the sampling scale, not of the landscape: at 16 tiles
+    /// the walk sees the broad fall of the ground, particles run for hundreds of
+    /// tiles, and their paths coincide often enough for flow to mean something.
+    ///
+    /// The precision is not missed. A valley is a broad feature, and the lattice is
+    /// still anchored on the world origin, which is the property that actually
+    /// matters — two particles crossing the same ground step between the same
+    /// nodes. It is also 16x less scratch than the river lattice.
+    pub drain_step_tiles: u32,
+    /// How many particles must agree on a node before it is drawn at all.
+    ///
+    /// The floor is what stops this reintroducing the speckle gh-14 is about: every
+    /// valley head walks a path, and drawing all of them would put a one-tile
+    /// squiggle through every square of the world. Only where descents *converge*
+    /// is there a valley worth seeing.
+    pub drain_min_flow: u32,
+    /// How wide a heavily used channel gets. Small — this is a treeline, not a
+    /// river, and a wide one would read as a road.
+    pub drain_max_width: u32,
+    /// How far a particle may walk before it is abandoned. A backstop only: every
+    /// step is strictly downhill, so a walk terminates on the terrain long before
+    /// this.
+    pub drain_max_steps: u32,
+    /// How many chunks of dry valley are stamped per frame, on the same terms as
+    /// the rivers'.
+    pub drain_chunks_stamped_per_frame: u32,
 }
 
 impl Default for WorldPlanConfig {
@@ -155,6 +211,12 @@ impl Default for WorldPlanConfig {
             river_lake_min_tiles: 64,
             river_lake_max_tiles: 512,
             river_chunks_stamped_per_frame: 64,
+            drain_source_cell_tiles: 24,
+            drain_step_tiles: 16,
+            drain_min_flow: 3,
+            drain_max_width: 2,
+            drain_max_steps: 512,
+            drain_chunks_stamped_per_frame: 64,
         }
     }
 }
@@ -168,6 +230,12 @@ impl Default for WorldPlanConfig {
 pub enum WorldPlan {
     WaitingForTerrain,
     Rivers(RiverStamping),
+    /// The dry valleys, between the rivers and the cities. It has to be after the
+    /// rivers so a channel ends where the water starts rather than crossing it, and
+    /// before the cities because it moves tiles onto and off the habitable list —
+    /// a wadi through a desert lays down settleable ground, and a city stage that
+    /// had already run would never see it.
+    Drainage(DrainageStamping),
     Cities(Task<Vec<PlannedCity>>),
     Roads(RoadPlanning),
     Done,
@@ -186,6 +254,18 @@ pub struct RiverStamping {
     /// Chunks still to stamp. Reversed on arrival so that `pop` yields them in
     /// chunk order, and the fill sweeps the world one way rather than jumping
     /// about.
+    pending: Vec<Vec<TileEdit>>,
+}
+
+/// The drainage stage's working set — the river stage's shape exactly, and for the
+/// same reasons: one task cuts every valley in the world at once because the
+/// particles share their flow through the lattice rather than through the map, and
+/// the stamping is spread because the edit list is large enough that `apply_edits`
+/// would be a visible stall in one frame.
+pub struct DrainageStamping {
+    in_flight: Option<Task<DrainagePlan>>,
+    /// Reversed on arrival so that `pop` yields chunks in order and the fill sweeps
+    /// the world one way rather than jumping about.
     pending: Vec<Vec<TileEdit>>,
 }
 
@@ -228,6 +308,7 @@ impl Plugin for WorldPlanPlugin {
             (
                 start_river_plan,
                 apply_river_plan,
+                apply_drainage_plan,
                 apply_city_plan,
                 drive_road_plan,
             )
@@ -307,6 +388,58 @@ fn apply_river_plan(
     }
 
     for _ in 0..config.river_chunks_stamped_per_frame.max(1) {
+        let Some(edits) = state.pending.pop() else {
+            break;
+        };
+        map.apply_edits(&edits, &mut dirty);
+    }
+
+    if !state.pending.is_empty() {
+        return;
+    }
+
+    let world = map
+        .snapshot()
+        .expect("the world was complete when the plan started");
+    let terrain = terrain.clone();
+    let config = config.clone();
+    let task =
+        AsyncComputeTaskPool::get().spawn(async move { plan_drainage(&terrain, &config, &world) });
+    *plan = WorldPlan::Drainage(DrainageStamping {
+        in_flight: Some(task),
+        pending: Vec::new(),
+    });
+}
+
+/// Stamps the dry valleys a batch of chunks at a time, and opens the city stage
+/// once the last of them is down.
+///
+/// The city stage starts from here for the reason it used to start from the river
+/// stage: the snapshot it plans against has to be the one *with* the valleys in it.
+/// This stage moves tiles across the habitable line in both directions — a wadi
+/// turns desert `Sand` into settleable `Scrub` — so a city plan taken before it
+/// would be planning a different world from the one on screen.
+fn apply_drainage_plan(
+    mut plan: ResMut<WorldPlan>,
+    mut map: ResMut<WorldMap>,
+    mut dirty: ResMut<DirtyChunks>,
+    terrain: Res<TerrainConfig>,
+    config: Res<WorldPlanConfig>,
+) {
+    let WorldPlan::Drainage(state) = &mut *plan else {
+        return;
+    };
+
+    if let Some(task) = &mut state.in_flight {
+        let Some(planned) = block_on(poll_once(task)) else {
+            return;
+        };
+        state.in_flight = None;
+        state.pending = planned.by_chunk;
+        state.pending.reverse();
+    }
+
+    for _ in 0..config.drain_chunks_stamped_per_frame.max(1) {
         let Some(edits) = state.pending.pop() else {
             break;
         };
@@ -450,7 +583,32 @@ mod tests {
         let rivers = plan_rivers(&terrain, &config, &base);
         let river_edits: Vec<TileEdit> = rivers.by_chunk.iter().flatten().copied().collect();
         report_rivers(&base, &rivers, &river_edits);
-        let world = base.with_edits(&river_edits);
+        let watered = base.with_edits(&river_edits);
+
+        // The drainage stage sits between the rivers and the cities, and it has to
+        // be here rather than skipped: it moves tiles across the habitable line, so
+        // a city plan taken against `watered` would be planning a different world
+        // from the one the game shows.
+        let drainage = plan_drainage(&terrain, &config, &watered);
+        let drain_edits: Vec<TileEdit> = drainage.by_chunk.iter().flatten().copied().collect();
+        println!(
+            "{} tiles of dry valley across {} chunks",
+            drain_edits.len(),
+            drainage.by_chunk.len()
+        );
+        assert!(
+            !drain_edits.is_empty(),
+            "the world has no dry valleys at all"
+        );
+        for edit in &drain_edits {
+            assert!(
+                !edit.kind.is_water(),
+                "the drainage stage laid {:?} at {}",
+                edit.kind,
+                edit.tile
+            );
+        }
+        let world = watered.with_edits(&drain_edits);
 
         let planned = plan_cities(&terrain, &config, &world);
         let cities: Vec<City> = planned.iter().map(|p| p.city).collect();

@@ -108,10 +108,38 @@ would mean rivers running up the visible hills. `settlement_field()` is the one 
 `city.rs` compares scores between sites and nothing biome-dependent enters into it.
 
 Then `classify` cuts the result into bands: deep water / shallow water / **sand** / lowland /
-mountain / **rock** / **snow**. What the biome changes is what *fills* a band — the lowland pair comes
+mountain / **rock** / **snow**. What the biome changes is what *fills* a band — the lowland triple comes
 from `Biome::kinds()` rather than being Grass and Forest everywhere, and the sand band above the water
 line is as wide as the recipe says, which is zero for a `Highland` coast and so gives a cliff instead
 of a beach.
+
+**Three more layers make the lowland band read the height instead of discarding it** (gh-14). The band
+spans 0.42–0.72, 30% of the height scale, and used to collapse all of it into one vegetation test at an
+11-tile wavelength — which is why the mountains, where the height *does* pick the kind, were the only
+part of the world that read as landscape. Now:
+
+- **soil** — how much loose material sits on the bedrock, from the *slope* of the height the tile was
+  already going to be cut with. Below `bedrock_max` the biome gets no say and the rock shows through.
+- **hardness** (`lithology_*`) — a strongly anisotropic field on one world strike, giving hard/soft
+  bands 40–160 tiles wide. Its value is that it is **uncorrelated with the biome Voronoi**: a second
+  partition cutting across the first, which is what stops a region's interior being self-similar.
+  `hardness_is_uncorrelated_with_the_biome_map` is the guard.
+- **dune** (`dune_*`) — transverse aeolian crests, weighted per recipe so only `Desert` pays for the
+  sample, on the same epsilon skip `ridge` earns. **Dunes reach the tileset through soil and vegetation,
+  never through a rule**: a crest is deep loose material nothing grows on, so it climbs a rung to Sand,
+  and the deflated trough beside it falls to Gravel. No rule anywhere names `Desert`.
+
+All three also displace the height a little, which is nearly free and deliberate — the tint pass shades
+the world by the stored per-tile height, so a hogback ridge and a dune field get their shading with
+nothing new drawn.
+
+**The gradient must not cost a second biome lookup.** The expensive part of a height sample is `blend()`,
+not the height; the recipe is constant outside a 48-tile band, so `soil` re-uses *this tile's own* recipe
+and samples only relief and ridge. Getting that wrong triples the per-tile cost instead of doubling it.
+
+`soil_vegetation_gain` is the knob that made this work at all. Letting soil decide only whether bedrock
+breaks through leaves every tile that *has* soil — most of the world, and nearly all of `Plains` —
+picking its kind from vegetation alone exactly as before.
 
 ### Biomes (`gameplay/biome.rs`)
 
@@ -157,11 +185,17 @@ Two more details hold the shape together:
   boundary exactly one weight is non-zero and a region has an *interior*. Without that the world
   would be an average of all six everywhere. `biome_blend_tiles` must stay well under the cell's
   inradius (~192): at 96 only a quarter of the world was interior, which is why it is 48.
-- **`HeightRecipe` is numbers only; the kind pair lives on `Biome::kinds()`.** An enum cannot be
-  averaged, so the pair comes from a single biome — `cover`, per the dither above. It is therefore the
+- **`HeightRecipe` is numbers only; the kind triple lives on `Biome::kinds()`.** An enum cannot be
+  averaged, so the triple comes from a single biome — `cover`, per the dither above. It is therefore the
   one thing about a tile that changes all at once, and deliberately the one thing elevation does *not*
   depend on, which is what lets a boundary read as a treeline rather than a wall. `dominant` (the
   argmax) is the separate question "which region is this", and only the measurements ask it.
+- **A triple, not a pair** (gh-14). Two rungs meant a `vegetation_bias` did not move a region along a
+  ladder, it pinned the region to one end: `Desert`'s -0.30 put 92.5% of its tiles below the single cut
+  and made it 80% Sand. `Scrub` is the tile that made three rungs possible, and five of the six biomes
+  use it. `no_region_is_built_out_of_one_or_two_kinds` is the guard, and it is the one test that would
+  have caught the world gh-14 was opened about — everything else asks whether a kind exists *somewhere*,
+  and nothing asked whether a region was made of only one.
 
 Six biomes, because the drawn palette supports six that look different: `Ocean`, `Plains`, `Forest`,
 `Highland`, `Desert`, `Wetland`. Tundra is absent — with no cold-grass or conifer tile the only thing
@@ -186,21 +220,34 @@ rivers rise where it rains and the clouds are drawn from the same field, which i
 Everything is driven by `TerrainConfig`; the biome recipe table lives in `biome.rs` and carries its
 measured coverage in `the_default_config_produces_recognisably_different_regions` (`cargo test
 --release -- --ignored --nocapture`, and run it *alone* — three measurement tests in parallel contend
-for CPU and inflate the per-chunk figure). At the defaults the world is 33.5% water, and the four
-tiles the rework added all earn their column: Sand 14.6%, Rock 6.6%, Snow 2.8%, Marsh 2.1%. Biome
-coverage runs Ocean 30.6%, Forest 21.4%, Plains 15.9%, Highland 13.9%, Desert 11.9%, Wetland 6.4%.
+for CPU and inflate the per-chunk figure). At the defaults the world is 33.3% water, and every added
+tile earns its column: Scrub 12.8%, Sand 9.5%, Rock 7.4%, Gravel 5.2%, Snow 2.8%, Marsh 1.9%, Reed 1.8%.
+Biome coverage is unmoved by gh-14 — Ocean 30.6%, Forest 21.4%, Plains 15.9%, Highland 13.9%,
+Desert 11.9%, Wetland 6.4% — because the substrate layers change what *fills* a region, not where the
+regions are.
 
-This is the only expensive call in the crate, and the biome rework made it **2.1× dearer**: 1.75 ms
-per 64×64 chunk before against 3.70 ms now, measured on one machine, which scales the ~4 ms the older
-notes were written against to ~8.5 ms and the whole-world background pass from ~16 s to ~34 s. That is
-why `MAX_BLOCKING_GENERATIONS_PER_FRAME` came down from 2 to 1. Treat it as something to keep off the
-main thread.
+What a region is made of, which is what gh-14 was about: Plains runs Scrub 34 / Grass 23 / Forest 20 /
+Sand 13, Desert Sand 39 / Gravel 30 / Scrub 17, Wetland Marsh 26 / Reed 25 / Forest 23. Before the
+change Desert was **80% Sand** and Plains 53% Grass. Mean run length went *up* (5.9–7.9 tiles against
+4–6.5), so the patches are the same size or bigger — they are simply made of four kinds instead of two.
+
+**Measure structure as excess agreement over chance, never raw agreement.** Two tiles of a one-kind
+region agree 100% of the time while carrying no structure at all, so raw agreement rewards exactly the
+monotony it is supposed to detect — the first pass at gh-14 misdiagnosed a "spectral gap" from an
+unnormalised table, and the plateau turned out to be the chance floor of an 80%-Sand desert.
+`the_default_config_measures_the_structure_gap` prints the normalised curve for the shipped world
+against one with the layers switched off.
+
+This is the only expensive call in the crate, and it keeps getting dearer: 1.75 ms per 64×64 chunk
+originally, 3.70 ms after the biome rework, **6.58 ms** after gh-14's substrate layers — so the
+whole-world background pass is ~60 s. `MAX_BLOCKING_GENERATIONS_PER_FRAME` is 1 and there is no room to
+raise it; one chunk is already most of a 60 fps frame. Treat it as something to keep off the main thread.
 
 ### Rivers, cities and roads (`gameplay/plan.rs`, `river.rs`, `city.rs`, `road.rs`)
 
 Once `WorldMap` is complete, `WorldPlan` walks one session through
-`WaitingForTerrain → Rivers → Cities → Roads → Done`, editing tiles under the plan while the player is
-already walking around. The in-flight tasks live *inside* the enum, so dropping the resource on leaving
+`WaitingForTerrain → Rivers → Drainage → Cities → Roads → Done`, editing tiles under the plan while the
+player is already walking around. The in-flight tasks live *inside* the enum, so dropping the resource on leaving
 gameplay cancels them — a route planned for one world can never land in the next.
 
 The stage order is load-bearing: each stamps into `WorldMap` and the next takes its snapshot
@@ -213,10 +260,32 @@ only it knows when the last river tile is down.
   lattice **anchored on the world origin** (same trick as roads, same reason: two particles that pass
   through a place step between the same nodes, so paths coincide and flow accumulates). A tile's
   channel width is its flow, capped at `MAX_RIVER_WIDTH` = 4.
+- **Dry valleys** (`drainage.rs`) — the branching network the land drains through, drawn as a change of
+  ground cover rather than as water: a wadi through desert sand, a gallery treeline down a lowland
+  valley, reed along a marsh channel. **A drainage particle never floods** — that one rule is the whole
+  design. It removes the expensive half of the river stage and makes it impossible for this pass to add
+  a tile of standing water, which is what lets it land *before* the gh-9 lake retune. It paints cover
+  only, so no drainage edit costs a heightmap upload. `dampened` is the moisture ladder, and everything
+  not named in it is a fixed point — that is how "may not touch the water, the mountain bands, or the
+  plan's own kinds" is enforced, by omission rather than by a list that could fall out of step.
+  0.199% of the world, against roads at 0.24%.
+
+  Note the lattice is **16 tiles, four times the river's**, and that is what makes the stage work at
+  all: with no flood, a particle stops at the first node with nothing lower beside it, and at a 4-tile
+  stride the relief layer's fine octaves put a local minimum every few nodes. The first cut laid 404
+  tiles in the entire world. The pits are a property of the sampling scale, not of the landscape.
 - **Cities** — one candidate per `region_size_tiles` square, jittered by hash, kept if habitable and
   clearing `town_threshold`. Size tier from how far it clears; the outline is a disc whose radius
   wobbles over three hashed harmonics, clipped to habitable tiles. `City` is a component; `CityMap`
   only indexes those entities by chunk.
+
+  `is_habitable` is Forest, Grass and **Scrub**. Scrub being habitable is a decision, not an oversight:
+  it is the bare rung of the `Plains` and `Forest` ladders, so excluding it would have cut city sites
+  out of ordinary grassland. The visible consequence is at the other end — a wadi promotes desert Sand
+  to Scrub, so towns appear strung along desert drainage lines, which is where real ones are. Everything
+  else the reworks added (Sand, Marsh, Rock, Snow, Gravel, Reed) stays uninhabitable, which is still
+  most of what makes a desert or a marsh feel different to walk into. Breaking up the uniform grassland
+  cost 5 cities of 96 and 5% of the town tiles — measured, and small enough to be worth it.
 - **Roads** — pairs from the Gabriel graph, then an angular prune so no city gets two roads leaving
   within `road_min_separation_degrees`. Routed by A* on a lattice **anchored on the world origin, not
   on the city**: that is the only reason two roads lay down the same tiles and can therefore merge.
@@ -441,8 +510,12 @@ this one, the same trick the weather's shape map uses.
 `assets/textures/terrain.png` cannot drift. The atlas is a horizontal strip of 8×8 tiles loaded once
 (`world::load_tileset`) as an array texture via
 `ImageArrayLayout::GridCount { columns: TERRAIN_KIND_COUNT, rows: 1 }`; every chunk entity shares
-that one handle. Twelve columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
-Marsh (11), so nothing existing moved.
+that one handle. Fifteen columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
+Marsh (11), and gh-14 appended Scrub (12), Gravel (13) and Reed (14), so nothing existing moved.
+
+`Gravel` is deliberately not `Rock`: `Rock` is cold alpine scree and reads wrong at sea level, where a
+desert hardpan and a stripped lowland outcrop both live. `terrain.atlas.json`'s `width_in_tiles` has to
+be bumped alongside the PNG for the art tool, though the game never reads it.
 
 Adding a terrain kind means: append a column to the PNG, add the enum variant with the matching
 discriminant, bump `TERRAIN_KIND_COUNT`, and extend `the_default_config_produces_every_base_kind` —
