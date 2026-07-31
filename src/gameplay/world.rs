@@ -30,7 +30,7 @@ use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
         plan::WorldPlanPlugin,
-        terrain::{TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, generate_chunk},
+        terrain::{ChunkTerrain, TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, generate_chunk},
     },
     screens::Screen,
 };
@@ -126,6 +126,7 @@ fn start_world(mut commands: Commands) {
     commands.insert_resource(WorldMap::default());
     commands.insert_resource(BackgroundGeneration::default());
     commands.insert_resource(DirtyChunks::default());
+    commands.insert_resource(HeightUploadQueue::default());
 }
 
 /// Throws the world away. Removing the resources drops whatever tasks they were
@@ -136,6 +137,9 @@ fn tear_down_world(mut commands: Commands) {
     commands.remove_resource::<WorldMap>();
     commands.remove_resource::<BackgroundGeneration>();
     commands.remove_resource::<DirtyChunks>();
+    // The queue's absence is also the signal that retires the render world's
+    // heightmap, so a session can never be shown under the next one's terrain.
+    commands.remove_resource::<HeightUploadQueue>();
 }
 
 // -- Coordinates ------------------------------------------------------------
@@ -260,17 +264,24 @@ pub struct TileEdit {
 /// Every tile in the world, or `None` for chunks the background pass has not
 /// reached yet. One `TerrainKind` per tile, so this is ~16 MB in full.
 ///
+/// And, beside it, the height each of those tiles was classified from — another
+/// ~16 MB. That is the whole cost of the heightmap: `classify` computed the value
+/// already and used to drop it, so keeping it buys the tint pass, the noise step
+/// and any later reader their heights for memory instead of generation time.
+///
 /// Chunks are held behind an `Arc` so that [`WorldMap::snapshot`] can hand the
 /// whole finished world to a background task without copying 16 MB.
 #[derive(Resource)]
 pub struct WorldMap {
     chunks: Vec<Option<Arc<[TerrainKind]>>>,
+    heights: Vec<Option<Arc<[u8]>>>,
 }
 
 impl Default for WorldMap {
     fn default() -> Self {
         Self {
             chunks: vec![None; chunk_count()],
+            heights: vec![None; chunk_count()],
         }
     }
 }
@@ -280,15 +291,40 @@ impl WorldMap {
         self.chunks[chunk_index(coord)].as_ref()
     }
 
-    fn insert(&mut self, coord: UVec2, tiles: Arc<[TerrainKind]>) {
-        self.chunks[chunk_index(coord)] = Some(tiles);
+    /// The heights of a generated chunk, in the same order as its kinds.
+    ///
+    /// The tint reads the upload queue rather than this, so today only the tests
+    /// call it. It is the heightmap kept for the *crate*: the noise step and any
+    /// later reader get their heights here without sampling the terrain a second
+    /// time, and it is how the map can be checked without a GPU.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn heights(&self, coord: UVec2) -> Option<&Arc<[u8]>> {
+        self.heights[chunk_index(coord)].as_ref()
+    }
+
+    /// Stores a freshly generated chunk and queues its heights for the GPU.
+    ///
+    /// The queue is an argument rather than something a later system derives,
+    /// because that is what makes "a chunk reaches the texture exactly once" a
+    /// property of the type: there is no way to store a chunk without queueing it.
+    fn insert(&mut self, coord: UVec2, chunk: ChunkTerrain, uploads: &mut HeightUploadQueue) {
+        let index = chunk_index(coord);
+        let heights: Arc<[u8]> = chunk.heights.into();
+        self.chunks[index] = Some(chunk.kinds.into());
+        self.heights[index] = Some(Arc::clone(&heights));
+        uploads.push(index, heights);
     }
 
     /// Generates a chunk on the calling thread. Only for chunks that are needed
     /// this frame — everything else should come from the background pass.
-    fn generate_blocking(&mut self, config: &TerrainConfig, coord: UVec2) {
-        let tiles = generate_chunk(config, chunk_origin_tiles(coord), CHUNK_SIZE);
-        self.insert(coord, tiles.into());
+    fn generate_blocking(
+        &mut self,
+        config: &TerrainConfig,
+        coord: UVec2,
+        uploads: &mut HeightUploadQueue,
+    ) {
+        let chunk = generate_chunk(config, chunk_origin_tiles(coord), CHUNK_SIZE);
+        self.insert(coord, chunk, uploads);
     }
 
     /// A shared read-only view of the whole world, or `None` while any chunk is
@@ -306,6 +342,10 @@ impl WorldMap {
     /// A chunk is rewritten rather than mutated in place: the snapshot the
     /// planner is still reading holds the old `Arc`, and it must keep seeing the
     /// world it planned against.
+    ///
+    /// **Kinds only.** What the heightmap records is the height the terrain was
+    /// *generated* at, never what was stamped over it, so a road, a town or a river
+    /// is shaded by the ground it sits on — and no edit ever re-queues an upload.
     pub fn apply_edits(&mut self, edits: &[TileEdit], dirty: &mut DirtyChunks) {
         let mut touched: Vec<(UVec2, Vec<TileEdit>)> = Vec::new();
         for &edit in edits {
@@ -329,7 +369,7 @@ impl WorldMap {
                 let local = edit.tile - origin;
                 tiles[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize] = edit.kind;
             }
-            self.insert(coord, tiles.into());
+            self.chunks[chunk_index(coord)] = Some(tiles.into());
             dirty.mark(coord);
         }
     }
@@ -369,12 +409,12 @@ impl WorldSnapshot {
                         let end = (start + per_thread).min(chunk_count());
                         (start..end)
                             .map(|index| {
-                                let tiles = generate_chunk(
+                                let chunk = generate_chunk(
                                     config,
                                     chunk_origin_tiles(chunk_coord(index)),
                                     CHUNK_SIZE,
                                 );
-                                Arc::from(tiles)
+                                Arc::<[TerrainKind]>::from(chunk.kinds)
                             })
                             .collect::<Vec<_>>()
                     })
@@ -458,13 +498,47 @@ impl DirtyChunks {
     }
 }
 
+/// One chunk's heights on their way to the GPU: which chunk, by the world's own
+/// chunk index, and the texels themselves.
+///
+/// The texels ride behind the same `Arc` [`WorldMap`] stores, so queueing a chunk
+/// copies no tile data.
+pub struct ChunkHeights {
+    pub chunk: usize,
+    pub texels: Arc<[u8]>,
+}
+
+/// Chunks that have been generated but whose heights are not on the GPU yet.
+///
+/// The same idiom as [`DirtyChunks`] — something the streamer fills and another
+/// pass drains — and it lives here rather than with the tint so that
+/// [`start_world`] and [`tear_down_world`] own its lifetime. It therefore cannot
+/// be absent while a [`WorldMap`] exists, nor outlive one; and its absence is what
+/// tells the render world that the session is over and the texture can go.
+#[derive(Resource, Default)]
+pub struct HeightUploadQueue {
+    pending: Vec<ChunkHeights>,
+}
+
+impl HeightUploadQueue {
+    fn push(&mut self, chunk: usize, texels: Arc<[u8]>) {
+        self.pending.push(ChunkHeights { chunk, texels });
+    }
+
+    /// Hands the queued chunks over and leaves the queue empty, so a chunk is
+    /// queued once, uploaded once, and cannot be missed or repeated.
+    pub fn take(&mut self) -> Vec<ChunkHeights> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 /// The background pass that fills in the rest of [`WorldMap`].
 #[derive(Resource)]
 pub struct BackgroundGeneration {
     /// Chunks still to generate, ordered so that `pop` yields the ones nearest
     /// the middle of the world — which is where the camera starts — first.
     pending: Vec<UVec2>,
-    in_flight: Vec<Task<(UVec2, Box<[TerrainKind]>)>>,
+    in_flight: Vec<Task<(UVec2, ChunkTerrain)>>,
 }
 
 impl BackgroundGeneration {
@@ -490,13 +564,14 @@ impl Default for BackgroundGeneration {
 fn drive_background_generation(
     mut generation: ResMut<BackgroundGeneration>,
     mut map: ResMut<WorldMap>,
+    mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
 ) {
     generation
         .in_flight
         .retain_mut(|task| match block_on(poll_once(task)) {
-            Some((coord, tiles)) => {
-                map.insert(coord, tiles.into());
+            Some((coord, chunk)) => {
+                map.insert(coord, chunk, &mut uploads);
                 false
             }
             None => true,
@@ -549,6 +624,7 @@ fn load_tileset(mut commands: Commands, assets: Res<AssetServer>) {
 fn spawn_initial_chunks(
     mut commands: Commands,
     mut map: ResMut<WorldMap>,
+    mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
     tileset: Res<TerrainTileset>,
     resident: Query<(Entity, &ChunkCoord)>,
@@ -558,6 +634,7 @@ fn spawn_initial_chunks(
     refresh_resident_chunks(
         &mut commands,
         &mut map,
+        &mut uploads,
         &config,
         &tileset,
         &resident,
@@ -573,6 +650,7 @@ fn spawn_initial_chunks(
 fn stream_chunks_around_camera(
     mut commands: Commands,
     mut map: ResMut<WorldMap>,
+    mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
     tileset: Res<TerrainTileset>,
     resident: Query<(Entity, &ChunkCoord)>,
@@ -582,6 +660,7 @@ fn stream_chunks_around_camera(
     refresh_resident_chunks(
         &mut commands,
         &mut map,
+        &mut uploads,
         &config,
         &tileset,
         &resident,
@@ -602,6 +681,7 @@ fn stream_chunks_around_camera(
 fn refresh_resident_chunks(
     commands: &mut Commands,
     map: &mut WorldMap,
+    uploads: &mut HeightUploadQueue,
     config: &TerrainConfig,
     tileset: &TerrainTileset,
     resident: &Query<(Entity, &ChunkCoord)>,
@@ -630,7 +710,7 @@ fn refresh_resident_chunks(
                 continue;
             }
             generation_budget -= 1;
-            map.generate_blocking(config, coord);
+            map.generate_blocking(config, coord, uploads);
         }
         spawn_budget -= 1;
         let tiles = map.get(coord).expect("the chunk was just generated");
@@ -827,5 +907,68 @@ mod tests {
 
         let first = generation.pending.last().expect("the world is not empty");
         assert_eq!(chunk_distance(*first, WORLD_CHUNKS / 2), 0);
+    }
+
+    /// A chunk reaches the heightmap exactly once. Storing it and queueing it are
+    /// the same call, so there is no path that does one without the other, and the
+    /// queue hands its contents over rather than lending them.
+    #[test]
+    fn a_generated_chunk_queues_its_heights_once() {
+        let config = TerrainConfig::default();
+        let mut map = WorldMap::default();
+        let mut uploads = HeightUploadQueue::default();
+        let coord = WORLD_CHUNKS / 2;
+
+        map.generate_blocking(&config, coord, &mut uploads);
+
+        let heights = map
+            .heights(coord)
+            .expect("the chunk was just generated")
+            .clone();
+        assert_eq!(heights.len() as u32, CHUNK_SIZE.element_product());
+
+        let queued = uploads.take();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].chunk, chunk_index(coord));
+        assert_eq!(queued[0].texels.as_ref(), heights.as_ref());
+
+        assert!(uploads.take().is_empty(), "a chunk is queued once");
+        assert!(map.heights(coord).is_some(), "and the map keeps its copy");
+    }
+
+    /// What the heightmap records is the height the terrain was *generated* at,
+    /// never what was stamped over it — so a road is shaded by the ground it sits
+    /// on, and no plan edit costs an upload.
+    #[test]
+    fn an_edit_leaves_the_height_it_was_stamped_over() {
+        let config = TerrainConfig::default();
+        let mut map = WorldMap::default();
+        let mut uploads = HeightUploadQueue::default();
+        let coord = WORLD_CHUNKS / 2;
+
+        map.generate_blocking(&config, coord, &mut uploads);
+        uploads.take();
+        let before = map.heights(coord).expect("generated").clone();
+
+        let local = IVec2::splat(7);
+        let mut dirty = DirtyChunks::default();
+        map.apply_edits(
+            &[TileEdit {
+                tile: chunk_origin_tiles(coord) + local,
+                kind: TerrainKind::Road,
+            }],
+            &mut dirty,
+        );
+
+        let index = (local.y * CHUNK_SIZE.x as i32 + local.x) as usize;
+        assert_eq!(
+            map.get(coord).expect("still there")[index],
+            TerrainKind::Road
+        );
+        assert_eq!(
+            map.heights(coord).expect("still there").as_ref(),
+            before.as_ref()
+        );
+        assert!(uploads.take().is_empty(), "an edit re-queues nothing");
     }
 }
