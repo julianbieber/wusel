@@ -47,23 +47,50 @@ impl CitySize {
             _ => CitySize::Metropolis,
         }
     }
+
+    /// The tier a radius falls in — the inverse of [`CitySize::radius`], and what
+    /// keeps the tier meaningful once [`crate::gameplay::growth`] moves the radius
+    /// about. A city that grows past a threshold *becomes* the larger tier rather
+    /// than keeping the one it was founded at.
+    pub fn from_radius(radius: u32) -> Self {
+        match radius {
+            r if r < CitySize::Village.radius() => CitySize::Hamlet,
+            r if r < CitySize::Borough.radius() => CitySize::Village,
+            r if r < CitySize::Metropolis.radius() => CitySize::Borough,
+            _ => CitySize::Metropolis,
+        }
+    }
 }
 
-/// The largest radius any city can have — the margin a city site is kept away
-/// from the world edge, so a disc is never clipped by it.
+/// The largest radius a city may have, whether founded at it or grown to it.
+///
+/// It is doing three jobs at once, which is why growth is capped here rather than
+/// given a bound of its own: it is the margin a site is kept from the world edge so
+/// no disc is clipped, it is half of what `resolve_spacing` relies on when it
+/// assumes only the eight neighbouring regions can conflict, and it is the top tier's
+/// radius. Letting a city grow past it would quietly invalidate the first two.
 pub const MAX_CITY_RADIUS: u32 = 12;
 
 /// One city. The entity carrying this *is* the record of the city existing; it
 /// is spawned when the plan lands and torn down with the screen.
+///
+/// **Live state, not a founding record.** `radius` and `size` are what the city is
+/// this frame: [`crate::gameplay::growth`] re-derives both from the town's tile
+/// count every step, so a hamlet that thrives becomes a borough. Nothing keeps the
+/// tier it was founded at — if a reader ever wants "founded a hamlet, now a
+/// metropolis", that is a second field and not a second reading of these.
+///
+/// It stays `Copy`, and the road stage snapshots it by value into `RoadQueue`. That
+/// snapshot is stale by construction the moment the simulation starts, and is safe
+/// only because the roads are all routed before `WorldPlan::Done` — which is the
+/// same gate that keeps a route from being planned against a moving city.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct City {
     /// Stable across a session, and the seed for this city's outline.
     pub id: u32,
-    /// Global tile coordinate of the city's centre.
+    /// Global tile coordinate of the city's centre. The one thing about a city that
+    /// never moves.
     pub centre: IVec2,
-    /// Stored for whatever reads cities later — the tier a city was founded at
-    /// is not recoverable from its radius alone once the outline is wobbled.
-    #[allow(dead_code)]
     pub size: CitySize,
     pub radius: u32,
 }
@@ -76,8 +103,15 @@ pub struct CityMap {
 }
 
 impl CityMap {
+    /// Idempotent, because a city's footprint moves: [`crate::gameplay::growth`]
+    /// reports the chunks it reaches as it grows into them, and without this a city
+    /// that has spent a session touching one chunk would appear in its row a
+    /// thousand times.
     pub fn insert(&mut self, chunk: usize, city: Entity) {
-        self.by_chunk.entry(chunk).or_default().push(city);
+        let row = self.by_chunk.entry(chunk).or_default();
+        if !row.contains(&city) {
+            row.push(city);
+        }
     }
 
     /// The cities whose disc overlaps the given chunk. Nothing reads this yet —

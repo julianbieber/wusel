@@ -3,6 +3,7 @@ use bevy::prelude::*;
 mod biome;
 mod city;
 mod drainage;
+mod growth;
 mod noise;
 mod plan;
 mod river;

@@ -77,6 +77,11 @@ returns to `Screen::Main` when none remain.
 All noise is hand-rolled — `hash2` → `gradient_noise_2d` → `fbm` / `ridged_fbm`. No noise crate; keep
 it that way unless there's a reason, since determinism across platforms is what the tests assert.
 
+That claim is about **generation**, and since gh-6 it stops there. The terrain, the rivers, the cities
+as founded and the roads are still a pure function of the seed on every platform; what happens to them
+afterwards is not, because `gameplay/growth.rs` reads a sky that drifts on the frame clock. Nothing
+below this line in the pipeline may be tested by reproducing a world.
+
 `generate_chunk(config, origin, chunk_size)` is a pure function of `(config, global tile position)` —
 and of *that tile alone*. Every sample is taken in **global tile space** (`origin` is the chunk's
 lower-left tile), never chunk-locally, and no rule reads a neighbouring **tile**, so a chunk needs no
@@ -278,7 +283,11 @@ only it knows when the last river tile is down.
 - **Cities** — one candidate per `region_size_tiles` square, jittered by hash, kept if habitable and
   clearing `town_threshold`. Size tier from how far it clears; the outline is a disc whose radius
   wobbles over three hashed harmonics, clipped to habitable tiles. `City` is a component; `CityMap`
-  only indexes those entities by chunk.
+  only indexes those entities by chunk. **`City` is live state, not a founding record** — `radius` and
+  `size` are what the city is this frame, re-derived from its town's tile count every step by
+  `growth.rs`, which is what put `size` to work after it spent a release as `#[allow(dead_code)]`.
+  `RoadQueue` snapshots cities by value and is stale by construction the moment the simulation starts;
+  it is safe only because every road is routed before `Done`.
 
   `is_habitable` is Forest, Grass and **Scrub**. Scrub being habitable is a decision, not an oversight:
   it is the bare rung of the `Plains` and `Forest` ladders, so excluding it would have cut city sites
@@ -286,7 +295,9 @@ only it knows when the last river tile is down.
   to Scrub, so towns appear strung along desert drainage lines, which is where real ones are. Everything
   else the reworks added (Sand, Marsh, Rock, Snow, Gravel, Reed) stays uninhabitable, which is still
   most of what makes a desert or a marsh feel different to walk into. Breaking up the uniform grassland
-  cost 5 cities of 96 and 5% of the town tiles — measured, and small enough to be worth it.
+  cost 5 cities of 96 and 5% of the town tiles — measured, and small enough to be worth it. Scrub is
+  therefore also farmable, and `growth.rs` gives it its own poorer yield rather than lumping it with
+  forest.
 - **Roads** — pairs from the Gabriel graph, then an angular prune so no city gets two roads leaving
   within `road_min_separation_degrees`. Routed by A* on a lattice **anchored on the world origin, not
   on the city**: that is the only reason two roads lay down the same tiles and can therefore merge.
@@ -395,6 +406,72 @@ Config defaults in `WorldPlanConfig` carry their measurements in the doc comment
 generates the whole world in ~2 s and is how those numbers were taken —
 `cargo test --release -- --ignored --nocapture`.
 
+### City growth (`gameplay/growth.rs`)
+
+The first **simulation** in the crate: everything above it is a pure function of the seed evaluated
+once, this has state that advances. Once `WorldPlan` reaches `Done`, every city claims land, farms it,
+and grows or shrinks against what it feeds. `WorldSystems::Growth` sits between `Planning` and
+`Refresh`, so a tile it edits is visible in the frame it lands — and after `Planning`, so no road is
+ever routed against a world whose cities are moving.
+
+**Reproducibility ends here, deliberately** (see the note under terrain generation). The consequence is
+the test strategy: `step_city` takes the sky as an argument rather than reading it, so with a fixed
+`Sky` every property is an ordinary unit test — more land ends up bigger, a footprint that grew can
+shrink back, a released tile is habitable, rain never costs a city a field.
+
+Four things carry the design:
+
+- **A tile has one owner, and no code arranges it.** `Farmland` is not `is_habitable`, and a claim
+  requires habitable, so a field one city holds is refused to its neighbour by the same predicate that
+  clips a city against its coast. There is no nearest-city partition anywhere. Two cities' *founding*
+  discs are the one case this cannot separate — both are `Town` — so seeding carries a set for that
+  single pass.
+- **The ledger remembers claims, never the ground beneath them.** A released tile takes the commonest
+  **habitable** kind among its neighbours, so a ring dissolves back into the country it was cut from.
+  Voting only among habitable kinds is what makes it safe rather than merely plausible: the tile was
+  habitable when claimed, so no release can put water, rock or road where a field was. The fallback —
+  the biome's own wet kind — does real work, because a footprint clipped into lobes can leave a field
+  whose every neighbour is sea. Every biome's wet kind is habitable, and a test says so.
+- **The town is the ledger's prefix and the fields after it are distance-sorted.** That is what makes
+  claiming an append, releasing a pop, and town growth a boundary move. The *whole* ledger is not
+  sorted and cannot be: a town grows past land it never took, and a later rescan can turn that up
+  nearer than tiles the town has since built on.
+- **The fields are not a disc, because poor ground is not worth breaking.** A tile's yield is its
+  cleared ground times the humidity *at that tile* — sampled per tile, not once per city, which
+  matters because the humidity field's wavelength (~50 tiles) is shorter than a city's reach (56), so
+  one side of a city is measurably wetter than the other. Anything under `min_field_fertility` of the
+  best ground is left alone, so the farmland follows a wet valley and stops at a dry ridge. The
+  measure of it: a city holds a median **39%** of the tiles within its reach, where an earlier cut with
+  no floor took 97% and every city simply filled its circle. Scrub is habitable since gh-14 and so is
+  claimable, but poor enough that most of it sits under the floor — which is why the median fell again
+  from 57% when the cover ladder landed.
+- **The footprint is sized on a rain-free quantity.** Rain moves the population and the population
+  sizes the fields, so a wet spell does grow a city — but the claim/release *comparison* is
+  `static_yield` against demand, and `static_yield` is the harvest with the weather taken out. So no
+  cloud can make a city give up a ring the next dry step wants back. That round trip is lossy twice
+  over (a neighbour can take the freed tile; re-claiming re-reads the yield from whatever it was
+  restored to), which is how a world ratchets its forests into grass.
+
+Two loops that look unstable and are not. Population chases `capacity = fields / food_per_person`,
+while the town is sized *from* the population and is built **on** the fields — so growing costs food.
+That is negative feedback, and it converges as long as `town_people_per_tile` exceeds what one field
+feeds; `a_town_tile_houses_more_than_the_field_it_replaces_feeds` is the guard, and it is a stability
+condition rather than taste. The logistic is in closed form, not the Euler `p + r·p·(1 - p/K)`, because
+that oscillates at large rates and divides by a K that is **zero for every city on its first step**.
+
+Costs are per-step and permanent, where every stage above pays once — and small: **0.53 ms for the
+whole world of 92 cities**, once every `step_seconds`. A step is O(1) per city, because the field sum
+is maintained incrementally and the rain is sampled once per city rather than once per field. Nearly
+all of that 0.36 ms is the one city whose turn it is re-walking its cursor and re-sampling humidity;
+a step where nobody rescans is free. Validation is a round-robin sweep of one city per step — walking
+every ledger every step would be ~70k tile reads and would falsify the whole reason the sum is kept
+incrementally. The founding fields are laid **unbudgeted** (25147 tiles in ~36 ms), like the
+streamer's first screenful: making a city claim them at `claims_per_step` would have every city in the
+world starving for the hundreds of steps its fields took to fill.
+
+Defaults carry their measurements, from the `#[ignore]`d
+`the_default_config_grows_the_world_into_a_steady_state`.
+
 ### The world (`gameplay/world.rs`)
 
 A fixed 64×64 grid of chunks — 4096×4096 tiles — centred on the world origin, so it has a hard edge
@@ -423,7 +500,7 @@ main thread, capped at `MAX_BLOCKING_GENERATIONS_PER_FRAME`, and builds at most
 Anything over either budget appears a frame or two later. `OnEnter(Screen::Gameplay)` passes unlimited
 budgets so the first frame is complete.
 
-`WorldSystems` orders the frame `Streaming → Planning → Refresh`, which is what puts the plan's tile
+`WorldSystems` orders the frame `Streaming → Planning → Growth → Refresh`, which is what puts the plan's tile
 edits between the streamer that spawns chunk entities and `refresh_edited_chunks` that rebuilds the
 stale ones — so an edit is visible in the frame it lands. The river stage leans on that: it stamps
 `river_chunks_stamped_per_frame` chunks a frame (~44 frames for the default world) rather than
@@ -437,8 +514,18 @@ is why: it is the only conversion that keeps its fraction, since a screen pixel 
 
 ### Weather (`gameplay/weather.rs`, `assets/shaders/weather.wgsl`)
 
-Cloud patches drifting over the world, the shadow each throws, and rain in the thick of them. It is
-**cosmetic**: nothing here reads or writes `WorldMap`, so no tile can depend on the weather.
+Cloud patches drifting over the world, the shadow each throws, and rain in the thick of them.
+
+**This is no longer cosmetic, and that is the one thing to know before tuning it.** Nothing here reads
+or writes `WorldMap` — the dependency is strictly one way — but `gameplay/growth.rs` reads *this*: a
+city's harvest is modulated by the rain over it, so turning `rain_strength` down changes how big the
+world's cities get. `SkySampler` is the seam, and it is the only thing this module exposes: the CPU
+gets an answer, not the machinery, so `WeatherClock` and the field salts stay private.
+
+The overlay draws from baked, byte-quantized, bilinearly filtered maps while `SkySampler` evaluates the
+same fields directly, so the two agree to within a texel rather than exactly. Where they differ the
+CPU answer is authoritative — it decides whether a city was rained on; the overlay only has to look
+right.
 
 Two baked textures and one full-screen pass, and the split is the design:
 
@@ -566,17 +653,27 @@ this one, the same trick the weather's shape map uses.
 `assets/textures/terrain.png` cannot drift. The atlas is a horizontal strip of 8×8 tiles loaded once
 (`world::load_tileset`) as an array texture via
 `ImageArrayLayout::GridCount { columns: TERRAIN_KIND_COUNT, rows: 1 }`; every chunk entity shares
-that one handle. Fifteen columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
-Marsh (11), and gh-14 appended Scrub (12), Gravel (13) and Reed (14), so nothing existing moved.
+that one handle. Sixteen columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
+Marsh (11), gh-14 appended Scrub (12), Gravel (13) and Reed (14), and gh-6 appended Farmland (15), so
+nothing existing moved.
 
 `Gravel` is deliberately not `Rock`: `Rock` is cold alpine scree and reads wrong at sea level, where a
-desert hardpan and a stripped lowland outcrop both live. `terrain.atlas.json`'s `width_in_tiles` has to
-be bumped alongside the PNG for the art tool, though the game never reads it.
+desert hardpan and a stripped lowland outcrop both live.
+
+**The count is not self-checking and the failure is silent.** The strip is *divided* by
+`TERRAIN_KIND_COUNT`, so a constant one behind the PNG does not fail to load — it slices the strip at
+the wrong offset and draws every tile in the game wrong. That is exactly what the working tree looked
+like between the Farmland art landing and the enum being bumped.
+`the_atlas_has_a_column_for_every_terrain_kind` now reads the PNG's own IHDR width and fails instead.
+`terrain.atlas.json`'s `width_in_tiles` is a third copy of the same number and has to be bumped
+alongside for the art tool, though the game never reads it — which is why nothing noticed the drift.
 
 Adding a terrain kind means: append a column to the PNG, add the enum variant with the matching
 discriminant, bump `TERRAIN_KIND_COUNT`, and extend `the_default_config_produces_every_base_kind` —
-unless, like `Town` and `Road`, the kind is stamped by the plan rather than generated, in which case
-that test must keep *not* seeing it.
+unless, like `Town`, `Road` and `Farmland`, the kind is stamped rather than generated, in which case
+that test must keep *not* seeing it and `the_terrain_never_produces_a_kind_the_plan_stamps` must
+learn about it. `KIND_BY_INDEX` is a fixed-length array over the constant, so it stops compiling
+until the variant is added — that is the guard, and it is worth keeping.
 
 Tiles are drawn at their native 8px size with `ImagePlugin::default_nearest`; upscaling
 `tile_display_size` would resample the pixel art. `terrain.atlas.json` is sidecar metadata from the
