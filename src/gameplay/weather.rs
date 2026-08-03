@@ -359,6 +359,10 @@ fn start_weather_bake(
     // At zero rather than wherever the last session left off: the sky is world
     // state, and a new world gets a new one.
     commands.insert_resource(WeatherClock::default());
+    // The CPU-side sky, built once because its field costs the same to construct
+    // as any other. It goes in beside the clock and out beside it, so nothing can
+    // read one session's weather against the next session's world.
+    commands.insert_resource(SkySampler::new(&terrain, &config));
 
     let terrain = terrain.clone();
     let config = config.clone();
@@ -377,6 +381,7 @@ fn detach_weather_overlay(mut commands: Commands, camera: Single<Entity, With<Wo
     commands.remove_resource::<WeatherMaps>();
     commands.remove_resource::<WeatherClock>();
     commands.remove_resource::<WeatherBake>();
+    commands.remove_resource::<SkySampler>();
 }
 
 fn finish_weather_bake(
@@ -402,6 +407,7 @@ fn advance_weather_clock(
     time: Res<Time>,
     config: Res<WeatherConfig>,
     mut clock: ResMut<WeatherClock>,
+    mut sky: ResMut<SkySampler>,
 ) {
     let delta = time.delta_secs();
     let drift = config.wind_drift_tiles_per_second / config.shape_period_tiles * delta;
@@ -412,6 +418,13 @@ fn advance_weather_clock(
     clock.fine_offset =
         (clock.fine_offset + drift * config.cloud_fine_drift * config.cloud_fine_scale).fract();
     clock.streak_phase = (clock.streak_phase + config.rain_streak_speed * delta).fract();
+
+    // The CPU sky is drifted from the same clock in the same system, so the
+    // simulation and the overlay can never be a frame apart about where the
+    // weather is. `streak_phase` is not carried across: streaks are screen-space
+    // decoration and nothing off-screen can be rained on by them.
+    sky.coarse_offset = clock.coarse_offset;
+    sky.fine_offset = clock.fine_offset;
 }
 
 fn sync_weather_overlay(
@@ -459,7 +472,10 @@ fn cloud_probability_at(sampler: &TerrainSampler, tile: Vec2) -> f32 {
 /// because it moves. This is the same arithmetic in Rust so that the properties the
 /// sky is supposed to have can be measured over the whole world without a GPU; the
 /// two are edited together, like the uniform and its wgsl struct.
-#[cfg(test)]
+///
+/// No longer test-only: [`SkySampler`] is the simulation's reader, and it goes
+/// through exactly these functions so that the crate holds two transcriptions of
+/// the sky's arithmetic rather than three.
 fn cloud_density(config: &WeatherConfig, field: f32) -> f32 {
     smoothstep(
         config.cloud_cut - config.cloud_softness,
@@ -471,7 +487,6 @@ fn cloud_density(config: &WeatherConfig, field: f32) -> f32 {
 /// How hard it is raining under a cloud, from the raw field and the density it
 /// produced. Ramped rather than switched, so a rain patch has no rim, and multiplied
 /// by the density, so rain out of a clear sky is not unlikely but impossible.
-#[cfg(test)]
 fn rain_amount(config: &WeatherConfig, field: f32, density: f32) -> f32 {
     smoothstep(
         config.rain_cut,
@@ -480,10 +495,89 @@ fn rain_amount(config: &WeatherConfig, field: f32, density: f32) -> f32 {
     ) * density
 }
 
-#[cfg(test)]
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Where a tile falls in the shape map's lattice. The map holds one tiling period,
+/// so this is the one conversion between world tiles and the field's own space —
+/// written here once rather than at each of the three places that used to do it.
+fn shape_cell(config: &WeatherConfig, tile: Vec2) -> Vec2 {
+    tile / config.shape_period_tiles * SHAPE_LATTICE_PERIOD as f32
+}
+
+/// The two layers of shape the shader mixes, at one point, scrolled to where the
+/// clock has drifted them.
+///
+/// The offsets are in map periods — the same units the shader adds them in — so
+/// they are scaled by the lattice period to reach cell space.
+fn shape_at(
+    field: &TilingNoiseField,
+    config: &WeatherConfig,
+    cell: Vec2,
+    coarse_offset: Vec2,
+    fine_offset: Vec2,
+) -> f32 {
+    let lattice = SHAPE_LATTICE_PERIOD as f32;
+    let coarse_at = cell + coarse_offset * lattice;
+    let fine_at = cell * config.cloud_fine_scale + fine_offset * lattice;
+
+    let coarse = field.sample(coarse_at.x, coarse_at.y);
+    let fine = field.sample(fine_at.x, fine_at.y);
+    coarse * config.cloud_coarse_weight + fine * (1.0 - config.cloud_coarse_weight)
+}
+
+/// The sky as anything outside this module reads it.
+///
+/// The overlay is drawn from baked maps on the GPU; this evaluates the same fields
+/// directly on the CPU, so the two answers agree to within the shape map's byte
+/// quantization and its bilinear filtering rather than exactly. Where they differ,
+/// **this one is authoritative** — it is what decides whether a city's harvest was
+/// rained on, and the overlay only has to look right.
+///
+/// Owned here so that [`WeatherClock`] and the field salts stay private: a reader
+/// gets an answer, not the machinery. Its absence is a clear sky, the same fallback
+/// an unbaked map gives the overlay, which is what lets the simulation run in a test
+/// with no weather plugin at all.
+#[derive(Resource)]
+pub struct SkySampler {
+    field: TilingNoiseField,
+    config: WeatherConfig,
+    coarse_offset: Vec2,
+    fine_offset: Vec2,
+}
+
+impl SkySampler {
+    fn new(terrain: &TerrainConfig, config: &WeatherConfig) -> Self {
+        Self {
+            field: TilingNoiseField::new(
+                terrain.seed,
+                CLOUD_SHAPE_SALT,
+                SHAPE_LATTICE_PERIOD,
+                config.shape_octaves,
+            ),
+            config: config.clone(),
+            coarse_offset: Vec2::ZERO,
+            fine_offset: Vec2::ZERO,
+        }
+    }
+
+    /// How hard it is raining over a tile, on 0..1.
+    ///
+    /// `probability` is the humidity there — passed in rather than sampled, because
+    /// every caller already holds it and a `TerrainSampler` lookup is ~190 ns.
+    pub fn rain_at(&self, tile: Vec2, probability: f32) -> f32 {
+        let shape = shape_at(
+            &self.field,
+            &self.config,
+            shape_cell(&self.config, tile),
+            self.coarse_offset,
+            self.fine_offset,
+        );
+        let field = probability * shape;
+        rain_amount(&self.config, field, cloud_density(&self.config, field))
+    }
 }
 
 /// Bakes both maps. Called on the compute pool: this is ~260k fbm samples for the
@@ -830,8 +924,8 @@ mod tests {
             for x in 0..steps {
                 let tile = Vec2::new(x as f32, y as f32) * step;
                 let probability = cloud_probability_at(&sampler, tile);
-                let cell = tile / config.shape_period_tiles * SHAPE_LATTICE_PERIOD as f32;
-                let raw = probability * shape_at(&field, &config, cell);
+                let cell = shape_cell(&config, tile);
+                let raw = probability * shape_at(&field, &config, cell, Vec2::ZERO, Vec2::ZERO);
                 samples.push(Sky {
                     probability,
                     field: raw,
@@ -840,16 +934,6 @@ mod tests {
             }
         }
         samples
-    }
-
-    /// The two layers the shader mixes, at one point.
-    fn shape_at(field: &TilingNoiseField, config: &WeatherConfig, cell: Vec2) -> f32 {
-        let coarse = field.sample(cell.x, cell.y);
-        let fine = field.sample(
-            cell.x * config.cloud_fine_scale,
-            cell.y * config.cloud_fine_scale,
-        );
-        coarse * config.cloud_coarse_weight + fine * (1.0 - config.cloud_coarse_weight)
     }
 
     /// The weather equivalent of `the_default_config_produces_every_base_kind`: the
@@ -979,8 +1063,9 @@ mod tests {
         );
         let sampler = terrain.sampler();
         let density_at = |tile: Vec2| {
-            let cell = tile / config.shape_period_tiles * SHAPE_LATTICE_PERIOD as f32;
-            let raw = cloud_probability_at(&sampler, tile) * shape_at(&field, &config, cell);
+            let cell = shape_cell(&config, tile);
+            let raw = cloud_probability_at(&sampler, tile)
+                * shape_at(&field, &config, cell, Vec2::ZERO, Vec2::ZERO);
             cloud_density(&config, raw)
         };
 

@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use bevy::{
     image::{ImageArrayLayout, ImageLoaderSettings},
+    platform::collections::HashSet,
     prelude::*,
     sprite_render::{AlphaMode2d, TileData, TilemapChunk, TilemapChunkTileData},
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
@@ -29,6 +30,7 @@ use bevy::{
 use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
+        growth::CityGrowthPlugin,
         plan::WorldPlanPlugin,
         terrain::{ChunkTerrain, TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, generate_chunk},
     },
@@ -86,18 +88,25 @@ impl Plugin for WorldPlugin {
         // The config is a knob rather than world state, so it is the one thing
         // here that outlives a session.
         app.init_resource::<TerrainConfig>();
-        app.add_plugins(WorldPlanPlugin);
+        // Both of these edit tiles, which is why they are the world's plugins
+        // rather than siblings of it the way the tint and the weather are.
+        app.add_plugins((WorldPlanPlugin, CityGrowthPlugin));
         app.add_systems(Startup, load_tileset);
         app.add_systems(
             OnEnter(Screen::Gameplay),
             (start_world, spawn_initial_chunks).chain(),
         );
         app.add_systems(OnExit(Screen::Gameplay), tear_down_world);
+        // One `configure_sets` for the whole spine, and the state gate hangs off
+        // the tuple rather than off each set: a set configured separately would
+        // carry no `run_if`, and its systems would run on the menu with no
+        // `WorldMap` to read.
         app.configure_sets(
             Update,
             (
                 WorldSystems::Streaming,
                 WorldSystems::Planning,
+                WorldSystems::Growth,
                 WorldSystems::Refresh,
             )
                 .chain()
@@ -123,6 +132,11 @@ pub enum WorldSystems {
     Streaming,
     /// Planning cities and roads, and editing the tiles under them.
     Planning,
+    /// Growing and shrinking the cities the plan laid out, and editing the tiles
+    /// under *them*. After `Planning` because a road must never be routed against
+    /// a world whose cities are moving, and before `Refresh` for the same reason
+    /// the plan's own edits are: so an edit is visible in the frame it lands.
+    Growth,
     /// Rebuilding the resident entities whose tiles the plan changed.
     Refresh,
 }
@@ -334,6 +348,49 @@ impl WorldMap {
         self.insert(coord, chunk, uploads);
     }
 
+    /// The kind of one global tile, or `None` outside the world or in a chunk the
+    /// background pass has not reached.
+    ///
+    /// The simulation's read. It cannot go through [`WorldMap::snapshot`]: a
+    /// snapshot taken once a step would not show one city the fields another city
+    /// claimed earlier in that same step, and claim exclusivity is exactly that
+    /// read. Taking one per city instead would be 4096 refcount bumps apiece.
+    pub fn tile(&self, tile: IVec2) -> Option<TerrainKind> {
+        if !tile_in_world(tile) {
+            return None;
+        }
+        let coord = chunk_of_tile(tile);
+        let local = tile - chunk_origin_tiles(coord);
+        Some(self.get(coord)?[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize])
+    }
+
+    /// A whole world built from a rule rather than from the noise, so a test can
+    /// state exactly the terrain it wants a city to grow into. The [`WorldMap`]
+    /// counterpart of [`WorldSnapshot::from_fn`], for the readers that take the live
+    /// map because they need to see edits as they land.
+    #[cfg(test)]
+    pub fn from_fn(kind: impl Fn(IVec2) -> TerrainKind) -> Self {
+        let chunks: Vec<Option<Arc<[TerrainKind]>>> = (0..chunk_count())
+            .map(|index| {
+                let origin = chunk_origin_tiles(chunk_coord(index));
+                let tiles: Arc<[TerrainKind]> = (0..CHUNK_SIZE.element_product())
+                    .map(|i| {
+                        kind(
+                            origin
+                                + IVec2::new((i % CHUNK_SIZE.x) as i32, (i / CHUNK_SIZE.x) as i32),
+                        )
+                    })
+                    .collect();
+                Some(tiles)
+            })
+            .collect();
+
+        Self {
+            chunks,
+            heights: vec![None; chunk_count()],
+        }
+    }
+
     /// A shared read-only view of the whole world, or `None` while any chunk is
     /// still missing. The planner takes one of these instead of a copy.
     pub fn snapshot(&self) -> Option<WorldSnapshot> {
@@ -346,39 +403,63 @@ impl WorldMap {
     /// Applies the plan's edits and reports which chunks they touched, so the
     /// resident entities showing those chunks can be rebuilt.
     ///
-    /// A chunk is rewritten rather than mutated in place: the snapshot the
-    /// planner is still reading holds the old `Arc`, and it must keep seeing the
-    /// world it planned against.
+    /// A chunk is rewritten rather than mutated in place *while anyone else is
+    /// holding it*: the snapshot the planner is still reading holds the old `Arc`,
+    /// and it must keep seeing the world it planned against. `Arc::get_mut` is what
+    /// asks that question — it hands out the chunk only when this map is the sole
+    /// owner, so the copy-on-write happens exactly when it is needed rather than
+    /// on every call. That matters once the simulation is running: it edits a
+    /// handful of tiles per chunk every step, forever, where the plan paid for its
+    /// copies once and stopped.
+    ///
+    /// Edits are grouped by sorting rather than by scanning a list of touched
+    /// chunks, which was O(edits x chunks) — fine for the plan's per-chunk batches
+    /// and not for a step that touches ~200 chunks across the whole world.
     ///
     /// **Kinds only.** What the heightmap records is the height the terrain was
     /// *generated* at, never what was stamped over it, so a road, a town or a river
     /// is shaded by the ground it sits on — and no edit ever re-queues an upload.
     pub fn apply_edits(&mut self, edits: &[TileEdit], dirty: &mut DirtyChunks) {
-        let mut touched: Vec<(UVec2, Vec<TileEdit>)> = Vec::new();
-        for &edit in edits {
-            if !tile_in_world(edit.tile) {
-                continue;
-            }
-            let coord = chunk_of_tile(edit.tile);
-            match touched.iter_mut().find(|(c, _)| *c == coord) {
-                Some((_, batch)) => batch.push(edit),
-                None => touched.push((coord, vec![edit])),
-            }
-        }
+        let mut ordered: Vec<(usize, TileEdit)> = edits
+            .iter()
+            .filter(|edit| tile_in_world(edit.tile))
+            .map(|&edit| (chunk_index_of_tile(edit.tile), edit))
+            .collect();
+        ordered.sort_unstable_by_key(|(index, _)| *index);
 
-        for (coord, batch) in touched {
-            let Some(existing) = self.get(coord) else {
-                continue;
-            };
-            let mut tiles = existing.to_vec();
-            let origin = chunk_origin_tiles(coord);
-            for edit in batch {
-                let local = edit.tile - origin;
-                tiles[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize] = edit.kind;
+        let mut start = 0;
+        while start < ordered.len() {
+            let index = ordered[start].0;
+            let end = ordered[start..]
+                .iter()
+                .position(|(other, _)| *other != index)
+                .map_or(ordered.len(), |offset| start + offset);
+
+            if let Some(existing) = self.chunks[index].as_mut() {
+                let coord = chunk_coord(index);
+                let origin = chunk_origin_tiles(coord);
+                let batch = &ordered[start..end];
+
+                match Arc::get_mut(existing) {
+                    Some(tiles) => write_edits(tiles, origin, batch),
+                    None => {
+                        let mut tiles = existing.to_vec();
+                        write_edits(&mut tiles, origin, batch);
+                        *existing = tiles.into();
+                    }
+                }
+                dirty.mark(coord);
             }
-            self.chunks[chunk_index(coord)] = Some(tiles.into());
-            dirty.mark(coord);
+
+            start = end;
         }
+    }
+}
+
+fn write_edits(tiles: &mut [TerrainKind], origin: IVec2, batch: &[(usize, TileEdit)]) {
+    for (_, edit) in batch {
+        let local = edit.tile - origin;
+        tiles[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize] = edit.kind;
     }
 }
 
@@ -492,16 +573,19 @@ impl WorldSnapshot {
 
 /// Chunks whose tiles the plan has edited, and whose entity — if one is resident
 /// — is showing the tiles from before the edit.
+///
+/// A set rather than a list because both of its operations are membership tests,
+/// and because the simulation never lets it go empty: `refresh_edited_chunks` used
+/// to early-return on almost every frame once the plan was done, and now runs its
+/// scan every frame instead.
 #[derive(Resource, Default)]
 pub struct DirtyChunks {
-    chunks: Vec<UVec2>,
+    chunks: HashSet<UVec2>,
 }
 
 impl DirtyChunks {
     fn mark(&mut self, coord: UVec2) {
-        if !self.chunks.contains(&coord) {
-            self.chunks.push(coord);
-        }
+        self.chunks.insert(coord);
     }
 }
 
@@ -783,6 +867,36 @@ fn tile_data(tiles: &[TerrainKind]) -> TilemapChunkTileData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The atlas is *divided* by `TERRAIN_KIND_COUNT`, so a constant that disagrees
+    /// with the PNG does not fail to load — it slices the strip at the wrong offset
+    /// and draws every tile in the game wrong. That is exactly what happened when the
+    /// Farmland column landed before the enum did, and nothing caught it.
+    ///
+    /// Reads the PNG's IHDR width directly: 8 bytes of signature, then a 4-byte
+    /// length and the `IHDR` tag, then the width as big-endian u32.
+    #[test]
+    fn the_atlas_has_a_column_for_every_terrain_kind() {
+        let png = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/textures/terrain.png"
+        ))
+        .expect("the tileset is checked in beside the code");
+        assert_eq!(&png[1..4], b"PNG", "not a PNG");
+
+        let width = u32::from_be_bytes(png[16..20].try_into().expect("IHDR width"));
+        let height = u32::from_be_bytes(png[20..24].try_into().expect("IHDR height"));
+
+        assert_eq!(
+            width,
+            TERRAIN_KIND_COUNT * TILE_DISPLAY_SIZE.x,
+            "the atlas is {width}px wide, which is {} columns of {}px, but \
+             TERRAIN_KIND_COUNT is {TERRAIN_KIND_COUNT}",
+            width as f32 / TILE_DISPLAY_SIZE.x as f32,
+            TILE_DISPLAY_SIZE.x
+        );
+        assert_eq!(height, TILE_DISPLAY_SIZE.y, "the atlas is one row of tiles");
+    }
 
     #[test]
     fn a_chunks_own_position_resolves_back_to_it() {

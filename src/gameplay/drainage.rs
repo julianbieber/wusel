@@ -423,6 +423,7 @@ mod tests {
         TerrainKind::Scrub,
         TerrainKind::Gravel,
         TerrainKind::Reed,
+        TerrainKind::Farmland,
     ];
 
     fn plan() -> (TerrainConfig, WorldPlanConfig, WorldSnapshot, DrainagePlan) {

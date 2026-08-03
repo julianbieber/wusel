@@ -66,10 +66,18 @@ pub enum TerrainKind {
     Scrub = 12,
     Gravel = 13,
     Reed = 14,
+    /// Worked land around a city. Stamped by [`crate::gameplay::growth`], never
+    /// generated — the same standing rule `Town` and `Road` are under.
+    Farmland = 15,
 }
 
-/// Number of layers the terrain atlas is split into.
-pub const TERRAIN_KIND_COUNT: u32 = 15;
+/// Number of layers the terrain atlas is split into, which is also the number of
+/// columns in `assets/textures/terrain.png` and the `width_in_tiles` its
+/// `terrain.atlas.json` sidecar reports. The three have to agree: the strip is
+/// divided by this count, so a mismatch does not fail — it silently slices every
+/// tile at the wrong offset. `the_atlas_has_a_column_for_every_terrain_kind`
+/// checks the PNG's own width against this.
+pub const TERRAIN_KIND_COUNT: u32 = 16;
 
 impl TerrainKind {
     pub fn tileset_index(self) -> u16 {
@@ -90,6 +98,11 @@ impl TerrainKind {
     /// than the one it buys. The visible consequence is at the other end: a wadi
     /// promotes desert `Sand` to `Scrub` @ [`crate::gameplay::drainage`], so towns
     /// do appear strung along desert drainage lines, which is where real ones are.
+    ///
+    /// `Farmland` is deliberately *not* here either, and that one omission is the
+    /// whole of the competition between cities: a claim requires the tile to be
+    /// habitable, so a field one city has taken cannot be taken again by its
+    /// neighbour, and no partition of the land between them is computed anywhere.
     pub fn is_habitable(self) -> bool {
         matches!(
             self,
@@ -975,6 +988,10 @@ mod tests {
                 "no {kind:?} anywhere in the world"
             );
         }
+        // Town, Road, River and Farmland are deliberately absent from that list:
+        // they are stamped over finished terrain, so this test must keep *not*
+        // seeing them. `the_terrain_never_produces_a_kind_the_plan_stamps` is the
+        // other half of the same rule.
     }
 
     /// A tile drawn for a biome no recipe can reach is a tile drawn for nothing.
@@ -1207,16 +1224,27 @@ mod tests {
         counts
     }
 
-    /// The three stamped kinds belong to the plan, not to the terrain — if one
-    /// ever came out of here, a chunk's contents would depend on its neighbours
-    /// again.
+    /// The stamped kinds belong to the plan and to the simulation, not to the
+    /// terrain — if one ever came out of here, a chunk's contents would depend on
+    /// its neighbours again.
+    ///
+    /// Driven off a slice rather than enumerated in the name, because a name that
+    /// lists the kinds is wrong every time another one is added.
     #[test]
-    fn the_terrain_never_produces_a_town_a_road_or_a_river() {
+    fn the_terrain_never_produces_a_kind_the_plan_stamps() {
         let tiles = kinds(&TerrainConfig::default());
-        assert!(!tiles.contains(&TerrainKind::Town));
-        assert!(!tiles.contains(&TerrainKind::Road));
-        assert!(!tiles.contains(&TerrainKind::River));
+        for kind in STAMPED_KINDS {
+            assert!(!tiles.contains(&kind), "the terrain generated {kind:?}");
+        }
     }
+
+    /// The kinds nothing in [`classify`] may ever return.
+    const STAMPED_KINDS: [TerrainKind; 4] = [
+        TerrainKind::Town,
+        TerrainKind::Road,
+        TerrainKind::River,
+        TerrainKind::Farmland,
+    ];
 
     /// Rivers rise where it rains, so the humidity field has to be its own
     /// landscape rather than a second view of the elevation it is sampled
@@ -1808,5 +1836,6 @@ mod tests {
         TerrainKind::Scrub,
         TerrainKind::Gravel,
         TerrainKind::Reed,
+        TerrainKind::Farmland,
     ];
 }
