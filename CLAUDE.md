@@ -588,6 +588,31 @@ reads what the first wrote and the order is part of the result. It is stated in 
 in `gameplay/mod.rs` — `Tint` then `Weather` — rather than with `.before(weather_pass)`, because a
 system is only usable as an ordering label where its parameter types are visible.
 
+**There is a third struct written twice, and it is not one of these.** `WoodPanelMaterial` in
+`city_panel.rs` and in `wood_panel.wgsl` carry the same discipline — vectors before scalars, and the
+layout is 112 bytes — but a *different mechanism*, and reaching for this section's pattern when
+writing UI would be the mistake. The weather and the tint are fullscreen `Core2d` passes with
+hand-written `BindGroupLayoutDescriptor`s and specializers; a `UiMaterial` gets its layout **derived**
+by `AsBindGroup` and its handle carried by `MaterialNode`, so what is duplicated across the language
+boundary is the field list alone. Following `tint.rs` there would mean writing a render-graph pass for
+a rounded rectangle.
+
+Two more differences worth stating, since both mislead by analogy:
+
+- **The failure lands later.** A UI material's pipeline is specialized when the first node carrying it
+  is queued, so a mismatch is a shader-compile failure the first time a panel *opens* — not on
+  entering gameplay. Look for it there.
+- **`sd_rounded_box` is copied, not imported.** `bevy_ui::ui_node` does declare an import path, but the
+  module also declares the view uniform at group 0 and a texture and sampler at group 1, which collide
+  with a material's own group-1 binding — which is why `bevy_feathers`' `alpha_pattern.wgsl` copies it
+  too. Only `bevy_ui::ui_vertex_output::UiVertexOutput` is imported. In that struct `border_radius` is
+  in **pixels** while `border_widths` is in **UV**, and `size` is physical pixels, so every length in
+  the wood's uniform is physical too.
+
+`just check-web` still only type-checks Rust, so it catches none of this. What does catch it cheaply:
+naga parses, validates and lowers the wgsl to GLSL ES 3.00 in isolation if you inline the one import
+by hand — that is how `external` was found to be a reserved keyword before the panel was ever opened.
+
 ### Terrain tint (`gameplay/tint.rs`, `assets/shaders/tint.wgsl`)
 
 Scales the rendered world's brightness by the height of the tile under each fragment, so a slope reads
@@ -646,6 +671,72 @@ out 0.79..0.86 across the view, varying with the terrain under it.
 Only the height half of gh-13 is here. The noise half — a per-tile dither so identical tiles do not
 repeat exactly — is a second step with its own spec, and would be a small *tiling* dither map beside
 this one, the same trick the weather's shape map uses.
+
+### City stats panel (`gameplay/city_panel.rs`, `assets/shaders/wood_panel.wgsl`)
+
+Click a city, get a wooden window showing what `growth.rs` is doing to it. The first thing in the
+crate that *asks the world a question* — everything above is a generator or a simulation writing into
+`WorldMap` — and the first UI that exists during `Screen::Gameplay`, which is why it sits under
+`gameplay/` rather than beside `tooltip.rs`: everything it reads is private to this module tree.
+
+**The pick is geometric, never a tile lookup.** "Which city is under the cursor" is answered from
+`CityMap` and the cities' own centres and radii. A `Town` tile knows nothing about which city stamped
+it, and since gh-6 a footprint is a claimed set rather than a disc, so the tile would have to be
+traced back to an owner nothing indexes. Two consequences worth knowing:
+
+- **The click target has a floor in *screen* pixels**, and that is the whole of the issue's "works at
+  every zoom step": at `MAX_ZOOM_SCALE` a 3-tile hamlet is 6 px across. `pick_slack_px` is converted
+  through the orthographic scale, so it grows as the world shrinks — hence `camera.rs` now exports
+  `orthographic_scale` rather than the pick destructuring `Projection` a fourth time.
+- **Nine chunks are enough, and the argument is not the radius arithmetic.** A city is always in the
+  row of the chunk holding its *centre* (that tile is habitable by construction, so always stamped)
+  and `CityMap` only ever inserts — the index is monotone and over-inclusive, so a candidate that
+  fails the distance test is expected rather than a bug. The radius bound is a separate real
+  constraint: the scan stays sufficient only while `pick_slack_px < 104`, and a test says so.
+
+**Containment beats proximity, and the obvious rule has it backwards.** Minimising distance *minus*
+radius hands a click one tile inside a hamlet (-2) to a metropolis five tiles away (-7) — exactly the
+theft the rule was written to prevent. The pick prefers a city that contains the click and among those
+the smallest, ties broken on id so nine chunk rows cannot be visited into a different answer.
+
+**The bar's guard is the whole of `bar_fill`.** Population is floored at `min_population` and capacity
+is exactly zero on a city's first step — every city in the world — so a bare
+`(population / capacity).clamp(0.0, 1.0)` is `inf.clamp(..)`, which is **one**: a full bar at the
+moment a city has nothing. Its colour (harvest against demand) and its length (population against
+capacity) are independent readings, so a city can show nearly full *and* starving, which is the state
+that precedes a collapse.
+
+**Read every frame, write only what changed.** The reading must not be filtered — the sim writes
+`CityGrowth` every step. The writing must be: touching a `Text` costs two full text layout passes and
+touching the material clones it into the render world and allocates a fresh uniform buffer and bind
+group. The numbers move twice a second (`step_seconds` 0.5) against sixty redraws.
+
+**Every string is outlined, because bevy has no text stroke.** `TextShadow` is a single offset and
+there is nothing else, so `outlined_text` draws the string in black at all eight neighbouring pixels
+with a white copy on top — nine texts each. Wood is a mid-tone with dark grain running through it, so
+one flat colour is legible over part of a plank and lost over the rest; a dim second ink for the
+labels was the first attempt and was the unreadable one. The trick that keeps this cheap to *maintain*
+is that the `CityStatValue` marker rides on every copy, so the readout's ordinary query rewrites all
+nine without knowing an outline exists. Only the white copy is in flow — it alone sizes the container,
+and being spawned last is what puts it on top.
+
+The three systems share one gated, chained set ordered `after(WorldSystems::Growth)`. The gate is not
+optional and hangs off the *set*, exactly as `WorldSystems` does: `CityMap` and `RoadNetwork` exist
+only inside a session, `Screen::Main` is the default state, and `.after()` inherits an ordering edge
+but never a run condition. The ordering is about determinism rather than staleness — the sim holds
+`&mut City` and `&mut CityGrowth`, so without the edge the executor may run the readout either side of
+the step and choose differently each frame.
+
+**This is the crate's first `UiMaterial`, and it is not the tint's mechanism** — see the coupling note
+below. A city has no name because the crate has no name generator; the tier is a *row* rather than a
+header, because `CitySize` is re-derived from the radius every step and a header written at spawn
+would be the one thing on the panel that goes stale.
+
+Two known gaps, neither worth blocking on. A city's visible `Town` tiles can extend past `City.radius`
+— the radius is `sqrt(town_claims / π)`, an area rounded into a circle, while the claims reach up to
+`farm_max_reach_tiles` — so the outskirts of a clipped coastal city do not pick. And the panel takes
+bevy's default font rather than the feathers `fonts::REGULAR` the menus inherit, so it does not match;
+that is deferred to its own task.
 
 ### Tileset coupling
 

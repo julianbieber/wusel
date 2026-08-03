@@ -285,11 +285,18 @@ pub struct CityGrowth {
 }
 
 impl CityGrowth {
-    /// Tiles of field the city holds. The other half of what a HUD would want
-    /// beside the population, and what the measurements count.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Tiles of field the city holds — what the measurements count, and what
+    /// [`crate::gameplay::city_panel`] shows beside the population.
     pub fn fields(&self) -> usize {
         self.claims.len() - self.town_claims
+    }
+
+    /// Tiles the city has *built* on, as opposed to farms. Reported rather than
+    /// derived from `City::radius`, which is the area rounded into a circle: a city
+    /// clipped by a coast holds fewer tiles than its radius suggests, and the count
+    /// is the honest half of that pair.
+    pub fn town(&self) -> usize {
+        self.town_claims
     }
 }
 

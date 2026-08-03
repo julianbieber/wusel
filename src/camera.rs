@@ -68,11 +68,21 @@ fn spawn_camera(mut commands: Commands) {
 /// pan clamp below, and the chunk streamer deciding how far its entities must
 /// reach.
 pub fn visible_half_extent(camera: &Camera, projection: &Projection) -> Vec2 {
-    let scale = match projection {
+    camera.logical_viewport_size().unwrap_or(Vec2::ZERO) / 2.0 * orthographic_scale(projection)
+}
+
+/// World units per logical pixel.
+///
+/// The same number [`visible_half_extent`] is built on, exposed because not everything
+/// that has to cross between screen and world wants a half extent: the city pick needs
+/// to know how many tiles a cursor's width covers, which is this over the tile size.
+/// Destructuring the projection in a second module would be the start of that number
+/// having two answers.
+pub fn orthographic_scale(projection: &Projection) -> f32 {
+    match projection {
         Projection::Orthographic(orthographic) => orthographic.scale,
         _ => 1.0,
-    };
-    camera.logical_viewport_size().unwrap_or(Vec2::ZERO) / 2.0 * scale
+    }
 }
 
 fn zoom_camera(
