@@ -114,10 +114,16 @@ impl CityMap {
         }
     }
 
-    /// The cities whose disc overlaps the given chunk. Nothing reads this yet —
-    /// it is the half of the index that exists for gameplay to ask "what is the
-    /// player standing in".
-    #[allow(dead_code)]
+    /// The cities whose tiles fall in the given chunk — what
+    /// [`crate::gameplay::city_panel`] asks so that a click is answered without
+    /// scanning the world.
+    ///
+    /// Note what the index guarantees and what it does not. A city is always in the
+    /// row of the chunk holding its *centre*, because that tile is habitable by
+    /// construction and so is always stamped; and since [`CityMap::insert`] only ever
+    /// adds, the row is monotone. It is therefore over-inclusive: a row can name a
+    /// city whose footprint has since moved, so a caller has to test the candidates
+    /// it gets back rather than trust them.
     pub fn in_chunk(&self, chunk: usize) -> &[Entity] {
         self.by_chunk.get(&chunk).map_or(&[], Vec::as_slice)
     }
