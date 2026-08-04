@@ -1,0 +1,52 @@
+# Enter the world, let it finish generating and planning, then walk east and look.
+#
+# Run with:  just drive run scenarios/pan_east.txt
+#
+# What makes this reproducible is `wait`, not the frame counts. Generation, the weather
+# bake and the plan all run on the task pool and land on wall-clock time, so a scenario
+# that counted frames waiting for them would finish somewhere different on every machine.
+# The `hold` steps are frame-counted because a fixed delta makes that exact.
+
+# A fixed delta first, so every `hold` below moves the camera the same distance whatever
+# the machine renders at. The window still draws as fast as it can; only `Time::delta`
+# is pinned.
+fixed-delta 1/60
+
+enter gameplay
+
+# The whole world is ~4096 chunks and the plan stamps rivers, drainage, cities and roads
+# over it. On a warm release build this is a few seconds; the timeouts are generous
+# because being slow is not the same as being broken.
+wait terrain
+wait plan
+wait sky
+
+# Before anything else is asked: did the run complain? A shader that failed to compile
+# draws nothing rather than drawing wrong, so no capture below could show it — this is the
+# only step that can. Note `observe log` *drains*, so this must come before any other call
+# to it or the startup errors are already gone.
+observe log
+
+observe screen
+observe terrain
+observe camera
+
+capture /tmp/wusel-scenario/origin.png
+
+# 512 world units a second at 1/60 per frame: 240 frames is ~2048 units, which is four
+# chunks or 256 tiles east.
+hold D 240
+observe camera
+capture /tmp/wusel-scenario/east.png
+
+# Zoom out two steps and take the wide shot. Chunk residency is derived from what the
+# camera can see, so `resident_chunks` should jump here — that is the streamer working.
+zoom -2
+observe camera
+capture /tmp/wusel-scenario/east-wide.png
+
+observe plan
+observe cities
+
+# And again at the end, for anything the panning, zooming and capturing provoked.
+observe log
