@@ -216,7 +216,7 @@ struct BakedMaps {
 /// pass leaves the scene alone, so the first few frames of a session are a clear
 /// sky rather than a stall.
 #[derive(Resource, Clone)]
-struct WeatherMaps {
+pub(crate) struct WeatherMaps {
     probability: Handle<Image>,
     shape: Handle<Image>,
 }

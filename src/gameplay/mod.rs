@@ -1,18 +1,18 @@
 use bevy::prelude::*;
 
 mod biome;
-mod city;
+pub(crate) mod city;
 mod city_panel;
 mod drainage;
-mod growth;
+pub(crate) mod growth;
 mod noise;
-mod plan;
+pub(crate) mod plan;
 mod river;
-mod road;
-mod terrain;
+pub(crate) mod road;
+pub(crate) mod terrain;
 mod tint;
-mod weather;
-mod world;
+pub(crate) mod weather;
+pub(crate) mod world;
 
 pub use world::world_half_extent;
 

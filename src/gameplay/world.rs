@@ -75,7 +75,7 @@ const MAX_CHUNK_SPAWNS_PER_FRAME: usize = 32;
 /// chunks are resident — deriving that from the entities rather than from a
 /// separate resource means the two cannot disagree.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
-struct ChunkCoord(UVec2);
+pub(crate) struct ChunkCoord(UVec2);
 
 /// The tileset handle, loaded once. Every chunk entity shares it.
 #[derive(Resource)]
@@ -310,6 +310,19 @@ impl Default for WorldMap {
 impl WorldMap {
     fn get(&self, coord: UVec2) -> Option<&Arc<[TerrainKind]>> {
         self.chunks[chunk_index(coord)].as_ref()
+    }
+
+    /// Every chunk that has been generated so far, for a caller summarising the world
+    /// rather than asking about one tile.
+    ///
+    /// Yields nothing for the holes, so the count of what comes back is also how much of
+    /// the world exists — which is what makes a summary taken mid-generation honest
+    /// rather than merely incomplete.
+    ///
+    /// Read only by [`crate::control`], which does not exist on wasm.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn generated(&self) -> impl Iterator<Item = &Arc<[TerrainKind]>> {
+        self.chunks.iter().flatten()
     }
 
     /// The heights of a generated chunk, in the same order as its kinds.
@@ -637,6 +650,14 @@ impl BackgroundGeneration {
     /// it never sees a hole in the world it is planning against.
     pub fn is_complete(&self) -> bool {
         self.pending.is_empty() && self.in_flight.is_empty()
+    }
+
+    /// Chunks neither generated nor being generated. Only a progress report wants this —
+    /// the plan asks the yes-or-no question above — and that reader,
+    /// [`crate::control`], does not exist on wasm.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn remaining(&self) -> usize {
+        self.pending.len() + self.in_flight.len()
     }
 }
 

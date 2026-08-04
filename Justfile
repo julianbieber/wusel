@@ -8,6 +8,9 @@ RUSTFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 RUSTDOCFLAGS_BASE := "-Zshare-generics=y -Zthreads=0"
 WASM_TARGET := "wasm32-unknown-unknown"
 
+# Where `drive-start` opens its control socket and `drive` looks for it.
+CONTROL_SOCKET := "/tmp/wusel-control.sock"
+
 # Default: run everything
 default:
     @just --list
@@ -77,6 +80,27 @@ run:
 	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
 	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
 	bevy run
+
+# Launch the game with a control socket open, so it can be driven from outside.
+# Blocks; background it. `BEVY_ASSET_ROOT` because a binary invoked directly looks for
+# assets next to the executable, not next to the manifest.
+drive-start:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	BEVY_ASSET_ROOT="{{justfile_directory()}}" \
+	WUSEL_CONTROL="{{CONTROL_SOCKET}}" \
+	cargo run --bin wusel
+
+# Send one command to the running game and print its JSON reply.
+# Blocks until the command has actually happened: `just drive step 180` returns 180
+# frames later, not when the request was accepted.
+drive *ARGS:
+	@env \
+	RUSTFLAGS="{{RUSTFLAGS_BASE}}" \
+	RUSTDOCFLAGS="{{RUSTDOCFLAGS_BASE}}" \
+	WUSEL_CONTROL="{{CONTROL_SOCKET}}" \
+	cargo run --quiet --bin wusel-ctl -- {{ARGS}}
 
 # Run web via Bevy CLI
 # Bevy CLI handles building to wasm32-unknown-unknown and serving locally.

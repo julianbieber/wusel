@@ -770,10 +770,109 @@ Tiles are drawn at their native 8px size with `ImagePlugin::default_nearest`; up
 `tile_display_size` would resample the pixel art. `terrain.atlas.json` is sidecar metadata from the
 art tool (palette/ramps) and is not read by the game.
 
+### Driving the game from outside (`control/`, `src/bin/wusel-ctl.rs`, `scenarios/`)
+
+The game can be driven and observed over a Unix socket, so a change that only shows up on screen can
+be verified without a person holding the keys. `just drive-start` launches the game as normal;
+`just drive <command>` sends one command and prints a line of JSON.
+
+**Standing rule: every new way a player interacts with the game, and every new setup stage, must be
+reachable from `wusel-ctl` in the same change that adds it.** This tool only proves what it can
+reach, and it degrades silently: a feature the ctl cannot drive is not partially covered, it is
+invisible, and nothing says so. Left to drift, the driver ends up exercising a game that no longer
+exists while every scenario still passes. Concretely —
+
+- **A new input** (a key, a mouse target, a drag, a hotkey) needs a verb, or an argument to an
+  existing one. `click-tile` exists because "click the city at 2343,1969" is how a scenario wants to
+  say it; the pixel underneath is the driver's problem, not the author's.
+- **A new screen or state** must be reachable via `enter`, and have a `wait` condition if arriving
+  there is not instant.
+- **A new asynchronous setup stage** — anything on `AsyncComputeTaskPool`, the way generation, the
+  weather bake and the plan stages are — needs a `wait` condition. This one is the least obvious and
+  the most damaging to skip: without it a scenario has no choice but to count frames, and counting
+  frames against a task that lands on wall-clock is flaky by construction. That is the failure mode
+  this whole tool exists to remove, and one missing condition reintroduces it.
+- **New world state worth asserting on** needs an `observe` topic, so a scenario can check it without
+  a human reading a screenshot.
+
+The cost is deliberately lopsided in favour of keeping this up: a verb or a topic is a small addition
+to `control/command.rs` or `control/observe.rs`, while a *scenario* is a data file needing no
+recompile. If adding the hook feels expensive, that is usually a sign the interaction is reaching
+into something it should not — the ctl drives the same messages and state a player does, so anything
+awkward to reach from it is awkward for the same reason a test would be.
+
+**The app stays a real windowed game.** A headless render-to-image driver was built first and thrown
+away: it verifies a rendering path no human ever takes. `Screenshot::primary_window()` photographs
+the actual swapchain, through the real post-process chain, at the real window size — that is the
+whole point of the tool, and it is why there is no headless mode to maintain.
+
+`ControlPlugin` is inert unless `WUSEL_CONTROL` names a socket path, and the module is
+`#[cfg(not(target_arch = "wasm32"))]`. An env var rather than a cargo feature because CI already
+builds `--all-features`, so a feature would need care in every recipe to buy nothing. The cfg gate is
+also why `WorldMap::generated` and `BackgroundGeneration::remaining` carry
+`#[cfg_attr(target_arch = "wasm32", allow(dead_code))]` — their only reader vanishes on wasm, and
+`just check-web` is the only recipe that notices.
+
+**A command's reply is held until the effect has happened.** `wait plan` answers when the plan is
+done, `hold D 240` after 240 frames, `capture` once the PNG is on disk. What blocks is the *client*;
+the app runs on undisturbed, so a human can watch a scenario and grab the keyboard part-way through.
+One system in `PreUpdate` polls the in-flight command once a frame, so waiting and acting are the
+same mechanism rather than two. It is `.before(InputSystems)`, because `keyboard_input_system` drains
+`MessageReader<KeyboardInput>` into `ButtonInput` there and an injected key written after it lands a
+frame late. It is exclusive (`&mut World`) so that adding an observation does not mean threading
+another dozen resources through a signature.
+
+**`wait`, not frame counts, is what makes a scenario reproducible.** Generation, the weather bake and
+the plan run on `AsyncComputeTaskPool` and land on wall-clock, so counting frames to wait for them is
+machine-dependent by construction. Frame counts *are* exact for anything the simulation drives, but
+only under `fixed-delta`: `TimeUpdateStrategy::ManualDuration` is applied by `time_system` regardless
+of who owns the event loop, so the window still renders as fast as it can while `Time::delta` is
+pinned. `hold D 240` at `1/60` moves the camera 2047.998 units on any machine.
+
+Input goes in as *messages* (Bevy 0.19 calls them that, not events), so it takes the real path and
+the window needs no focus. `hold` presses once and releases once — `ButtonInput` retains `pressed`,
+and re-pressing every frame would re-fire the `just_pressed` edge that the zoom and the city click
+read. `zoom` therefore costs two frames a step, since one key yields one edge per frame. Screen
+transitions set `NextState<Screen>` rather than clicking the Feathers button, so **the menu buttons
+themselves stay unverified** — driving `bevy_picking` is a large lift for a transition no scenario
+tests. `click-tile` converts through the camera's own `Transform`, not its `GlobalTransform`, for the
+reason `city_panel.rs` gives at the matching conversion.
+
+`capture` knows it is finished when the screenshot *entity* is gone: `clear_screenshots` despawns it
+in `First`, strictly after the `ScreenshotCaptured` observer has written the file, so its absence
+means the PNG is complete — no polling the filesystem and no racing a half-written file.
+
+**`observe log` is the one observation a capture cannot replace.** A shader that fails to compile
+draws nothing rather than drawing wrong, so the frame looks merely odd and every other check passes;
+the naga diagnostic is the only evidence, and it is otherwise buried in stderr. `control/log.rs` adds
+a `tracing` layer keeping the run's `WARN`/`ERROR` in a bounded buffer. It is wired through
+`LogPlugin { custom_layer }` in `main.rs` rather than by `ControlPlugin`, because a log layer has to
+exist before the logger does and `LogPlugin` is built first — and it installs nothing unless
+`WUSEL_CONTROL` is set, since a buffer with no reader is a slow leak.
+
+It **drains**, so that a scenario can bracket a step — clear, do the thing, see what it said. The
+consequence is that the *first* `observe log` is the only one that can see startup, which is exactly
+where shader compile failures land. Call it before anything else that reads the log, as
+`scenarios/pan_east.txt` does; otherwise the interesting errors have already been thrown away.
+
+Adding an **observation** is a Rust change in `control/observe.rs`; adding a **scenario** is a data
+file. That asymmetry is the point — it is what keeps a scenario per feature cheap enough to bother
+with. `scenarios/pan_east.txt` is the worked example, and `run` is handled client-side so the
+protocol stays one command per connection and no script format enters the engine.
+
+Two things a driven run needs that a `just run` does not: `BEVY_ASSET_ROOT`, because a directly
+invoked binary looks for `assets/` next to the executable and will otherwise open a window with no
+tileset and only a log line to say so; and the same `RUSTFLAGS` as `just run`, or the two alternate
+full rebuilds.
+
 ## Conventions
 
 Comments here explain *why* a value or structure was chosen (the fbm gain constant, the chunk margin,
 the bevy_lint pin), not what the code does. Match that. Tests are named as behavioural sentences.
+
+A feature that adds a way to interact with the game, or a stage that has to finish before the world
+is usable, is not done until `wusel-ctl` can drive it — see the standing rule under "Driving the game
+from outside". A unit test proves the maths; the ctl is the only thing that proves the game.
 
 `Cargo.toml` allows `clippy::too_many_arguments` and `clippy::type_complexity` globally — normal for
 Bevy systems, so don't work around them.
