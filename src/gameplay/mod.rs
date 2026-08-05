@@ -9,6 +9,7 @@ mod noise;
 pub(crate) mod plan;
 mod river;
 pub(crate) mod road;
+mod sun;
 pub(crate) mod terrain;
 mod tint;
 pub(crate) mod weather;
@@ -39,20 +40,24 @@ pub struct GameplayPlugin;
 
 impl Plugin for GameplayPlugin {
     fn build(&self, app: &mut App) {
-        // Neither the weather nor the tint is world state — they read no tiles and
-        // edit none — so they are their own plugins here rather than part of the
-        // world's. The tint's *input* comes from the world, but only as a queue the
-        // world already fills; nothing it does can change a tile.
+        // Neither the weather nor the tint nor the sun is world state — they read no
+        // tiles and edit none — so they are their own plugins here rather than part
+        // of the world's. The tint's *input* comes from the world, but only as a
+        // queue the world already fills; nothing it does can change a tile.
         //
         // The stats panel is a sibling for the same reason and a different one: it edits
         // no tile either, but unlike those two it *reads* world state. So the rule this
         // list follows is "edits tiles → inside the world's plugin", and reading implies
         // neither — the panel asks `CityMap` a question and takes the answer away.
+        //
+        // The sun goes in after the two overlays it writes to, because its sync
+        // system expects both of them on the camera.
         app.add_plugins((
             world::WorldPlugin,
             tint::TerrainTintPlugin,
             weather::WeatherPlugin,
             city_panel::CityPanelPlugin,
+            sun::SunPlugin,
         ));
     }
 }

@@ -235,7 +235,7 @@ impl ExtractResource for WeatherMaps {
 /// or the shader fails to compile at runtime. Vectors first, scalars after, so the
 /// std140 padding is the same on both sides and WebGL2 agrees with the desktop.
 #[derive(Component, Clone, Copy, Default, ShaderType)]
-struct WeatherUniform {
+pub(super) struct WeatherUniform {
     view_centre_tiles: Vec2,
     view_half_extent_tiles: Vec2,
     coarse_offset: Vec2,
@@ -254,6 +254,10 @@ struct WeatherUniform {
     rain_softness: f32,
     rain_strength: f32,
     streak_phase: f32,
+    /// How much light there is, from [`crate::gameplay::sun`]. The clouds composite
+    /// over a world the tint pass has already lit, so without this a midnight sky is
+    /// white shapes over dark ground.
+    light_level: f32,
 }
 
 /// The main-world half of that uniform, carried by the one world camera while
@@ -261,7 +265,16 @@ struct WeatherUniform {
 /// are filled in at extract time from the camera itself, which is why no ordering
 /// against the pan is needed anywhere.
 #[derive(Component, Clone, Copy, Default)]
-struct WeatherOverlay(WeatherUniform);
+pub(super) struct WeatherOverlay(WeatherUniform);
+
+impl WeatherOverlay {
+    /// The one thing this module has ever taken from outside itself, and it is a
+    /// number rather than machinery: how brightly to draw a cloud. The uniform's
+    /// layout stays private, on the same terms `SkySampler` keeps the clock private.
+    pub(super) fn set_light_level(&mut self, level: f32) {
+        self.0.light_level = level;
+    }
+}
 
 impl SyncComponent for WeatherOverlay {
     // The removal target, and getting this wrong is a one-way trip: extraction only
@@ -371,7 +384,15 @@ fn start_weather_bake(
 }
 
 fn attach_weather_overlay(mut commands: Commands, camera: Single<Entity, With<WorldCamera>>) {
-    commands.entity(*camera).insert(WeatherOverlay::default());
+    commands
+        .entity(*camera)
+        .insert(WeatherOverlay(WeatherUniform {
+            // Full daylight until the sun's first sync, and what the clouds are lit
+            // by if the sun plugin is not in the app at all. A zeroed uniform would
+            // draw every cloud black.
+            light_level: 1.0,
+            ..default()
+        }));
 }
 
 /// Takes the overlay off the camera, which survives this transition, and drops the

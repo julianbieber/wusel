@@ -583,10 +583,71 @@ used directly, since its bind group layout is fixed at three entries and cannot 
 That placement is what keeps weather off the UI: `bevy_ui_render` orders `ui_pass` *after* the whole
 `PostProcess` set.
 
-There are **two** passes in `PostProcess` now, and both ping-pong the same `ViewTarget`, so the second
+There are **two** passes in `PostProcess`, and both ping-pong the same `ViewTarget`, so the second
 reads what the first wrote and the order is part of the result. It is stated in the `ScreenEffectSystems` set
 in `gameplay/mod.rs` — `Tint` then `Weather` — rather than with `.before(weather_pass)`, because a
-system is only usable as an ordering label where its parameter types are visible.
+system is only usable as an ordering label where its parameter types are visible. gh-26 added the sun to
+the *tint* pass rather than a third one, so that count still holds; what it cost instead is the
+`light_level` coupling noted above.
+
+### The sun (`gameplay/sun.rs`)
+
+A day/night cycle modelled as a planet turning, not as a timer with a brightness ramp on it. `Sun` is
+the resource game logic reads and the session's only clock; `PlanetConfig` is the knob and outlives a
+session like `TerrainConfig`. **Nothing simulation-side reads it yet** — the seam exists so it can, on
+the same terms `SkySampler` exists for the rain, and its absence is full daylight the way an absent
+`SkySampler` is a clear sky.
+
+**There is one piece of state — how far the planet has turned — and everything else is geometry read
+off it.** `Sun::rotation` is wrapped to 0..1 and *is* local solar time; the hour is `rotation * 24`.
+That is the whole design and it is what pays for the module:
+
+- **Day length is not a knob.** `sin(altitude) = sin φ sin δ + cos φ cos δ cos H` — latitude,
+  declination, hour angle. An equinox day is half a turn at every latitude; the default's solstices are
+  14.3 h and 9.7 h with nothing saying so.
+- **Night is not a state and dawn is not an event.** Both are the altitude crossing the horizon, and no
+  branch in the module names either.
+- **Seasons are one moving knob away.** Declination is derived from `axial_tilt_degrees` and
+  `orbit_phase`; an orbit would move `orbit_phase` and nothing else here would change.
+- **There is no shadow-strength knob.** A shadowed tile is lit by `Insolation::sky` alone and a lit one
+  by sky plus `direct`, so "how dark is a shadow" is already answered by how much of the light is beam.
+- **No colour is keyframed.** A low sun is warm because its beam crosses more air — Kasten-Young air
+  mass against a per-channel `zenith_extinction`. No configuration can make noon redder than dusk.
+
+**The bearing is a vector, not a sign.** The brief allowed assuming rays run left-right; that is what
+the model *reports* at latitude 0 with zero declination, and `at_the_equator_at_an_equinox_the_sun_runs_
+exactly_left_to_right` pins it. The default latitude is 35, where the sun rises due east, swings south
+through midday and sets due west — so a shadow rotates about a quarter turn over a day. At the equator
+it would instead pass overhead, shadows would vanish at noon and the bearing would flip in one frame.
+
+Three things about the light are not obvious and are load-bearing:
+
+- **It is white-balanced against a reference altitude** — equinox noon *for this latitude*, derived
+  rather than configured. There the two terms sum to `daylight` and the world is drawn exactly as the
+  art was painted; every other hour is a departure from the art rather than from nothing. Without it a
+  physically blue sky sits the whole world under a cast the pixel art was never drawn for. The beam is
+  capped at what the sky leaves, so a solstice noon — higher than the reference — blows nothing out.
+- **The sky has to dim with the sun that lights it.** The first cut held it at `sky_fraction` down to
+  the horizon, where it swamped the beam and dusk came out neutral grey — the whole point of an evening
+  is the ground going warm. `horizon_glow` is what is left of it at the horizon, with a square root
+  between; and it cannot be exceeded by `night_sky`, or the world visibly *brightens* after sunset.
+  `the_world_never_brightens_as_the_sun_sinks` is the guard.
+- **`cosine_response` softens the cosine law.** The full `sin(altitude)` is right for a flat plane and
+  makes a landscape go nearly dark long before sunset; what is drawn here is slopes and faces, which
+  catch a low sun better. It is 1 at the reference whatever it is set to, so the balance does not move.
+
+**Mountain shadows are three texture loads, not a ray march** — 1, 5 and 10 tiles along the bearing,
+strongest occluder wins, each softened over `shadow_softness` because the sun sweeps a ridge *past* a
+sample distance and a hard test flickers there. The price is that a lone spire between two samples
+throws nothing.
+
+`relief_tiles` is the crate's **first and only vertical scale**: the heightmap is stored on 0..1 with no
+physical meaning, and "is that ridge high enough to hide the sun" cannot be answered without one.
+**Nothing but the lighting may read it**, or a tile's kind would start depending on it. 128 came off the
+world — see the sweep in its doc comment — because at 64 the shadows are gone by mid-morning and at 192
+a ridge shades the country beside it at noon, which stops reading as shadow and starts reading as dirt.
+
+The clock never pauses: while gameplay is up the planet turns with `Time` and nothing else gates it.
 
 **There is a third struct written twice, and it is not one of these.** `WoodPanelMaterial` in
 `city_panel.rs` and in `wood_panel.wgsl` carry the same discipline — vectors before scalars, and the
@@ -618,6 +679,19 @@ by hand — that is how `external` was found to be a reserved keyword before the
 Scales the rendered world's brightness by the height of the tile under each fragment, so a slope reads
 as a slope *inside* a kind's band rather than only where it crosses a `classify` edge. Cosmetic, like
 the weather: nothing here touches `WorldMap`.
+
+**This pass also carries the sun** (gh-26), because the occlusion test reads the heightmap and this is
+the only thing that binds it — a pass of its own would duplicate the pipeline, the specializer and both
+ping-pong bind groups for three more `textureLoad`s. Two consequences. The overlay is no longer written
+once and left alone: `sun.rs` writes this frame's light into it through `TerrainTintOverlay::set_sun`,
+which is why the uniform's layout can stay private here. And because the tint composites *under* the
+weather, `WeatherUniform` had to take a `light_level` so a cloud at midnight is a dark shape rather than
+a white one — the first thing the weather has ever read from outside itself.
+
+The height ramp is unchanged by any of that, deliberately: it is fake relief, but it is the only cue at
+noon and through the whole night, when a real sun casts nothing. The two can disagree — the ramp
+brightens a peak the sun may be behind. Fading it as the sun sinks would fix that and would invalidate
+the screenful spread measured below, so it is not done.
 
 **The height is kept, not re-baked.** `classify` already computes every tile's elevation and used to
 drop it, so `generate_chunk` returns a `ChunkTerrain { kinds, heights }` and `WorldMap` stores both.

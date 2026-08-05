@@ -20,9 +20,19 @@
 //! that chunk arrives.
 //!
 //! Like the weather this is cosmetic: nothing here reads or writes `WorldMap`, so no
-//! tile can depend on the shading. Unlike the weather it is *static* — the ramp is
-//! config and the view is filled in at extract — so there is no per-frame sync
-//! system to pair with the overlay.
+//! tile can depend on the shading.
+//!
+//! **This pass also carries the sun** (gh-26). The ramp is fake relief — high ground
+//! is brighter whether or not anything is shining on it — and it is deliberately
+//! unchanged, because it is the only cue at noon and through the whole night, when a
+//! real sun casts nothing. Over the top of it [`crate::gameplay::sun`]'s light
+//! multiplies, and a shadow is a tile the beam does not reach.
+//!
+//! The sun lives here rather than in a pass of its own for one reason: the occlusion
+//! test reads the heightmap, and this is the only thing that binds it. A third pass
+//! would duplicate the pipeline, the specializer and both ping-pong bind groups for
+//! the sake of three more `textureLoad`s. The cost is that the overlay is no longer
+//! written once and left alone — `sun.rs` writes its light every frame.
 
 use bevy::{
     core_pipeline::{Core2d, Core2dSystems, FullscreenShader, tonemapping::tonemapping},
@@ -56,6 +66,7 @@ use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
         ScreenEffectSystems,
+        sun::{PlanetConfig, Sun},
         terrain::TerrainConfig,
         world::{
             CHUNK_SIZE, ChunkHeights, HeightUploadQueue, TILE_DISPLAY_SIZE, WORLD_CHUNKS,
@@ -129,22 +140,55 @@ impl Default for TerrainTintConfig {
 /// which declares the same struct. Vectors before scalars, so the std140 padding is
 /// the same on both sides and WebGL2 agrees with the desktop.
 #[derive(Component, Clone, Copy, Default, ShaderType)]
-struct TerrainTintUniform {
+pub(super) struct TerrainTintUniform {
+    /// The beam and the sky, from [`crate::gameplay::sun`]. `vec4` rather than
+    /// `vec3` because std140 pads a `vec3` to sixteen bytes, and a padding
+    /// disagreement between these two structs is a runtime shader failure rather
+    /// than a build error. The fourth component is not read.
+    sun_direct: Vec4,
+    sun_sky: Vec4,
     view_centre_tiles: Vec2,
     view_half_extent_tiles: Vec2,
     world_tiles: Vec2,
+    /// Which way the sun lies, on the ground. The occlusion test walks along it.
+    sun_bearing: Vec2,
     water_line: f32,
     tint_low: f32,
     tint_high: f32,
     strength: f32,
+    sun_ray_slope: f32,
+    shadow_softness: f32,
+    relief_tiles: f32,
+    shadow_near_tiles: f32,
+    shadow_mid_tiles: f32,
+    shadow_far_tiles: f32,
 }
 
 /// Lives on the one world camera while [`Screen::Gameplay`] is up.
 ///
-/// Unlike the weather's overlay this never changes during a session: the ramp is
-/// config and the view is filled in at extract, so nothing has to keep it in step.
+/// The ramp half of it is written once — that is config, and the view is filled in
+/// at extract. The sun half moves, so [`crate::gameplay::sun`] writes it every
+/// frame through [`TerrainTintOverlay::set_sun`]; the uniform's layout stays in
+/// here, where the shader that reads it is.
 #[derive(Component, Clone, Copy, Default)]
-struct TerrainTintOverlay(TerrainTintUniform);
+pub(super) struct TerrainTintOverlay(TerrainTintUniform);
+
+impl TerrainTintOverlay {
+    /// Where the sun reaches the screen. Everything about the light and the shadow
+    /// arrives through this one call, so no other module has to know the uniform's
+    /// field order.
+    pub(super) fn set_sun(&mut self, sun: &Sun, config: &PlanetConfig) {
+        self.0.sun_direct = sun.light.direct.extend(0.0);
+        self.0.sun_sky = sun.light.sky.extend(0.0);
+        self.0.sun_bearing = sun.position.bearing;
+        self.0.sun_ray_slope = sun.position.ray_slope;
+        self.0.shadow_softness = config.shadow_softness;
+        self.0.relief_tiles = config.relief_tiles;
+        self.0.shadow_near_tiles = config.shadow_near_tiles;
+        self.0.shadow_mid_tiles = config.shadow_mid_tiles;
+        self.0.shadow_far_tiles = config.shadow_far_tiles;
+    }
+}
 
 impl SyncComponent for TerrainTintOverlay {
     // The removal target. Extraction only ever inserts, so if the render world is
@@ -239,6 +283,11 @@ fn attach_terrain_tint(
             tint_low: config.tint_low,
             tint_high: config.tint_high,
             strength: config.strength,
+            // Full daylight and a flat ray until the sun's first sync — the same
+            // fallback an unbaked sky gives the weather, and what this pass shows if
+            // the sun plugin is not in the app at all. A zeroed uniform would draw
+            // the world black.
+            sun_direct: Vec4::new(1.0, 1.0, 1.0, 0.0),
             ..default()
         }));
 }
