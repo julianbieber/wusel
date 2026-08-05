@@ -31,6 +31,7 @@ use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
         growth::CityGrowthPlugin,
+        industry::IndustryPlugin,
         plan::WorldPlanPlugin,
         terrain::{ChunkTerrain, TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, generate_chunk},
     },
@@ -90,7 +91,10 @@ impl Plugin for WorldPlugin {
         app.init_resource::<TerrainConfig>();
         // Both of these edit tiles, which is why they are the world's plugins
         // rather than siblings of it the way the tint and the weather are.
-        app.add_plugins((WorldPlanPlugin, CityGrowthPlugin));
+        // `IndustryPlugin` adds no system of its own beyond the two that build and
+        // drop its offset table — the industry step runs inside the growth loop,
+        // because the two have to interleave per *step* and there is only one clock.
+        app.add_plugins((WorldPlanPlugin, CityGrowthPlugin, IndustryPlugin));
         app.add_systems(Startup, load_tileset);
         app.add_systems(
             OnEnter(Screen::Gameplay),

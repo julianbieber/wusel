@@ -490,10 +490,12 @@ pub struct TileSample {
     /// biome map by construction, which is the point of it.
     pub hardness: f32,
     /// Which region the tile is in. Not what the bands read — that is `cover` — so
-    /// nothing outside the coverage and outline measurements has a use for it, and
-    /// the allow is scoped to say exactly that rather than to silence the lint
-    /// generally.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// nothing in generation has a use for it.
+    ///
+    /// [`crate::gameplay::deposit`] is the one thing outside the measurements that
+    /// does, and it wants exactly this rather than `cover`: a recipe naming
+    /// `Highland` is naming the region's geology, and inside a blend band the tile's
+    /// *vegetation* may well have been drawn from the neighbour.
     pub dominant: Biome,
     /// Which biome supplies the tile's ground cover, drawn from the blend weights.
     /// Equal to `dominant` everywhere except inside a blend band.

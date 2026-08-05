@@ -78,6 +78,7 @@ use crate::{
             TemperatureOffset,
         },
         inspect::{OverlayField, OverlayRange},
+        prospect::{ProspectTexture, seam_mark_unit},
         sun::{PlanetConfig, Sun},
         terrain::TerrainConfig,
         tint::{GroundDither, TerrainTintConfig},
@@ -168,6 +169,14 @@ pub(super) struct ScreenUniform {
     overlay_high: f32,
     overlay_diverging: f32,
     overlay_opacity: f32,
+    /// Which seam mark the active overlay is looking for in the prospect map's fourth
+    /// channel, on 0..1 — or 0 for a field that is not a resource.
+    ///
+    /// The comparison's *target* rather than the comparison: the categories are
+    /// `gameplay::prospect`'s to choose, so putting the value here rather than a
+    /// constant in the wgsl keeps them in one place. The tolerance is the shader's,
+    /// because it is a property of the byte quantization and not of the categories.
+    overlay_seam: f32,
 }
 
 /// Lives on the one world camera while [`Screen::Gameplay`] is up, and is the only
@@ -239,6 +248,7 @@ impl ScreenOverlay {
         self.0.overlay_high = range.high;
         self.0.overlay_diverging = f32::from(range.diverging);
         self.0.overlay_opacity = opacity;
+        self.0.overlay_seam = field.resource().map_or(0.0, seam_mark_unit);
     }
 
     /// Where the sun reaches the screen. Everything about the light and the shadow
@@ -608,6 +618,13 @@ fn init_screen_pipeline(
                 sampler(SamplerBindingType::Filtering),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
+                // The prospect map. **The one binding gh-24 adds**, and the first
+                // overlay field with a bake behind it — the recipe score needs the
+                // tile's kind and its biome, neither of which is on the GPU. Fifteen
+                // bindings now, of WebGL2's sixteen textures: worth checking before a
+                // second map is ever added.
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
                 uniform_buffer::<ScreenUniform>(true),
             ),
         ),
@@ -721,6 +738,7 @@ fn prepare_screen_bind_groups(
     cover: Option<Res<GroundCoverTexture>>,
     dither: Option<Res<GroundDither>>,
     climate: Option<Res<ClimateTexture>>,
+    prospect: Option<Res<ProspectTexture>>,
     images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
 ) {
@@ -775,6 +793,16 @@ fn prepare_screen_bind_groups(
         &pipeline.blank_climate,
         fallback,
     );
+    // The ordinary blank: a zero score is ground worth nothing and a zero seam mark is
+    // no seam, so an unbaked prospect map draws an empty field rather than a wrong
+    // one. Unlike the climate, zero means here exactly what absence means.
+    let (prospect_view, prospect_sampler) = map(
+        prospect
+            .as_ref()
+            .and_then(|prospect| images.get(&prospect.0)),
+        &pipeline.blank,
+        fallback,
+    );
 
     for (entity, target) in &views {
         let bind_group = |scene: &_| {
@@ -795,6 +823,8 @@ fn prepare_screen_bind_groups(
                     dither_sampler,
                     climate_view,
                     climate_sampler,
+                    prospect_view,
+                    prospect_sampler,
                     uniform_binding.clone(),
                 )),
             )

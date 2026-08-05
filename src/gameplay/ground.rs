@@ -726,7 +726,7 @@ fn climate_image(side: u32, cells: &[ClimateCell]) -> Image {
 /// The filtering is set here rather than inherited: the app-wide default is *nearest*
 /// for the 8px pixel art, and a nearest-sampled cover map would draw the snow in
 /// visible 16-tile blocks.
-fn map_image(
+pub(super) fn map_image(
     side: u32,
     texels: Vec<u8>,
     format: TextureFormat,
