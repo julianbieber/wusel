@@ -25,6 +25,7 @@ use crate::{
     camera::WorldCamera,
     gameplay::{
         ground::ClimateMaps,
+        inspect::OverlayField,
         plan::WorldPlan,
         sun::{PlanetConfig, Sun},
         weather::WeatherMaps,
@@ -75,6 +76,10 @@ pub(super) enum Command {
     Turn(f32),
     /// Where to put its orbit, on 0..1 from the northward equinox.
     Season(f32),
+    /// Which field the inspection overlay draws. `None` cycles, exactly as the key
+    /// does, so a scenario can drive the same interaction a player has rather than
+    /// only the one the ctl invented.
+    Overlay(Option<OverlayField>),
     Quit,
 }
 
@@ -104,6 +109,7 @@ impl Command {
             Self::Realtime => "realtime",
             Self::Turn(_) => "sun",
             Self::Season(_) => "season",
+            Self::Overlay(_) => "overlay",
             Self::Quit => "quit",
         }
     }
@@ -180,6 +186,10 @@ impl Command {
             "season" => Ok(Self::Season(number(
                 rest.first().ok_or("season needs an orbit phase on 0..1")?,
             )?)),
+            "overlay" => Ok(Self::Overlay(match rest.first() {
+                None => None,
+                Some(word) => Some(overlay_field(word)?),
+            })),
             "quit" => Ok(Self::Quit),
             other => Err(format!("unknown command: {other}")),
         }
@@ -364,6 +374,19 @@ impl Command {
                 Poll::Done(json!({ "orbit_phase": planet.orbit_phase }))
             }
 
+            // The mode is a resource and nothing else, so setting it is the whole of
+            // the interaction — the legend and the pass both read it the same frame.
+            Self::Overlay(field) => {
+                let Some(mut current) = world.get_resource_mut::<OverlayField>() else {
+                    return Poll::Failed("no overlay field resource".into());
+                };
+                *current = match field {
+                    Some(field) => *field,
+                    None => current.next(),
+                };
+                Poll::Done(json!({ "field": current.label() }))
+            }
+
             Self::Quit => {
                 world.write_message(AppExit::Success);
                 Poll::Done(json!({}))
@@ -515,6 +538,16 @@ fn screen(word: &str) -> Result<Screen, String> {
         "gameplay" => Ok(Screen::Gameplay),
         other => Err(format!("unknown screen: {other} (main, help, gameplay)")),
     }
+}
+
+fn overlay_field(word: &str) -> Result<OverlayField, String> {
+    OverlayField::ALL
+        .into_iter()
+        .find(|field| field.label() == word)
+        .ok_or_else(|| {
+            let known: Vec<&str> = OverlayField::ALL.iter().map(|f| f.label()).collect();
+            format!("unknown overlay field: {word} ({})", known.join(", "))
+        })
 }
 
 fn key_code(word: &str) -> Result<KeyCode, String> {

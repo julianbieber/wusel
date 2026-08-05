@@ -899,6 +899,64 @@ world state and go on `OnExit`, which cancels a bake or a step still in flight. 
 the read seam, built the way `SkySampler` was — an answer, not the machinery — so `growth.rs` starving
 a field under snow is a change to that module and not to this one. It is explicitly out of scope here.
 
+### The inspection overlay (`gameplay/inspect.rs`)
+
+`Tab` (or `overlay <field>` from the ctl) draws the fields the world is built out of as false colour:
+height, temperature, moisture, wetness, snow, cloud. It is a debug view, and the first thing in the
+crate that exists to be *looked at* rather than played.
+
+**It needs no new maps.** Every field is already bound to the one pass because something else needed
+it there — the heightmap for the ramp and the shadows, the climate map for what falls as snow, the
+cover map for what lies, and the cloud probability map, which *is* `TerrainSampler::humidity()`. That
+is the merge paying off a second time: with two passes, half these fields would have been in the wrong
+one. The module owns a mode, two ramps and a legend; the pass short-circuits to them before the
+composite, because an inspector dimmed by nightfall or hidden under a cloud is not an inspector.
+
+**Fit the ramp to a screenful, not to the field.** This is the same lesson the tint's `strength`
+carries and it was learned again the hard way: the first cut ranged height over 0..1 and temperature
+over the world's -20..30 C, and *both came out one flat colour*, because a screen at gameplay zoom
+holds about 0.3 of the height range and four degrees of temperature. The range is now measured every
+frame from a 24x24 grid over the visible rectangle, trimmed a fortieth at each end so one deep-water
+tile cannot stretch the ramp over water nobody is looking at.
+
+Which fields get that splits on a property of the field rather than on preference. **Smooth and slow**
+— height, temperature, moisture — vary over hundreds of tiles, so a screen is a slice. **Saturating** —
+wetness, snow, cloud — are 0 or 1 over most of the map by construction and already use their whole
+range; fitting one would draw a dry screen's numerical noise as weather. A `min_span` floor is what
+keeps genuinely flat ground looking flat instead of having its last quantization step magnified.
+
+**The colours are not a free choice**, and the rules are worth keeping because the instinctive answer
+breaks all of them:
+
+- **Never a rainbow.** Blue-green-yellow-red is not monotone in lightness, so the eye reads its bright
+  band as an *edge* and invents a boundary the data does not have.
+- **Magnitude gets one hue, light to dark** — so "more" is always "darker" and the hue means nothing.
+- **Polarity gets two hues and a light neutral middle.** Temperature is the only field with a
+  meaningful zero, so it is the only diverging one, and its midpoint is
+  `GroundConfig::freezing_celsius` read from the module that freezes things rather than restated as 0.
+  The payoff is that **the snow line is the neutral band** — you see where it is without reading a
+  number. The arms are kept equal about it, so a view wholly below freezing draws wholly cool.
+- **Nothing is encoded by colour alone.** The legend names the field and prints the ends of the *live*
+  range, which is also the relief a sub-3:1 ramp requires.
+
+The diverging poles were validated rather than eyeballed: `#0d366b` against `#701312` measures ΔE 15.2
+under protanopia and 20.9 to normal vision, against floors of 8 and 15. The legend's swatch strip
+carries a hairline ring because the sequential ramp's dark end is under 2:1 against the panel and
+without it the strip has no visible right-hand end.
+
+**Each field is drawn at the resolution the game reads it at**, and the difference shows: height is
+one texel per tile and comes out crisp, while temperature and moisture come out in soft 16-tile blocks
+because that is the grid the ground steps on. That is not a defect to smooth over — being able to see
+the grid is worth more than a prettier map. Bilinear rather than nearest for the same reason: the
+bilinear value is the one the composite decides rain against snow with.
+
+`ActiveOverlay` is written once a frame by the sync and read by everything that has to agree with the
+screen — the pass, the legend and the ctl. With a fitted range, deriving it a second time anywhere
+would be a second answer to "what is the player looking at", and the two would part company the moment
+the camera moved. The legend follows the same read-every-frame-write-what-changed rule `city_panel.rs`
+does, and for the opposite reason: its *structure* changes twice a session and its *numbers* change on
+any frame you pan, so the swatches are rebuilt on a field change and only the three labels are written.
+
 ### City stats panel (`gameplay/city_panel.rs`, `assets/shaders/wood_panel.wgsl`)
 
 Click a city, get a wooden window showing what `growth.rs` is doing to it. The first thing in the
@@ -1025,6 +1083,9 @@ exists while every scenario still passes. Concretely —
   `season <orbit_phase>` for this: without them a scenario has to wait 300 real seconds to see
   midnight, and there is no way at all to see a winter. The rotation *is* the sun's only state, so
   writing it is the whole of moving the clock — everything else is re-derived the same frame.
+- **A view mode needs a verb, and the verb should be able to do what the key does.** `overlay <field>`
+  selects one; bare `overlay` *cycles*, which is exactly what `Tab` does — so a scenario drives the
+  player's interaction rather than only the one the ctl invented for itself.
 
 **Two traps in driving a world with clocks in it**, both found by getting them wrong:
 

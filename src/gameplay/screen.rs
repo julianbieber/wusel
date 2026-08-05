@@ -77,6 +77,7 @@ use crate::{
             CLIMATE_MIN_CELSIUS, ClimateTexture, GroundConfig, GroundCoverTexture,
             TemperatureOffset,
         },
+        inspect::{OverlayField, OverlayRange},
         sun::{PlanetConfig, Sun},
         terrain::TerrainConfig,
         tint::{GroundDither, TerrainTintConfig},
@@ -157,6 +158,16 @@ pub(super) struct ScreenUniform {
     climate_min_celsius: f32,
     climate_span_celsius: f32,
     climate_amplitude_span_celsius: f32,
+    /// Which field the inspection overlay is drawing, as
+    /// [`crate::gameplay::inspect::OverlayField`]'s discriminant — the enum's order
+    /// *is* what the shader switches on. Zero is off, and off is the only reason the
+    /// composite below it runs at all.
+    overlay_field: f32,
+    overlay_low: f32,
+    overlay_mid: f32,
+    overlay_high: f32,
+    overlay_diverging: f32,
+    overlay_opacity: f32,
 }
 
 /// Lives on the one world camera while [`Screen::Gameplay`] is up, and is the only
@@ -203,6 +214,31 @@ impl ScreenOverlay {
         self.0.climate_min_celsius = CLIMATE_MIN_CELSIUS;
         self.0.climate_span_celsius = CLIMATE_MAX_CELSIUS - CLIMATE_MIN_CELSIUS;
         self.0.climate_amplitude_span_celsius = CLIMATE_MAX_AMPLITUDE_CELSIUS;
+    }
+
+    /// Which field the inspection overlay is drawing, and over what.
+    ///
+    /// The range comes over as three numbers rather than as the field's identity,
+    /// because the shader has no business knowing that a temperature is measured in
+    /// degrees — it normalizes whatever it reads against these and looks the result
+    /// up in a ramp. `None` is off, and it zeroes the field id so there is no second
+    /// place for "is the overlay on" to be answered.
+    pub(super) fn set_overlay(
+        &mut self,
+        field: OverlayField,
+        range: Option<OverlayRange>,
+        opacity: f32,
+    ) {
+        let Some(range) = range else {
+            self.0.overlay_field = 0.0;
+            return;
+        };
+        self.0.overlay_field = field as u32 as f32;
+        self.0.overlay_low = range.low;
+        self.0.overlay_mid = range.mid;
+        self.0.overlay_high = range.high;
+        self.0.overlay_diverging = f32::from(range.diverging);
+        self.0.overlay_opacity = opacity;
     }
 
     /// Where the sun reaches the screen. Everything about the light and the shadow

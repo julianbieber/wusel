@@ -16,10 +16,12 @@ use crate::{
         city::{City, CitySize},
         ground::{ClimateMaps, GroundConfig, GroundCover, temperature_offset},
         growth::CityGrowth,
+        inspect::{ActiveOverlay, FieldSources},
         plan::WorldPlan,
         road::RoadNetwork,
         sun::{PlanetConfig, Sun},
         terrain::TerrainKind,
+        weather::SkySampler,
         world::{BackgroundGeneration, ChunkCoord, WORLD_CHUNKS, WorldMap, tile_position_at},
     },
     screens::Screen,
@@ -37,6 +39,7 @@ pub(super) enum Topic {
     Cities,
     Ground,
     Sun,
+    Overlay,
     Screen,
     Log,
 }
@@ -50,11 +53,12 @@ impl Topic {
             "cities" => Ok(Self::Cities),
             "ground" => Ok(Self::Ground),
             "sun" => Ok(Self::Sun),
+            "overlay" => Ok(Self::Overlay),
             "screen" => Ok(Self::Screen),
             "log" => Ok(Self::Log),
             other => Err(format!(
                 "unknown observation: {other} \
-                 (terrain, plan, camera, cities, ground, sun, screen, log)"
+                 (terrain, plan, camera, cities, ground, sun, overlay, screen, log)"
             )),
         }
     }
@@ -68,6 +72,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Cities => cities(world),
         Topic::Ground => ground(world),
         Topic::Sun => sun(world),
+        Topic::Overlay => overlay(world),
         Topic::Screen => screen(world),
         Topic::Log => log(world),
     }
@@ -310,6 +315,68 @@ fn cities(world: &mut World) -> Value {
     // iteration order is an ECS implementation detail and would make a diff noise.
     list.sort_by_key(|city| city["id"].as_u64().unwrap_or_default());
     json!({ "count": list.len(), "cities": list })
+}
+
+/// What the inspection overlay is drawing, and what it is drawing at the middle of
+/// the screen.
+///
+/// The field and its range come from `ActiveOverlay`, which the overlay's own sync
+/// wrote this frame — **not** re-derived here. With a range fitted to what is on
+/// screen, deriving it a second time would be a second answer to "what is the player
+/// looking at", and the two would part company the moment the camera moved.
+///
+/// The value beside it *is* read afresh, from the CPU's own copy of the field rather
+/// than from the map the shader samples — so the pair is a genuine cross-check.
+/// `position` is where that value lands on the ramp, through the same `normalize` the
+/// shader transcribes: 0 is the low end, 1 the high, and for a diverging field 0.5 is
+/// exactly the freezing point.
+fn overlay(world: &mut World) -> Value {
+    let Some(active) = world.get_resource::<ActiveOverlay>().copied() else {
+        return json!({ "running": false });
+    };
+    let Some(range) = active.range else {
+        return json!({ "running": true, "field": active.field.label() });
+    };
+
+    // Scoped so the query's borrow ends before the resources are read; the tile is
+    // `Copy`. The camera's own `Transform`, for the reason `city_panel.rs` gives at
+    // the matching conversion.
+    let centre = {
+        let mut cameras = world.query_filtered::<&Transform, With<WorldCamera>>();
+        cameras
+            .iter(world)
+            .next()
+            .map(|transform| tile_position_at(transform.translation.truncate()))
+    };
+
+    let value = centre.and_then(|tile| {
+        let offset = temperature_offset(
+            world.get_resource::<GroundConfig>()?,
+            world.get_resource::<PlanetConfig>()?,
+            world.get_resource::<Sun>()?,
+        );
+        FieldSources {
+            world: world.get_resource::<WorldMap>(),
+            climate: world.get_resource::<ClimateMaps>(),
+            cover: world.get_resource::<GroundCover>(),
+            sky: world.get_resource::<SkySampler>(),
+            offset,
+        }
+        .value(active.field, tile)
+    });
+
+    json!({
+        "running": true,
+        "field": active.field.label(),
+        "low": range.low,
+        "mid": range.mid,
+        "high": range.high,
+        "diverging": range.diverging,
+        "unit": range.unit,
+        "centre_tile": centre.map(|tile| [tile.x, tile.y]),
+        "value": value,
+        "position": value.map(|value| range.normalize(value)),
+    })
 }
 
 fn screen(world: &mut World) -> Value {

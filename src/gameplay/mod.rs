@@ -6,6 +6,7 @@ mod city_panel;
 mod drainage;
 pub(crate) mod ground;
 pub(crate) mod growth;
+pub(crate) mod inspect;
 mod noise;
 pub(crate) mod plan;
 mod river;
@@ -48,6 +49,7 @@ impl Plugin for GameplayPlugin {
             tint::TerrainTintPlugin,
             weather::WeatherPlugin,
             ground::GroundPlugin,
+            inspect::InspectPlugin,
             city_panel::CityPanelPlugin,
             sun::SunPlugin,
         ));

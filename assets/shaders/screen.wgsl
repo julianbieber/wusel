@@ -63,6 +63,12 @@ struct ScreenUniform {
     climate_min_celsius: f32,
     climate_span_celsius: f32,
     climate_amplitude_span_celsius: f32,
+    overlay_field: f32,
+    overlay_low: f32,
+    overlay_mid: f32,
+    overlay_high: f32,
+    overlay_diverging: f32,
+    overlay_opacity: f32,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -234,11 +240,112 @@ fn snow_lying(coverage: f32, dither: f32, softness: f32) -> f32 {
     return smoothstep(threshold - softness, threshold + softness, coverage);
 }
 
+// -- the inspection overlay ---------------------------------------------------
+//
+// The fields the world is built out of, drawn as false colour. Every one of them is
+// already bound because something else needed it: the heightmap for the ramp and the
+// shadows, the climate for what falls as snow, the cover for what lies, and the
+// cloud probability map — which *is* the humidity field. So this adds no binding.
+//
+// The colours are gameplay/inspect.rs's, and the two are edited together: that
+// module builds the legend out of the same ramp, so a swatch and the map under it
+// cannot disagree about what a value looks like.
+
+const RAMP_SEQUENTIAL = array(
+    vec3(0.804, 0.886, 0.984),
+    vec3(0.224, 0.529, 0.898),
+    vec3(0.051, 0.212, 0.420),
+);
+const RAMP_DIVERGING = array(
+    vec3(0.051, 0.212, 0.420),
+    vec3(0.941, 0.937, 0.925),
+    vec3(0.439, 0.075, 0.071),
+);
+
+/// The raw value of whichever field is selected.
+///
+/// `textureSampleLevel` rather than `textureSample`: this runs inside a branch on a
+/// uniform, and asking for an explicit level means no implicit derivatives and so no
+/// uniformity question to get wrong. None of these maps has mips, so it reads the
+/// same texel either way.
+fn overlay_value(at: vec2<f32>, tile: vec2<f32>) -> f32 {
+    let field = screen.overlay_field;
+    if field < 1.5 {
+        return textureLoad(height_texture, vec2<i32>(tile), 0).r;
+    }
+    if field < 2.5 {
+        return temperature_at(at);
+    }
+    if field < 3.5 {
+        // The cloud probability map, which is the humidity field unchanged — the same
+        // answer the river springs read and the clouds gather on.
+        return textureSampleLevel(
+            probability_texture,
+            probability_sampler,
+            at / screen.world_tiles,
+            0.0,
+        ).r;
+    }
+    if field < 5.5 {
+        // Read at the tile's centre, exactly as the composite reads it, so the
+        // overlay shows the number the ground is actually drawn from.
+        let cover = textureSampleLevel(
+            cover_texture,
+            cover_sampler,
+            (tile + vec2(0.5)) / screen.world_tiles,
+            0.0,
+        ).rg;
+        if field < 4.5 {
+            return cover.r;
+        }
+        return cover.g;
+    }
+    return cloud_density(cloud_field(at));
+}
+
+/// A value onto the ramp's 0..1, with the range's midpoint pinned to the middle.
+///
+/// Transcribes `OverlayRange::normalize`. Piecewise because the two arms need not be
+/// the same width — the temperature range runs -20 to 30 about a freezing point at 0
+/// — and both still have to fill their half.
+fn overlay_position(value: f32) -> f32 {
+    var t: f32;
+    if value < screen.overlay_mid {
+        t = 0.5 * (value - screen.overlay_low)
+            / max(screen.overlay_mid - screen.overlay_low, 1e-6);
+    } else {
+        t = 0.5 + 0.5 * (value - screen.overlay_mid)
+            / max(screen.overlay_high - screen.overlay_mid, 1e-6);
+    }
+    return clamp(t, 0.0, 1.0);
+}
+
+/// Three stops, interpolated — transcribes `inspect::ramp`.
+fn overlay_colour(t: f32) -> vec3<f32> {
+    var stops = RAMP_SEQUENTIAL;
+    if screen.overlay_diverging > 0.5 {
+        stops = RAMP_DIVERGING;
+    }
+    if t < 0.5 {
+        return mix(stops[0], stops[1], t * 2.0);
+    }
+    return mix(stops[1], stops[2], (t - 0.5) * 2.0);
+}
+
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(scene_texture, scene_sampler, in.uv);
     let at = tile_position(in.uv);
     let tile = floor(at);
+
+    // The overlay short-circuits everything below, and that is the point of it: an
+    // inspector dimmed by nightfall or hidden under a cloud is not an inspector. Off
+    // the edge of the world there is no field to read, so the world's own border
+    // stays visible.
+    if screen.overlay_field > 0.5 && inside_world(tile) {
+        let field = overlay_colour(overlay_position(overlay_value(at, tile)));
+        return vec4(mix(scene.rgb, field, screen.overlay_opacity), scene.a);
+    }
 
     // -- the ground: its own relief, then the sun on it ----------------------
 

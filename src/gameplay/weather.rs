@@ -454,19 +454,35 @@ impl SkySampler {
         (self.coarse_offset, self.fine_offset)
     }
 
-    /// How hard it is raining over a tile, on 0..1.
+    /// How much cloud is over a tile, on 0..1.
     ///
-    /// `probability` is the humidity there — passed in rather than sampled, because
-    /// every caller already holds it and a `TerrainSampler` lookup is ~190 ns.
-    pub fn rain_at(&self, tile: Vec2, probability: f32) -> f32 {
-        let shape = shape_at(
+    /// The same density the overlay draws and the shadow is cut from, so the ctl can
+    /// report what the screen is showing rather than an approximation of it.
+    /// `probability` is the humidity there, passed in for the reason
+    /// [`Self::rain_at`] gives.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn cloud_at(&self, tile: Vec2, probability: f32) -> f32 {
+        cloud_density(&self.config, probability * self.shape_at(tile))
+    }
+
+    /// The two shape layers where the clock has drifted them, at a tile. Shared by
+    /// both readings above so they cannot disagree about where the cloud is.
+    fn shape_at(&self, tile: Vec2) -> f32 {
+        shape_at(
             &self.field,
             &self.config,
             shape_cell(&self.config, tile),
             self.coarse_offset,
             self.fine_offset,
-        );
-        let field = probability * shape;
+        )
+    }
+
+    /// How hard it is raining over a tile, on 0..1.
+    ///
+    /// `probability` is the humidity there — passed in rather than sampled, because
+    /// every caller already holds it and a `TerrainSampler` lookup is ~190 ns.
+    pub fn rain_at(&self, tile: Vec2, probability: f32) -> f32 {
+        let field = probability * self.shape_at(tile);
         rain_amount(&self.config, field, cloud_density(&self.config, field))
     }
 }
