@@ -30,6 +30,7 @@ struct WeatherUniform {
     rain_softness: f32,
     rain_strength: f32,
     streak_phase: f32,
+    light_level: f32,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -129,7 +130,11 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     // The cloud itself, last, so it sits over the world and over its own rain — but
     // never opaquely: the point is terrain seen through weather.
-    colour = mix(colour, vec3(weather.cloud_brightness), cloud * weather.cloud_opacity);
+    //
+    // Lit by the same sun as the ground it is over — the tint pass ran first, so
+    // without this a cloud at midnight would be a white shape over a dark world.
+    let cloud_colour = weather.cloud_brightness * weather.light_level;
+    colour = mix(colour, vec3(cloud_colour), cloud * weather.cloud_opacity);
 
     return vec4(colour, scene.a);
 }
