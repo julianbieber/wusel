@@ -9,6 +9,7 @@ mod noise;
 pub(crate) mod plan;
 mod river;
 pub(crate) mod road;
+mod screen;
 mod sun;
 pub(crate) mod terrain;
 mod tint;
@@ -16,25 +17,6 @@ pub(crate) mod weather;
 pub(crate) mod world;
 
 pub use world::world_half_extent;
-
-/// The order the full-screen passes composite in.
-///
-/// Both of them ping-pong the same view target, so the second reads what the first
-/// wrote and the order is the result — it cannot be left to whichever plugin was
-/// added first. The tint is the terrain's own shading and goes *under* the weather,
-/// so that a cloud shadow darkens shaded ground rather than the shading brightening
-/// a cloud.
-///
-/// A set rather than `.before(weather_pass)`, because a system is only usable as an
-/// ordering label where its parameter types are visible, and the weather's are its
-/// own business.
-#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ScreenEffectSystems {
-    /// The terrain's shading, over the world and under everything else.
-    Tint,
-    /// Clouds, their shadows and rain.
-    Weather,
-}
 
 pub struct GameplayPlugin;
 
@@ -50,16 +32,18 @@ impl Plugin for GameplayPlugin {
         // list follows is "edits tiles → inside the world's plugin", and reading implies
         // neither — the panel asks `CityMap` a question and takes the answer away.
         //
-        // The order in this list is *not* load-bearing: every overlay is attached in
-        // OnEnter, which finishes before Update, so the sun's sync finds the two it
-        // writes to however these are listed.
+        // `screen` is the odd one out and is none of those things: it owns no model at
+        // all, only the one post-process pass the tint, the sun and the weather draw
+        // through. There used to be two passes, and the order they composited in was an
+        // ordering between systems that had to be stated here; now it is the order of
+        // the lines in one fragment function, so this list is back to being a list.
         //
-        // What is worth knowing is the failure mode. That sync takes both overlays
-        // as one `Single`, so it is silently *skipped* while either is missing —
-        // which means dropping the weather plugin, as a capture experiment might,
-        // stops the sun advancing on screen too rather than merely removing clouds.
+        // The order in it is *not* load-bearing: every contributor writes the overlay
+        // in `Update` or in an `OnEnter` explicitly ordered after the attach, both of
+        // which run after the whole `OnEnter` set this list feeds.
         app.add_plugins((
             world::WorldPlugin,
+            screen::ScreenEffectPlugin,
             tint::TerrainTintPlugin,
             weather::WeatherPlugin,
             city_panel::CityPanelPlugin,

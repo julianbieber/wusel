@@ -24,9 +24,10 @@
 //! the machinery — and its absence is full daylight, the way the absence of
 //! `SkySampler` is a clear sky.
 //!
-//! The lighting itself is drawn by [`crate::gameplay::tint`], because the shadow
-//! test reads the heightmap and that is the only pass which binds it. This module
-//! decides; that one draws.
+//! The lighting itself is drawn by [`crate::gameplay::screen`], the one post-process
+//! pass over the world — this module decides where the sun is and what it delivers,
+//! and hands both over through [`ScreenOverlay::set_sun`]. That is also where the
+//! shadow test lives, because it reads the heightmap and the pass is what binds it.
 //!
 //! **None of the drawing half is visible to a unit test**, so it was measured off
 //! real frames instead — captures of one fixed scene at a series of rotations, the
@@ -57,10 +58,7 @@ use std::f32::consts::TAU;
 
 use bevy::prelude::*;
 
-use crate::{
-    gameplay::{tint::TerrainTintOverlay, weather::WeatherOverlay},
-    screens::Screen,
-};
+use crate::{gameplay::screen::ScreenOverlay, screens::Screen};
 
 /// How a colour is weighed into one number. Used for the level the clouds are lit
 /// by, and to normalise the sky's hue so that "how blue" and "how bright" are two
@@ -309,7 +307,16 @@ impl Sun {
     }
 
     /// How much light the world is getting in total, on the same scale
-    /// [`PlanetConfig::daylight`] is set in. What the clouds are lit by.
+    /// [`PlanetConfig::daylight`] is set in.
+    ///
+    /// This is what the clouds are lit by, and it used to be *sent* to them, because
+    /// the weather composited over a world the tint had already lit. With one pass the
+    /// shader takes the same weighted sum off the uniform itself — so this is now the
+    /// CPU's copy of that arithmetic, kept for the readers the sun exists to serve.
+    #[allow(
+        dead_code,
+        reason = "the reader gh-26 exists to provide; the shader has its own copy"
+    )]
     pub fn light_level(&self) -> f32 {
         (self.light.sky + self.light.direct).dot(LUMINANCE)
     }
@@ -355,17 +362,18 @@ fn turn_the_planet(time: Res<Time>, config: Res<PlanetConfig>, mut sun: ResMut<S
     *sun = sun_at(&config, rotation);
 }
 
-/// Puts this frame's sun into the tint overlay, which draws it, and its level into
-/// the weather's, which is composited over an already-lit world and would otherwise
-/// hang white clouds in a midnight sky.
+/// Puts this frame's sun into the one overlay there is.
+///
+/// It used to write two — the tint's light and, separately, a level for the weather,
+/// because the clouds composited over a world the tint had already lit. With one pass
+/// the clouds read the same beam and sky the ground does, so there is nothing left to
+/// keep in step.
 fn sync_sun_light(
     sun: Res<Sun>,
     config: Res<PlanetConfig>,
-    overlays: Single<(&mut TerrainTintOverlay, &mut WeatherOverlay)>,
+    mut overlay: Single<&mut ScreenOverlay>,
 ) {
-    let (mut tint, mut weather) = overlays.into_inner();
-    tint.set_sun(&sun, &config);
-    weather.set_light_level(sun.light_level());
+    overlay.set_sun(&sun, &config);
 }
 
 // -- The model ---------------------------------------------------------------

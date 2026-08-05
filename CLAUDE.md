@@ -51,8 +51,8 @@ don't add a second one per screen. UI is laid out in screen space, so driving th
 WASD moves the world without disturbing anything on top of it.
 
 Because it outlives every screen, anything hung *on* the camera cannot use `DespawnOnExit` and has to
-be removed by hand — `gameplay/weather.rs` adds its `WeatherOverlay` on entering gameplay and takes it
-off on leaving, and the whole weather pass is gated on that component being there.
+be removed by hand — `gameplay/screen.rs` adds its `ScreenOverlay` on entering gameplay and takes it
+off on leaving, and the whole post-process pass is gated on that component being there.
 
 Zoom is the orthographic scale, held to powers of two between `MIN_ZOOM_SCALE` and `MAX_ZOOM_SCALE`
 (0.25 to 4) by `+`/`-` or the wheel. Powers of two because the 8px tiles are drawn with nearest
@@ -512,9 +512,11 @@ way between them: chunk coordinates (`0..WORLD_CHUNKS`), global tile coordinates
 sampled in), and world space in pixels. `tile_position_at` is the odd one out and the weather overlay
 is why: it is the only conversion that keeps its fraction, since a screen pixel falls *between* tiles.
 
-### Weather (`gameplay/weather.rs`, `assets/shaders/weather.wgsl`)
+### Weather (`gameplay/weather.rs`)
 
-Cloud patches drifting over the world, the shadow each throws, and rain in the thick of them.
+Cloud patches drifting over the world, the shadow each throws, and rain in the thick of them. The
+drawing is `gameplay/screen.rs`'s — see "The one post-process pass" below; this module bakes the maps,
+advances the clock and hands the knobs over through `ScreenOverlay::set_sky`.
 
 **This is no longer cosmetic, and that is the one thing to know before tuning it.** Nothing here reads
 or writes `WorldMap` — the dependency is strictly one way — but `gameplay/growth.rs` reads *this*: a
@@ -566,29 +568,56 @@ rather than accumulated — unwrapped they quantize the streak phase after a few
 Defaults carry their measurements, taken with the `#[ignore]`d `the_default_config_measures_the_sky`
 (`cargo test --release -- --ignored --nocapture`).
 
-### Weather shader coupling
+### The one post-process pass (`gameplay/screen.rs`, `assets/shaders/screen.wgsl`)
 
-`WeatherUniform` in `weather.rs` and `WeatherUniform` in `weather.wgsl` are the same struct written
-twice: **field order is the binding layout**. Vectors are declared before scalars so std140 padding
-agrees on both sides, including under WebGL2. The shader is loaded by path at runtime, so a mismatch is
-a shader-compile failure when you enter gameplay, not a build error — and `just check-web` only
-type-checks Rust, so it will not catch a wgsl construct the web backend rejects. Adding a knob means
-touching the Rust struct, the wgsl struct, `sync_weather_overlay` and the config doc comment together.
+**There is exactly one full-screen pass over the world, and the composite order is the order of the
+lines in its fragment function** — not an ordering between systems:
+
+```text
+scene → height ramp → sun light → cloud shadow → rain → cloud
+```
+
+There used to be two, ping-ponging the same `ViewTarget`, so the second read what the first wrote.
+That worked and it leaked: `WeatherUniform` carried a `light_level` field for no reason other than that
+the tint had already lit the world, and gh-26 put the sun in the *tint* pass rather than a third one
+because the tint was the only thing binding the heightmap — the same argument as merging, applied once
+already. Merged, the light is a local and the field is gone.
+
+**Ownership did not move, only the drawing did.** `tint.rs` still owns the ramp, `weather.rs` the sky
+and its bakes, `sun.rs` the light; each writes its own slice of one `ScreenOverlay` through a setter
+(`set_ramp`, `set_sun`, `set_sky`), so the uniform's field order stays private beside the shader that
+reads it. What `screen.rs` owns outright is the heightmap texture, the pipeline, the specializer, the
+two ping-pong bind groups and the pass.
+
+`ScreenUniform` in `screen.rs` and in `screen.wgsl` are the same struct written twice: **field order is
+the binding layout**. Vectors are declared before scalars so std140 padding agrees on both sides,
+including under WebGL2. The shader is loaded by path at runtime, so a mismatch is a shader-compile
+failure when you enter gameplay, not a build error — and `just check-web` only type-checks Rust, so it
+will not catch a wgsl construct the web backend rejects. Adding a knob means touching the Rust struct,
+the wgsl struct, the owning module's setter and its config doc comment together.
+
+**Every map has a blank fallback and the pass always draws.** A 1×1 zero R8 texture stands in for a
+heightmap whose session has not started and for a sky whose bake has not landed — zero height is below
+any water line and zero cloud probability is a clear sky, so each absence is the fallback that module
+already documents. That is what lets one bind group layout carry maps arriving at different times; with
+one pass, a missing map that skipped the whole thing would take the *other* effects down with it.
 
 The pass is registered `.in_set(Core2dSystems::PostProcess).after(tonemapping)`. Bevy 0.19 has **no
 node-based render graph** for Core2d — no `Node2d`, no `bevy_render::render_graph` — so a post-process
 effect is an ordinary system in the `Core2d` schedule taking `ViewQuery` and `RenderContext`;
 `bevy_core_pipeline::fullscreen_material` is the in-tree template it was written from (it cannot be
-used directly, since its bind group layout is fixed at three entries and cannot carry the two maps).
-That placement is what keeps weather off the UI: `bevy_ui_render` orders `ui_pass` *after* the whole
+used directly, since its bind group layout is fixed at three entries and cannot carry the maps). That
+placement is what keeps all of it off the UI: `bevy_ui_render` orders `ui_pass` *after* the whole
 `PostProcess` set.
 
-There are **two** passes in `PostProcess`, and both ping-pong the same `ViewTarget`, so the second
-reads what the first wrote and the order is part of the result. It is stated in the `ScreenEffectSystems` set
-in `gameplay/mod.rs` — `Tint` then `Weather` — rather than with `.before(weather_pass)`, because a
-system is only usable as an ordering label where its parameter types are visible. gh-26 added the sun to
-the *tint* pass rather than a third one, so that count still holds; what it cost instead is the
-`light_level` coupling noted above.
+**How the merge was verified, and the trick is reusable.** Captures of the same scene before and after,
+diffed channel by channel: the worst difference is **1/255** on 5–10% of channels and nothing larger,
+which is exactly the intermediate 8-bit write disappearing. Anything bigger would have been a composite
+reordered rather than rounding. Making two runs comparable at all needed `fixed-delta 0` as the *first*
+line of the scenario — every clock in the game is driven by `Time::delta`, so a zero delta freezes the
+sun at `start_rotation` and the weather at offset zero, while generation, the plan and the bake are
+driven by task-pool completion polled per frame and so still land. Without it the frame count before
+`wait terrain` returns is wall-clock dependent, and the sun would be at a different hour in each run.
 
 ### The sun (`gameplay/sun.rs`)
 
@@ -652,11 +681,11 @@ The clock never pauses: while gameplay is up the planet turns with `Time` and no
 **There is a third struct written twice, and it is not one of these.** `WoodPanelMaterial` in
 `city_panel.rs` and in `wood_panel.wgsl` carry the same discipline — vectors before scalars, and the
 layout is 112 bytes — but a *different mechanism*, and reaching for this section's pattern when
-writing UI would be the mistake. The weather and the tint are fullscreen `Core2d` passes with
-hand-written `BindGroupLayoutDescriptor`s and specializers; a `UiMaterial` gets its layout **derived**
-by `AsBindGroup` and its handle carried by `MaterialNode`, so what is duplicated across the language
-boundary is the field list alone. Following `tint.rs` there would mean writing a render-graph pass for
-a rounded rectangle.
+writing UI would be the mistake. `screen.rs` is a fullscreen `Core2d` pass with a hand-written
+`BindGroupLayoutDescriptor` and a specializer; a `UiMaterial` gets its layout **derived** by
+`AsBindGroup` and its handle carried by `MaterialNode`, so what is duplicated across the language
+boundary is the field list alone. Following `screen.rs` there would mean writing a render-graph pass
+for a rounded rectangle.
 
 Two more differences worth stating, since both mislead by analogy:
 
@@ -674,22 +703,24 @@ Two more differences worth stating, since both mislead by analogy:
 naga parses, validates and lowers the wgsl to GLSL ES 3.00 in isolation if you inline the one import
 by hand — that is how `external` was found to be a reserved keyword before the panel was ever opened.
 
-### Terrain tint (`gameplay/tint.rs`, `assets/shaders/tint.wgsl`)
+### Terrain tint (`gameplay/tint.rs`)
 
 Scales the rendered world's brightness by the height of the tile under each fragment, so a slope reads
 as a slope *inside* a kind's band rather than only where it crosses a `classify` edge. Cosmetic, like
 the weather: nothing here touches `WorldMap`.
 
-**This pass also carries the sun** (gh-26), because the occlusion test reads the heightmap and this is
-the only thing that binds it — a pass of its own would duplicate the pipeline, the specializer and both
-ping-pong bind groups for three more `textureLoad`s. Two consequences. The overlay is no longer written
-once and left alone: `sun.rs` writes this frame's light into it through `TerrainTintOverlay::set_sun`,
-which is why the uniform's layout can stay private here. And because the tint composites *under* the
-weather, `WeatherUniform` had to take a `light_level` so a cloud at midnight is a dark shape rather than
-a white one — the first thing the weather has ever read from outside itself.
+**The module is the ramp and nothing else** — three knobs, one setter and its tests. The heightmap
+texture, the pipeline and the fragment function are `screen.rs`'s, the one post-process pass; this
+decides how a height becomes a brightness and hands the numbers over through `ScreenOverlay::set_ramp`.
+Being the only thing that bound the heightmap is why gh-26 put the sun in this pass rather than a third
+one, and that argument taken one step further is why there is now only one pass at all.
 
-The height ramp is unchanged by any of that, deliberately: it is fake relief, but it is the only cue at
-noon and through the whole night, when a real sun casts nothing. The two can disagree — the ramp
+The ramp is written once, on entering gameplay, where the sun and the sky are written every frame — so
+`sync_tint_ramp` is ordered `.after(attach_screen_overlay)`, which is legal because a system is usable
+as an ordering label wherever its parameter types are visible.
+
+The height ramp is unchanged by the sun's arrival, deliberately: it is fake relief, but it is the only
+cue at noon and through the whole night, when a real sun casts nothing. The two can disagree — the ramp
 brightens a peak the sun may be behind. Fading it as the sun sinks would fix that and would invalidate
 the screenful spread measured below, so it is not done.
 
@@ -701,7 +732,7 @@ there being one. The cost is memory: 16 MB of heights beside the 16 MB of kinds,
 GPU. `every_tile_keeps_the_height_it_was_classified_from` is the guard.
 
 **The map is not an `Image` asset**, because Bevy re-uploads a whole `Image` on any change and 16 MB
-per landed chunk is not a thing to do 4096 times. `tint.rs` owns a raw `WORLD_TILES` R8 texture and
+per landed chunk is not a thing to do 4096 times. `screen.rs` owns a raw `WORLD_TILES` R8 texture and
 writes one chunk's 4 KB rect into it. `HeightUploadQueue` lives in `world.rs` beside `DirtyChunks`, and
 `WorldMap::insert` takes it as an argument — there is no way to store a chunk without queueing it, so
 "a chunk reaches the texture exactly once" is a property of the signature. The extract *moves* the
@@ -731,8 +762,8 @@ Two things about the ramp:
   to within one quantization step: `107/255` and `108/255` straddle 0.42, so no byte lands on the line
   and `water_is_exactly_what_falls_below_the_tint_water_line` leaves that byte unconstrained.
 
-`TerrainTintUniform` in `tint.rs` and in `tint.wgsl` are the same struct written twice, on the same
-terms as the weather's — vectors before scalars, and a mismatch is a runtime shader-compile failure.
+The ramp's own numbers reach the shader as four fields of `ScreenUniform`, whose coupling rules are in
+"The one post-process pass" above.
 
 **Tune against a screenful, not against the world.** The ramp spans the whole height range, but a
 screen holds only a slice of it, so the visible spread is a fraction of `2 * strength` — 7.8% at the
