@@ -377,6 +377,23 @@ impl WorldMap {
         Some(self.get(coord)?[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize])
     }
 
+    /// The height a tile was classified from, on 0..1 — the same byte the pass
+    /// shades and shadows by, rather than a fresh sample of the terrain.
+    ///
+    /// That distinction is the point of reading it here: an inspector that re-derived
+    /// the height would be checking the sampler against itself, where this checks
+    /// what the world actually stored.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn height(&self, tile: IVec2) -> Option<f32> {
+        if !tile_in_world(tile) {
+            return None;
+        }
+        let coord = chunk_of_tile(tile);
+        let local = tile - chunk_origin_tiles(coord);
+        let byte = self.heights(coord)?[(local.y * CHUNK_SIZE.x as i32 + local.x) as usize];
+        Some(byte as f32 / 255.0)
+    }
+
     /// A whole world built from a rule rather than from the noise, so a test can
     /// state exactly the terrain it wants a city to grow into. The [`WorldMap`]
     /// counterpart of [`WorldSnapshot::from_fn`], for the readers that take the live

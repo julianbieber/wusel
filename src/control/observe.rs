@@ -14,20 +14,32 @@ use crate::{
     camera::{WorldCamera, orthographic_scale, visible_half_extent},
     gameplay::{
         city::{City, CitySize},
+        ground::{ClimateMaps, GroundConfig, GroundCover, temperature_offset},
         growth::CityGrowth,
+        inspect::{ActiveOverlay, FieldSources},
         plan::WorldPlan,
         road::RoadNetwork,
+        sun::{PlanetConfig, Sun},
         terrain::TerrainKind,
+        weather::SkySampler,
         world::{BackgroundGeneration, ChunkCoord, WORLD_CHUNKS, WorldMap, tile_position_at},
     },
     screens::Screen,
 };
+
+/// How much cover counts as "there is snow here" for the world fractions. A tenth,
+/// because the pass draws a tile from about there and a threshold that only counted
+/// deep snow would report a bare world through a whole snowfall.
+const COVER_THRESHOLD: f32 = 0.1;
 
 pub(super) enum Topic {
     Terrain,
     Plan,
     Camera,
     Cities,
+    Ground,
+    Sun,
+    Overlay,
     Screen,
     Log,
 }
@@ -39,10 +51,14 @@ impl Topic {
             "plan" => Ok(Self::Plan),
             "camera" => Ok(Self::Camera),
             "cities" => Ok(Self::Cities),
+            "ground" => Ok(Self::Ground),
+            "sun" => Ok(Self::Sun),
+            "overlay" => Ok(Self::Overlay),
             "screen" => Ok(Self::Screen),
             "log" => Ok(Self::Log),
             other => Err(format!(
-                "unknown observation: {other} (terrain, plan, camera, cities, screen, log)"
+                "unknown observation: {other} \
+                 (terrain, plan, camera, cities, ground, sun, overlay, screen, log)"
             )),
         }
     }
@@ -54,9 +70,98 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Plan => plan(world),
         Topic::Camera => camera(world),
         Topic::Cities => cities(world),
+        Topic::Ground => ground(world),
+        Topic::Sun => sun(world),
+        Topic::Overlay => overlay(world),
         Topic::Screen => screen(world),
         Topic::Log => log(world),
     }
+}
+
+/// What the weather has left on the ground: here, and over the world.
+///
+/// Both, because neither alone says what a scenario wants to know. The world
+/// fractions are how you assert that it snowed at all; the reading at the view centre
+/// is how you tell whether the thing in the capture is the thing in the numbers.
+fn ground(world: &mut World) -> Value {
+    let Some(cover) = world.get_resource::<GroundCover>() else {
+        return json!({ "running": false });
+    };
+    let (snowed, wet) = cover.fractions_over(COVER_THRESHOLD);
+
+    // The camera's own `Transform`, for the reason `city_panel.rs` gives at the
+    // matching conversion: the pan writes it in `Update` and propagation runs in
+    // `PostUpdate`, so the global one is a frame behind.
+    let centre = {
+        let mut cameras = world.query_filtered::<&Transform, With<WorldCamera>>();
+        cameras
+            .iter(world)
+            .next()
+            .map(|transform| tile_position_at(transform.translation.truncate()))
+    };
+    let here = centre.map(|tile| {
+        world
+            .get_resource::<GroundCover>()
+            .map(|cover| cover.at(tile))
+    });
+
+    // The climate is absent until its bake lands, and that absence is what makes the
+    // world dry — so saying so beats reporting a temperature nobody is standing in.
+    let climate = centre.and_then(|tile| {
+        let maps = world.get_resource::<ClimateMaps>()?;
+        let config = world.get_resource::<GroundConfig>()?;
+        let planet = world.get_resource::<PlanetConfig>()?;
+        let sun = world.get_resource::<Sun>()?;
+        let cell = maps.at(tile);
+        let offset = temperature_offset(config, planet, sun);
+        Some(json!({
+            "normal_celsius": cell.normal_celsius,
+            "diurnal_amplitude_celsius": cell.diurnal_amplitude_celsius,
+            "humidity": cell.humidity,
+            "temperature_celsius": cell.temperature(offset),
+            "swing": offset.swing,
+            "seasonal_celsius": offset.seasonal_celsius,
+        }))
+    });
+
+    json!({
+        "running": true,
+        "climate_baked": climate.is_some(),
+        "threshold": COVER_THRESHOLD,
+        "snowed_fraction": snowed,
+        "wet_fraction": wet,
+        "centre_tile": centre.map(|tile| [tile.x, tile.y]),
+        "snow": here.flatten().map(|cell| cell.snow),
+        "wetness": here.flatten().map(|cell| cell.wetness),
+        "climate": climate,
+    })
+}
+
+/// Where the planet has turned to, and what that delivers.
+///
+/// The gap gh-26 left: the sun was the first thing in the crate a capture could not
+/// settle, because "is that shadow long because it is early or because the ridge is
+/// tall" is not a question a PNG answers.
+fn sun(world: &mut World) -> Value {
+    let Some(sun) = world.get_resource::<Sun>() else {
+        return json!({ "running": false });
+    };
+    let orbit_phase = world
+        .get_resource::<PlanetConfig>()
+        .map(|planet| planet.orbit_phase);
+
+    json!({
+        "running": true,
+        "rotation": sun.rotation,
+        "hour": sun.hour(),
+        "is_up": sun.is_up(),
+        "altitude_degrees": sun.position.altitude.to_degrees(),
+        "bearing": [sun.position.bearing.x, sun.position.bearing.y],
+        "ray_slope": sun.position.ray_slope,
+        "light_level": sun.light_level(),
+        "declination_degrees": sun.declination.to_degrees(),
+        "orbit_phase": orbit_phase,
+    })
 }
 
 /// The warnings and errors since the last time anyone asked.
@@ -210,6 +315,68 @@ fn cities(world: &mut World) -> Value {
     // iteration order is an ECS implementation detail and would make a diff noise.
     list.sort_by_key(|city| city["id"].as_u64().unwrap_or_default());
     json!({ "count": list.len(), "cities": list })
+}
+
+/// What the inspection overlay is drawing, and what it is drawing at the middle of
+/// the screen.
+///
+/// The field and its range come from `ActiveOverlay`, which the overlay's own sync
+/// wrote this frame — **not** re-derived here. With a range fitted to what is on
+/// screen, deriving it a second time would be a second answer to "what is the player
+/// looking at", and the two would part company the moment the camera moved.
+///
+/// The value beside it *is* read afresh, from the CPU's own copy of the field rather
+/// than from the map the shader samples — so the pair is a genuine cross-check.
+/// `position` is where that value lands on the ramp, through the same `normalize` the
+/// shader transcribes: 0 is the low end, 1 the high, and for a diverging field 0.5 is
+/// exactly the freezing point.
+fn overlay(world: &mut World) -> Value {
+    let Some(active) = world.get_resource::<ActiveOverlay>().copied() else {
+        return json!({ "running": false });
+    };
+    let Some(range) = active.range else {
+        return json!({ "running": true, "field": active.field.label() });
+    };
+
+    // Scoped so the query's borrow ends before the resources are read; the tile is
+    // `Copy`. The camera's own `Transform`, for the reason `city_panel.rs` gives at
+    // the matching conversion.
+    let centre = {
+        let mut cameras = world.query_filtered::<&Transform, With<WorldCamera>>();
+        cameras
+            .iter(world)
+            .next()
+            .map(|transform| tile_position_at(transform.translation.truncate()))
+    };
+
+    let value = centre.and_then(|tile| {
+        let offset = temperature_offset(
+            world.get_resource::<GroundConfig>()?,
+            world.get_resource::<PlanetConfig>()?,
+            world.get_resource::<Sun>()?,
+        );
+        FieldSources {
+            world: world.get_resource::<WorldMap>(),
+            climate: world.get_resource::<ClimateMaps>(),
+            cover: world.get_resource::<GroundCover>(),
+            sky: world.get_resource::<SkySampler>(),
+            offset,
+        }
+        .value(active.field, tile)
+    });
+
+    json!({
+        "running": true,
+        "field": active.field.label(),
+        "low": range.low,
+        "mid": range.mid,
+        "high": range.high,
+        "diverging": range.diverging,
+        "unit": range.unit,
+        "centre_tile": centre.map(|tile| [tile.x, tile.y]),
+        "value": value,
+        "position": value.map(|value| range.normalize(value)),
+    })
 }
 
 fn screen(world: &mut World) -> Value {

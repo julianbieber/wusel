@@ -24,7 +24,10 @@ use super::observe::{self, Topic};
 use crate::{
     camera::WorldCamera,
     gameplay::{
+        ground::ClimateMaps,
+        inspect::OverlayField,
         plan::WorldPlan,
+        sun::{PlanetConfig, Sun},
         weather::WeatherMaps,
         world::{BackgroundGeneration, tile_translation},
     },
@@ -69,6 +72,13 @@ pub(super) enum Command {
     Observe(Topic),
     FixedDelta(Duration),
     Realtime,
+    /// Where to put the planet's rotation, on 0..1 from local midnight.
+    Turn(f32),
+    /// Where to put its orbit, on 0..1 from the northward equinox.
+    Season(f32),
+    /// Which field the inspection overlay draws — one verb per digit key, so the ctl
+    /// reaches exactly what a player can and nothing more.
+    Overlay(OverlayField),
     Quit,
 }
 
@@ -76,6 +86,7 @@ pub(super) enum Condition {
     Terrain,
     Plan,
     Sky,
+    Ground,
     Screen(Screen),
 }
 
@@ -95,6 +106,9 @@ impl Command {
             Self::Observe(_) => "observe",
             Self::FixedDelta(_) => "fixed-delta",
             Self::Realtime => "realtime",
+            Self::Turn(_) => "sun",
+            Self::Season(_) => "season",
+            Self::Overlay(_) => "overlay",
             Self::Quit => "quit",
         }
     }
@@ -165,6 +179,15 @@ impl Command {
                 rest.first().copied().unwrap_or("1/60"),
             )?))),
             "realtime" => Ok(Self::Realtime),
+            "sun" => Ok(Self::Turn(number(
+                rest.first().ok_or("sun needs a rotation on 0..1")?,
+            )?)),
+            "season" => Ok(Self::Season(number(
+                rest.first().ok_or("season needs an orbit phase on 0..1")?,
+            )?)),
+            "overlay" => Ok(Self::Overlay(overlay_field(
+                rest.first().ok_or("overlay needs a field")?,
+            )?)),
             "quit" => Ok(Self::Quit),
             other => Err(format!("unknown command: {other}")),
         }
@@ -325,6 +348,41 @@ impl Command {
                 Poll::Done(json!({}))
             }
 
+            // Written straight onto the resource rather than through a system,
+            // because the rotation *is* the sun's only state: `turn_the_planet` runs
+            // later the same frame and re-derives the altitude, the bearing and the
+            // light from whatever it finds. Without this a scenario would have to
+            // wait 300 real seconds to see midnight.
+            Self::Turn(rotation) => {
+                let Some(mut sun) = world.get_resource_mut::<Sun>() else {
+                    return Poll::Failed("no sun; is gameplay up?".into());
+                };
+                sun.rotation = rotation.rem_euclid(1.0);
+                Poll::Done(json!({ "rotation": sun.rotation }))
+            }
+
+            // The orbit is a knob rather than world state, so this outlives the
+            // session — which is the point: it is how a scenario asks for winter
+            // before entering gameplay at all.
+            Self::Season(phase) => {
+                let Some(mut planet) = world.get_resource_mut::<PlanetConfig>() else {
+                    return Poll::Failed("no planet config".into());
+                };
+                planet.orbit_phase = phase.rem_euclid(1.0);
+                Poll::Done(json!({ "orbit_phase": planet.orbit_phase }))
+            }
+
+            // The mode is a resource and nothing else, so setting it is the whole of
+            // the interaction — the legend and the pass both read it the same frame,
+            // exactly as they would after the key press this stands in for.
+            Self::Overlay(field) => {
+                let Some(mut current) = world.get_resource_mut::<OverlayField>() else {
+                    return Poll::Failed("no overlay field resource".into());
+                };
+                *current = *field;
+                Poll::Done(json!({ "field": current.label() }))
+            }
+
             Self::Quit => {
                 world.write_message(AppExit::Success);
                 Poll::Done(json!({}))
@@ -339,9 +397,11 @@ impl Condition {
             "terrain" => Ok(Self::Terrain),
             "plan" => Ok(Self::Plan),
             "sky" => Ok(Self::Sky),
+            "ground" => Ok(Self::Ground),
             "main" | "help" | "gameplay" => Ok(Self::Screen(screen(word)?)),
             other => Err(format!(
-                "unknown wait condition: {other} (terrain, plan, sky, main, help, gameplay)"
+                "unknown wait condition: {other} \
+                 (terrain, plan, sky, ground, main, help, gameplay)"
             )),
         }
     }
@@ -351,6 +411,7 @@ impl Condition {
             Self::Terrain => "terrain",
             Self::Plan => "plan",
             Self::Sky => "sky",
+            Self::Ground => "ground",
             Self::Screen(_) => "screen",
         }
     }
@@ -362,6 +423,10 @@ impl Condition {
                 .is_some_and(BackgroundGeneration::is_complete),
             Self::Plan => matches!(world.get_resource::<WorldPlan>(), Some(WorldPlan::Done)),
             Self::Sky => world.get_resource::<WeatherMaps>().is_some(),
+            // The climate bake, which is what the ground's first step waits on: with
+            // no climate the world is dry, so a scenario that skipped this would
+            // capture bare ground and call it a thaw.
+            Self::Ground => world.get_resource::<ClimateMaps>().is_some(),
             Self::Screen(target) => world
                 .get_resource::<State<Screen>>()
                 .is_some_and(|screen| screen.get() == target),
@@ -381,6 +446,7 @@ impl Condition {
                 None => "no plan is running".into(),
             },
             Self::Sky => "the weather maps have not been baked".into(),
+            Self::Ground => "the climate map has not been baked".into(),
             Self::Screen(_) => match world.get_resource::<State<Screen>>() {
                 Some(screen) => format!("screen is {:?}", screen.get()),
                 None => "no screen state".into(),
@@ -470,6 +536,19 @@ fn screen(word: &str) -> Result<Screen, String> {
     }
 }
 
+fn overlay_field(word: &str) -> Result<OverlayField, String> {
+    OverlayField::ALL
+        .into_iter()
+        .find(|field| field.label() == word)
+        .ok_or_else(|| {
+            let known: Vec<&str> = OverlayField::ALL.iter().map(|f| f.label()).collect();
+            format!("unknown overlay field: {word} ({})", known.join(", "))
+        })
+}
+
+/// The keys a scenario can press. The digits are here so the overlay's *real* input
+/// path can be driven — `overlay <field>` writes the resource, which is the same
+/// thing the key press ends up doing but not the same code getting there.
 fn key_code(word: &str) -> Result<KeyCode, String> {
     match word.to_ascii_lowercase().as_str() {
         "w" => Ok(KeyCode::KeyW),
@@ -480,6 +559,13 @@ fn key_code(word: &str) -> Result<KeyCode, String> {
         "equal" | "plus" => Ok(KeyCode::Equal),
         "minus" => Ok(KeyCode::Minus),
         "space" => Ok(KeyCode::Space),
+        "0" => Ok(KeyCode::Digit0),
+        "1" => Ok(KeyCode::Digit1),
+        "2" => Ok(KeyCode::Digit2),
+        "3" => Ok(KeyCode::Digit3),
+        "4" => Ok(KeyCode::Digit4),
+        "5" => Ok(KeyCode::Digit5),
+        "6" => Ok(KeyCode::Digit6),
         other => Err(format!("unknown key: {other}")),
     }
 }

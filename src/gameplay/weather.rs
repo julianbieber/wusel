@@ -15,59 +15,36 @@
 //! it also keeps [`crate::gameplay::noise`] the only noise in the crate, which is
 //! what the terrain's determinism tests rest on.
 //!
-//! The field is anchored in *world* space, not screen space: the view centre comes
-//! from the camera at extract time, after the whole main-world frame, so panning
-//! can never drag the clouds a frame behind the terrain under them.
+//! **This module is the sky and nothing else.** The pass that composites it is
+//! [`crate::gameplay::screen`]'s, shared with the terrain's shading and the sun;
+//! this bakes the maps, advances the clock and hands the knobs over through
+//! [`ScreenOverlay::set_sky`]. The field is anchored in *world* space, not screen
+//! space, and the view centre is filled in over there at extract time — after the
+//! whole main-world frame, so panning can never drag the clouds a frame behind the
+//! terrain under them.
 //!
-//! Nothing here outlives [`Screen::Gameplay`] except the knobs. The camera does —
-//! it is the app's only one and is never despawned — so the overlay component is
-//! taken off it on the way out rather than relying on `DespawnOnExit`.
+//! Nothing here outlives [`Screen::Gameplay`] except the knobs.
 
 use bevy::{
     asset::RenderAssetUsages,
-    core_pipeline::{Core2d, Core2dSystems, FullscreenShader, tonemapping::tonemapping},
-    ecs::query::QueryItem,
     image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
     prelude::*,
     render::{
-        Render, RenderApp, RenderStartup, RenderSystems,
-        camera::ExtractedCamera,
-        extract_component::{
-            ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
-            UniformComponentPlugin,
-        },
         extract_resource::{ExtractResource, ExtractResourcePlugin},
-        render_asset::RenderAssets,
-        render_resource::{
-            BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-            CachedRenderPipelineId, Canonical, ColorTargetState, ColorWrites, Extent3d,
-            FragmentState, Operations, PipelineCache, RenderPassColorAttachment,
-            RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler,
-            SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, Specializer,
-            SpecializerKey, TextureDimension, TextureFormat, TextureSampleType, TextureViewId,
-            Variants,
-            binding_types::{sampler, texture_2d, uniform_buffer},
-        },
-        renderer::{RenderContext, RenderDevice, ViewQuery},
-        sync_component::SyncComponent,
-        texture::GpuImage,
-        view::{ExtractedView, ViewTarget},
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
     },
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
 
 use crate::{
-    camera::{WorldCamera, visible_half_extent},
     gameplay::{
-        ScreenEffectSystems,
         noise::TilingNoiseField,
+        screen::ScreenOverlay,
         terrain::{TerrainConfig, TerrainSampler},
-        world::{TILE_DISPLAY_SIZE, WORLD_TILES, tile_position_at},
+        world::WORLD_TILES,
     },
     screens::Screen,
 };
-
-const WEATHER_SHADER_PATH: &str = "shaders/weather.wgsl";
 
 /// Salt for the cloud-shape field, so the sky is not a second view of a landscape.
 const CLOUD_SHAPE_SALT: u32 = 0xc10d_5eed;
@@ -217,8 +194,10 @@ struct BakedMaps {
 /// sky rather than a stall.
 #[derive(Resource, Clone)]
 pub(crate) struct WeatherMaps {
-    probability: Handle<Image>,
-    shape: Handle<Image>,
+    // Read by `screen.rs`, which binds them: this module decides what is in a map and
+    // that one decides how it reaches a fragment.
+    pub(super) probability: Handle<Image>,
+    pub(super) shape: Handle<Image>,
 }
 
 impl ExtractResource for WeatherMaps {
@@ -229,135 +208,24 @@ impl ExtractResource for WeatherMaps {
     }
 }
 
-/// The uniform the shader reads, one per view.
-///
-/// Field order *is* the wgsl binding layout — the two structs are edited together
-/// or the shader fails to compile at runtime. Vectors first, scalars after, so the
-/// std140 padding is the same on both sides and WebGL2 agrees with the desktop.
-#[derive(Component, Clone, Copy, Default, ShaderType)]
-pub(super) struct WeatherUniform {
-    view_centre_tiles: Vec2,
-    view_half_extent_tiles: Vec2,
-    coarse_offset: Vec2,
-    fine_offset: Vec2,
-    shadow_offset_tiles: Vec2,
-    world_tiles: Vec2,
-    shape_period_tiles: f32,
-    cloud_fine_scale: f32,
-    cloud_coarse_weight: f32,
-    cloud_cut: f32,
-    cloud_softness: f32,
-    cloud_brightness: f32,
-    cloud_opacity: f32,
-    shadow_strength: f32,
-    rain_cut: f32,
-    rain_softness: f32,
-    rain_strength: f32,
-    streak_phase: f32,
-    /// How much light there is, from [`crate::gameplay::sun`]. The clouds composite
-    /// over a world the tint pass has already lit, so without this a midnight sky is
-    /// white shapes over dark ground.
-    light_level: f32,
-}
-
-/// The main-world half of that uniform, carried by the one world camera while
-/// gameplay is up. It holds everything the main world decides; the two view fields
-/// are filled in at extract time from the camera itself, which is why no ordering
-/// against the pan is needed anywhere.
-#[derive(Component, Clone, Copy, Default)]
-pub(super) struct WeatherOverlay(WeatherUniform);
-
-impl WeatherOverlay {
-    /// The one thing this module has ever taken from outside itself, and it is a
-    /// number rather than machinery: how brightly to draw a cloud. The uniform's
-    /// layout stays private, on the same terms `SkySampler` keeps the clock private.
-    pub(super) fn set_light_level(&mut self, level: f32) {
-        self.0.light_level = level;
-    }
-}
-
-impl SyncComponent for WeatherOverlay {
-    // The removal target, and getting this wrong is a one-way trip: extraction only
-    // ever inserts, so if the render world is not told what to drop, the weather
-    // outlives gameplay and composites over the menus for the rest of the run.
-    type Target = WeatherUniform;
-}
-
-impl ExtractComponent for WeatherOverlay {
-    type QueryData = (
-        &'static Self,
-        &'static Camera,
-        &'static Projection,
-        &'static GlobalTransform,
-    );
-    type QueryFilter = ();
-    type Out = WeatherUniform;
-
-    fn extract_component(
-        (overlay, camera, projection, transform): QueryItem<'_, '_, Self::QueryData>,
-    ) -> Option<Self::Out> {
-        let half_extent = visible_half_extent(camera, projection);
-        // A viewport with no size gives no scale to map screen back to world with,
-        // and would collapse the whole sky onto one tile.
-        if half_extent.x <= 0.0 || half_extent.y <= 0.0 {
-            return None;
-        }
-
-        let mut uniform = overlay.0;
-        uniform.view_centre_tiles = tile_position_at(transform.translation().truncate());
-        uniform.view_half_extent_tiles = half_extent / TILE_DISPLAY_SIZE.as_vec2();
-        Some(uniform)
-    }
-}
-
 pub struct WeatherPlugin;
 
 impl Plugin for WeatherPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WeatherConfig>();
-        app.add_plugins((
-            ExtractComponentPlugin::<WeatherOverlay>::default(),
-            UniformComponentPlugin::<WeatherUniform>::default(),
-            ExtractResourcePlugin::<WeatherMaps>::default(),
-        ));
-        app.add_systems(
-            OnEnter(Screen::Gameplay),
-            (start_weather_bake, attach_weather_overlay),
-        );
-        app.add_systems(OnExit(Screen::Gameplay), detach_weather_overlay);
+        app.add_plugins(ExtractResourcePlugin::<WeatherMaps>::default());
+        app.add_systems(OnEnter(Screen::Gameplay), start_weather_bake);
+        app.add_systems(OnExit(Screen::Gameplay), end_weather);
         app.add_systems(
             Update,
             (
                 finish_weather_bake,
-                // The clock is the only writer of its own state and the overlay is
-                // the only reader, so this pair is the whole ordering the main
-                // world needs.
+                // The clock is the only writer of its own state and the overlay
+                // sync is the only reader, so this pair is the whole ordering the
+                // main world needs.
                 (advance_weather_clock, sync_weather_overlay).chain(),
             )
                 .run_if(in_state(Screen::Gameplay)),
-        );
-
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
-        render_app.add_systems(RenderStartup, init_weather_pipeline);
-        render_app.add_systems(
-            Render,
-            (
-                prepare_weather_pipelines.in_set(RenderSystems::Prepare),
-                prepare_weather_bind_groups.in_set(RenderSystems::PrepareBindGroups),
-            ),
-        );
-        // After tonemapping, so the darkening works on the same values the screen
-        // shows; in PostProcess, because `bevy_ui_render` puts its pass after that
-        // whole set — which is what keeps weather off the menus and tooltips. And
-        // over the terrain's own shading, which `ScreenEffectSystems` orders.
-        render_app.add_systems(
-            Core2d,
-            weather_pass
-                .in_set(Core2dSystems::PostProcess)
-                .in_set(ScreenEffectSystems::Weather)
-                .after(tonemapping),
         );
     }
 }
@@ -383,22 +251,12 @@ fn start_weather_bake(
     commands.insert_resource(WeatherBake(task));
 }
 
-fn attach_weather_overlay(mut commands: Commands, camera: Single<Entity, With<WorldCamera>>) {
-    commands
-        .entity(*camera)
-        .insert(WeatherOverlay(WeatherUniform {
-            // Full daylight until the sun's first sync, and what the clouds are lit
-            // by if the sun plugin is not in the app at all. A zeroed uniform would
-            // draw every cloud black.
-            light_level: 1.0,
-            ..default()
-        }));
-}
-
-/// Takes the overlay off the camera, which survives this transition, and drops the
-/// session's state. A bake still in flight goes with it.
-fn detach_weather_overlay(mut commands: Commands, camera: Single<Entity, With<WorldCamera>>) {
-    commands.entity(*camera).remove::<WeatherOverlay>();
+/// Drops the session's state. A bake still in flight goes with it, so maps built for
+/// one world can never land in the next.
+///
+/// The overlay needs no help here: it belongs to [`crate::gameplay::screen`], which
+/// takes it off the camera on the same transition.
+fn end_weather(mut commands: Commands) {
     commands.remove_resource::<WeatherMaps>();
     commands.remove_resource::<WeatherClock>();
     commands.remove_resource::<WeatherBake>();
@@ -431,45 +289,30 @@ fn advance_weather_clock(
     mut sky: ResMut<SkySampler>,
 ) {
     let delta = time.delta_secs();
-    let drift = config.wind_drift_tiles_per_second / config.shape_period_tiles * delta;
 
-    // Wrapped rather than accumulated: an offset that grew all session would
-    // eventually quantize, and a map period is exactly where a wrap is invisible.
-    clock.coarse_offset = (clock.coarse_offset + drift).fract();
-    clock.fine_offset =
-        (clock.fine_offset + drift * config.cloud_fine_drift * config.cloud_fine_scale).fract();
+    // The sky drifts itself and the clock reads it back, so there is one copy of
+    // where the weather is rather than two kept in step. `streak_phase` is the
+    // clock's own: streaks are screen-space decoration and nothing off screen can be
+    // rained on by them, so the sampler has no use for it.
+    sky.drift(delta);
+    (clock.coarse_offset, clock.fine_offset) = sky.offsets();
     clock.streak_phase = (clock.streak_phase + config.rain_streak_speed * delta).fract();
-
-    // The CPU sky is drifted from the same clock in the same system, so the
-    // simulation and the overlay can never be a frame apart about where the
-    // weather is. `streak_phase` is not carried across: streaks are screen-space
-    // decoration and nothing off-screen can be rained on by them.
-    sky.coarse_offset = clock.coarse_offset;
-    sky.fine_offset = clock.fine_offset;
 }
 
+/// Hands this frame's sky to the one pass that draws it. The clock goes over as
+/// three numbers rather than as itself, which is what keeps [`WeatherClock`] private
+/// on the same terms [`SkySampler`] keeps the field salts private.
 fn sync_weather_overlay(
     config: Res<WeatherConfig>,
     clock: Res<WeatherClock>,
-    mut overlay: Single<&mut WeatherOverlay>,
+    mut overlay: Single<&mut ScreenOverlay>,
 ) {
-    let uniform = &mut overlay.0;
-    uniform.coarse_offset = clock.coarse_offset;
-    uniform.fine_offset = clock.fine_offset;
-    uniform.streak_phase = clock.streak_phase;
-    uniform.world_tiles = WORLD_TILES.as_vec2();
-    uniform.shape_period_tiles = config.shape_period_tiles;
-    uniform.cloud_fine_scale = config.cloud_fine_scale;
-    uniform.cloud_coarse_weight = config.cloud_coarse_weight;
-    uniform.cloud_cut = config.cloud_cut;
-    uniform.cloud_softness = config.cloud_softness;
-    uniform.cloud_brightness = config.cloud_brightness;
-    uniform.cloud_opacity = config.cloud_opacity;
-    uniform.shadow_offset_tiles = config.shadow_offset_tiles;
-    uniform.shadow_strength = config.shadow_strength;
-    uniform.rain_cut = config.rain_cut;
-    uniform.rain_softness = config.rain_softness;
-    uniform.rain_strength = config.rain_strength;
+    overlay.set_sky(
+        &config,
+        clock.coarse_offset,
+        clock.fine_offset,
+        clock.streak_phase,
+    );
 }
 
 // -- The bake ----------------------------------------------------------------
@@ -561,7 +404,11 @@ fn shape_at(
 /// gets an answer, not the machinery. Its absence is a clear sky, the same fallback
 /// an unbaked map gives the overlay, which is what lets the simulation run in a test
 /// with no weather plugin at all.
-#[derive(Resource)]
+/// `Clone` because [`crate::gameplay::ground`]'s step runs on the compute pool and
+/// has to own everything it reads — the sampler is two `Vec2`s, a config and a noise
+/// field's offset, so copying it per step is nothing beside the 65k evaluations it
+/// is copied for.
+#[derive(Resource, Clone)]
 pub struct SkySampler {
     field: TilingNoiseField,
     config: WeatherConfig,
@@ -570,7 +417,7 @@ pub struct SkySampler {
 }
 
 impl SkySampler {
-    fn new(terrain: &TerrainConfig, config: &WeatherConfig) -> Self {
+    pub(super) fn new(terrain: &TerrainConfig, config: &WeatherConfig) -> Self {
         Self {
             field: TilingNoiseField::new(
                 terrain.seed,
@@ -584,19 +431,58 @@ impl SkySampler {
         }
     }
 
-    /// How hard it is raining over a tile, on 0..1.
+    /// Drift the sky by `seconds` of game time.
     ///
-    /// `probability` is the humidity there — passed in rather than sampled, because
-    /// every caller already holds it and a `TerrainSampler` lookup is ~190 ns.
-    pub fn rain_at(&self, tile: Vec2, probability: f32) -> f32 {
-        let shape = shape_at(
+    /// **The clock's arithmetic, and its only copy.** `advance_weather_clock` calls
+    /// this and then reads the offsets back, so the sky the simulation asks and the
+    /// sky the overlay draws can never be a frame apart about where the weather is.
+    ///
+    /// The offsets are wrapped rather than accumulated: an offset that grew all
+    /// session would eventually quantize, and a map period is exactly where a wrap is
+    /// invisible.
+    pub(super) fn drift(&mut self, seconds: f32) {
+        let drift =
+            self.config.wind_drift_tiles_per_second / self.config.shape_period_tiles * seconds;
+        self.coarse_offset = (self.coarse_offset + drift).fract();
+        self.fine_offset = (self.fine_offset
+            + drift * self.config.cloud_fine_drift * self.config.cloud_fine_scale)
+            .fract();
+    }
+
+    /// Where it has drifted to, in map periods.
+    pub(super) fn offsets(&self) -> (Vec2, Vec2) {
+        (self.coarse_offset, self.fine_offset)
+    }
+
+    /// How much cloud is over a tile, on 0..1.
+    ///
+    /// The same density the overlay draws and the shadow is cut from, so the ctl can
+    /// report what the screen is showing rather than an approximation of it.
+    /// `probability` is the humidity there, passed in for the reason
+    /// [`Self::rain_at`] gives.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn cloud_at(&self, tile: Vec2, probability: f32) -> f32 {
+        cloud_density(&self.config, probability * self.shape_at(tile))
+    }
+
+    /// The two shape layers where the clock has drifted them, at a tile. Shared by
+    /// both readings above so they cannot disagree about where the cloud is.
+    fn shape_at(&self, tile: Vec2) -> f32 {
+        shape_at(
             &self.field,
             &self.config,
             shape_cell(&self.config, tile),
             self.coarse_offset,
             self.fine_offset,
-        );
-        let field = probability * shape;
+        )
+    }
+
+    /// How hard it is raining over a tile, on 0..1.
+    ///
+    /// `probability` is the humidity there — passed in rather than sampled, because
+    /// every caller already holds it and a `TerrainSampler` lookup is ~190 ns.
+    pub fn rain_at(&self, tile: Vec2, probability: f32) -> f32 {
+        let field = probability * self.shape_at(tile);
         rain_amount(&self.config, field, cloud_density(&self.config, field))
     }
 }
@@ -684,233 +570,6 @@ fn map_image(side: u32, texels: Vec<u8>, address_mode: ImageAddressMode) -> Imag
         ..default()
     });
     image
-}
-
-// -- The render world --------------------------------------------------------
-
-#[derive(Resource)]
-struct WeatherPipeline {
-    layout: BindGroupLayoutDescriptor,
-    /// For the scene texture. The maps bring their own, baked with the filtering
-    /// and address mode each one needs.
-    scene_sampler: Sampler,
-    variants: Variants<RenderPipeline, WeatherSpecializer>,
-}
-
-struct WeatherSpecializer;
-
-#[derive(PartialEq, Eq, Hash, Clone, Copy, SpecializerKey)]
-struct WeatherPipelineKey {
-    target_format: TextureFormat,
-}
-
-impl Specializer<RenderPipeline> for WeatherSpecializer {
-    type Key = WeatherPipelineKey;
-
-    fn specialize(
-        &self,
-        key: Self::Key,
-        descriptor: &mut RenderPipelineDescriptor,
-    ) -> Result<Canonical<Self::Key>, BevyError> {
-        descriptor.fragment_mut()?.set_target(
-            0,
-            ColorTargetState {
-                format: key.target_format,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            },
-        );
-        Ok(key)
-    }
-}
-
-fn init_weather_pipeline(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    asset_server: Res<AssetServer>,
-    fullscreen_shader: Res<FullscreenShader>,
-) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "weather_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
-            (
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                sampler(SamplerBindingType::Filtering),
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                sampler(SamplerBindingType::Filtering),
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                sampler(SamplerBindingType::Filtering),
-                uniform_buffer::<WeatherUniform>(true),
-            ),
-        ),
-    );
-
-    commands.insert_resource(WeatherPipeline {
-        layout: layout.clone(),
-        scene_sampler: render_device.create_sampler(&SamplerDescriptor::default()),
-        variants: Variants::new(
-            WeatherSpecializer,
-            RenderPipelineDescriptor {
-                label: Some("weather_pipeline".into()),
-                layout: vec![layout],
-                vertex: fullscreen_shader.to_vertex_state(),
-                fragment: Some(FragmentState {
-                    shader: asset_server.load(WEATHER_SHADER_PATH),
-                    targets: vec![Some(ColorTargetState {
-                        format: TextureFormat::Rgba8UnormSrgb,
-                        blend: None,
-                        write_mask: ColorWrites::ALL,
-                    })],
-                    ..default()
-                }),
-                ..default()
-            },
-        ),
-    });
-}
-
-#[derive(Component)]
-struct WeatherPipelineId(CachedRenderPipelineId);
-
-fn prepare_weather_pipelines(
-    mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    mut pipeline: ResMut<WeatherPipeline>,
-    views: Query<(Entity, &ExtractedView), With<ExtractedCamera>>,
-) -> Result<(), BevyError> {
-    for (entity, view) in &views {
-        let id = pipeline.variants.specialize(
-            &pipeline_cache,
-            WeatherPipelineKey {
-                target_format: view.target_format,
-            },
-        )?;
-        commands.entity(entity).insert(WeatherPipelineId(id));
-    }
-
-    Ok(())
-}
-
-/// A bind group for each of the two textures the view target ping-pongs between,
-/// since which one is the source is only known inside the pass.
-#[derive(Component)]
-struct WeatherBindGroups {
-    /// Which view `a` samples. Recorded rather than re-derived, because
-    /// `post_process_write` flips the target *before* handing back its source, so
-    /// `main_texture_view()` inside the pass is the destination. With this pass
-    /// alone the parity worked out anyway; once the tint runs first, guessing it
-    /// picks the texture this pass is writing to.
-    a_view: TextureViewId,
-    a: BindGroup,
-    b: BindGroup,
-}
-
-/// Rebuilt every frame rather than cached: the source texture changes with every
-/// post-process write, and either map's `GpuImage` is replaced whenever the asset
-/// is re-uploaded, so there are three things to invalidate against and creating a
-/// bind group costs microseconds.
-///
-/// The view gets no bind group at all until both maps are on the GPU — which is
-/// what makes an unbaked sky clear rather than a sampling error.
-fn prepare_weather_bind_groups(
-    mut commands: Commands,
-    views: Query<(Entity, &ViewTarget), With<WeatherUniform>>,
-    pipeline: Option<Res<WeatherPipeline>>,
-    pipeline_cache: Res<PipelineCache>,
-    uniforms: Res<ComponentUniforms<WeatherUniform>>,
-    maps: Option<Res<WeatherMaps>>,
-    images: Res<RenderAssets<GpuImage>>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(pipeline) = pipeline else {
-        return;
-    };
-    let Some(uniform_binding) = uniforms.uniforms().binding() else {
-        return;
-    };
-    let Some(maps) = maps else {
-        return;
-    };
-    let Some(probability) = images.get(&maps.probability) else {
-        return;
-    };
-    let Some(shape) = images.get(&maps.shape) else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
-
-    for (entity, target) in &views {
-        let bind_group = |scene: &_| {
-            render_device.create_bind_group(
-                "weather_bind_group",
-                &layout,
-                &BindGroupEntries::sequential((
-                    scene,
-                    &pipeline.scene_sampler,
-                    &probability.texture_view,
-                    &probability.sampler,
-                    &shape.texture_view,
-                    &shape.sampler,
-                    uniform_binding.clone(),
-                )),
-            )
-        };
-
-        commands.entity(entity).insert(WeatherBindGroups {
-            a_view: target.main_texture_view().id(),
-            a: bind_group(target.main_texture_view()),
-            b: bind_group(target.main_texture_other_view()),
-        });
-    }
-}
-
-/// Composites the weather over the rendered world.
-///
-/// Every part of the guard is the query: a view with no `WeatherUniform` — a menu,
-/// or a session whose bake has not landed — matches nothing, the system is skipped,
-/// and the scene is never even copied.
-fn weather_pass(
-    view: ViewQuery<(
-        &ViewTarget,
-        &DynamicUniformIndex<WeatherUniform>,
-        &WeatherBindGroups,
-        &WeatherPipelineId,
-    )>,
-    pipeline_cache: Res<PipelineCache>,
-    mut ctx: RenderContext,
-) {
-    let (target, uniform_index, bind_groups, pipeline_id) = view.into_inner();
-
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
-        return;
-    };
-
-    let post_process = target.post_process_write();
-    let bind_group = if post_process.source.id() == bind_groups.a_view {
-        &bind_groups.a
-    } else {
-        &bind_groups.b
-    };
-
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&RenderPassDescriptor {
-            label: Some("weather_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations::default(),
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[uniform_index.index()]);
-    pass.draw(0..3, 0..1);
 }
 
 #[cfg(test)]
@@ -1120,22 +779,24 @@ mod tests {
     /// bound is on the wrap rather than on how long you play.
     #[test]
     fn a_long_session_does_not_quantize_the_weather_clock() {
+        let terrain = TerrainConfig::default();
         let config = WeatherConfig::default();
+        let mut sky = SkySampler::new(&terrain, &config);
         let mut clock = WeatherClock::default();
         let delta = 1.0 / 60.0;
-        let drift = config.wind_drift_tiles_per_second / config.shape_period_tiles * delta;
 
-        // Ten hours at 60 fps.
+        // Ten hours at 60 fps, through the same call the running game makes.
         for _ in 0..(60 * 60 * 60 * 10) {
-            clock.coarse_offset = (clock.coarse_offset + drift).fract();
+            sky.drift(delta);
             clock.streak_phase = (clock.streak_phase + config.rain_streak_speed * delta).fract();
         }
 
-        assert!(clock.coarse_offset.x.abs() < 1.0 && clock.coarse_offset.y.abs() < 1.0);
+        let (coarse, _) = sky.offsets();
+        assert!(coarse.x.abs() < 1.0 && coarse.y.abs() < 1.0);
         assert!(clock.streak_phase.abs() < 1.0);
         // The step is still resolvable at the end of it, which is the thing an
         // unwrapped accumulator loses.
-        let stepped = (clock.coarse_offset + drift).fract();
-        assert_ne!(stepped, clock.coarse_offset);
+        sky.drift(delta);
+        assert_ne!(sky.offsets().0, coarse);
     }
 }

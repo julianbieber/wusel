@@ -1,0 +1,75 @@
+# Look at each of the fields the world is built out of, one after another.
+#
+# Run with:  just drive run scenarios/inspect_the_fields.txt
+#
+# Every `observe overlay` below reads its value from the CPU's own copy of the field
+# while the capture beside it shows the map the *shader* sampled — so the pair is a
+# cross-check rather than two looks at the same texture. `position` is where that
+# value lands on the ramp, and for temperature 0.5 is exactly the freezing point.
+
+# Clocks frozen through the waits, so two runs of this file are comparable; see the
+# comment in snow_falls_and_melts.txt for why that is not a formality.
+fixed-delta 0
+season 0
+
+enter gameplay
+wait terrain
+wait plan
+wait sky
+wait ground
+
+# A wgsl error draws nothing rather than drawing wrong, and every capture below would
+# still be written. `observe log` drains, so this has to come first.
+observe log
+
+# Let the world run a little, so the wetness and snow have something in them: at
+# frame zero the cover grid is uniformly dry and two of the six fields would be a
+# flat sheet of one colour.
+fixed-delta 1/4
+step 600
+
+# To the same high ground snow_falls_and_melts.txt uses, where the transient band is.
+hold D 50
+hold W 55
+step 30
+observe camera
+
+overlay height
+observe overlay
+capture /tmp/wusel-inspect/height.png
+
+# The one diverging ramp, and the one worth looking at: cool to a neutral band to
+# warm, with the neutral band sitting exactly on the freezing point. The snow line is
+# therefore not something to read off the legend — it is the pale stripe.
+overlay temperature
+observe overlay
+capture /tmp/wusel-inspect/temperature.png
+
+overlay moisture
+observe overlay
+capture /tmp/wusel-inspect/moisture.png
+
+overlay wetness
+observe overlay
+capture /tmp/wusel-inspect/wetness.png
+
+overlay snow
+observe overlay
+capture /tmp/wusel-inspect/snow.png
+
+overlay cloud
+observe overlay
+capture /tmp/wusel-inspect/cloud.png
+
+# And the keys themselves, which are a *different code path* from the verb above:
+# `overlay <field>` writes the resource, where a press goes in as a `KeyboardInput`
+# message and is read by the same system a player's keyboard feeds. Driving only the
+# verb would leave that path unexercised, and a broken key binding would pass every
+# check in this file.
+hold 2 1
+observe overlay
+hold 0 1
+observe overlay
+capture /tmp/wusel-inspect/off.png
+
+observe log

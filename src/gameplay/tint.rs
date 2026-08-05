@@ -14,69 +14,51 @@
 //! tests rest on there being one. The world pays for it in memory instead: 16 MB of
 //! heights beside the 16 MB of kinds, and 16 MB again on the GPU.
 //!
-//! **The map is not an `Image` asset.** Bevy re-uploads a whole `Image` on any
-//! change, so a 16 MB map would cross to the GPU in full every time a chunk landed.
-//! This module owns a raw texture and writes one chunk's rect — 4 KB — into it as
-//! that chunk arrives.
-//!
 //! Like the weather this is cosmetic: nothing here reads or writes `WorldMap`, so no
 //! tile can depend on the shading.
 //!
-//! **This pass also carries the sun** (gh-26). The ramp is fake relief — high ground
-//! is brighter whether or not anything is shining on it — and it is deliberately
-//! unchanged, because it is the only cue at noon and through the whole night, when a
-//! real sun casts nothing. Over the top of it [`crate::gameplay::sun`]'s light
-//! multiplies, and a shadow is a tile the beam does not reach.
+//! **This module is the ramp and nothing else.** The heightmap texture, the pipeline
+//! and the fragment function live in [`crate::gameplay::screen`], the one
+//! post-process pass — this decides how a height becomes a brightness and hands the
+//! numbers over through [`ScreenOverlay::set_ramp`]. The sun that multiplies over the
+//! top of the ramp is [`crate::gameplay::sun`]'s, on the same terms.
 //!
-//! The sun lives here rather than in a pass of its own for one reason: the occlusion
-//! test reads the heightmap, and this is the only thing that binds it. A third pass
-//! would duplicate the pipeline, the specializer and both ping-pong bind groups for
-//! the sake of three more `textureLoad`s. The cost is that the overlay is no longer
-//! written once and left alone — `sun.rs` writes its light every frame.
+//! The ramp is fake relief — high ground is brighter whether or not anything is
+//! shining on it — and it is deliberately unchanged by the sun's arrival, because it
+//! is the only cue at noon and through the whole night, when a real sun casts
+//! nothing. The two can disagree: the ramp brightens a peak the sun may be behind.
 
 use bevy::{
-    core_pipeline::{Core2d, Core2dSystems, FullscreenShader, tonemapping::tonemapping},
-    ecs::query::QueryItem,
+    asset::RenderAssetUsages,
+    image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
     prelude::*,
     render::{
-        MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
-        camera::ExtractedCamera,
-        extract_component::{
-            ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
-            UniformComponentPlugin,
-        },
-        render_resource::{
-            BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-            CachedRenderPipelineId, Canonical, ColorTargetState, ColorWrites, Extent3d,
-            FragmentState, Operations, Origin3d, PipelineCache, RenderPassColorAttachment,
-            RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler,
-            SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, Specializer,
-            SpecializerKey, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-            TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-            TextureView, TextureViewDescriptor, TextureViewId, Variants,
-            binding_types::{sampler, texture_2d, uniform_buffer},
-        },
-        renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
-        sync_component::SyncComponent,
-        view::{ExtractedView, ViewTarget},
+        extract_resource::{ExtractResource, ExtractResourcePlugin},
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
     },
 };
 
 use crate::{
-    camera::{WorldCamera, visible_half_extent},
     gameplay::{
-        ScreenEffectSystems,
-        sun::{PlanetConfig, Sun},
+        noise::TilingNoiseField,
+        screen::{ScreenOverlay, attach_screen_overlay},
         terrain::TerrainConfig,
-        world::{
-            CHUNK_SIZE, ChunkHeights, HeightUploadQueue, TILE_DISPLAY_SIZE, WORLD_CHUNKS,
-            WORLD_TILES, tile_position_at,
-        },
     },
     screens::Screen,
 };
 
-const TINT_SHADER_PATH: &str = "shaders/tint.wgsl";
+/// Salt for the dither field, so the per-tile variation is not a third view of the
+/// landscape it is drawn over.
+const DITHER_SALT: u32 = 0xd17e_7a11;
+
+/// Noise cells across one period of the dither map. With the default 128-tile period
+/// this puts the coarsest patch at 16 tiles and, over three octaves, the finest at 4.
+/// A power of two, because that is what lets every octave's lattice wrap exactly.
+const DITHER_LATTICE_PERIOD: u32 = 8;
+
+/// Three. A fourth would land inside two texels and only alias — the map is one texel
+/// per tile and there is nothing finer than a tile to say.
+const DITHER_OCTAVES: u32 = 3;
 
 /// How the height is turned into a brightness.
 ///
@@ -122,6 +104,16 @@ pub struct TerrainTintConfig {
     /// darkening against an untinted capture, which is what confirmed the pass draws
     /// what it should.
     pub strength: f32,
+    /// How much world one repeat of the dither map covers, in tiles.
+    ///
+    /// 128 is a screenful at scale 1, so the repeat is never visible twice over at
+    /// once. If a whole region sitting at partial coverage ever reads as a pattern,
+    /// this goes **up** rather than the map gaining a second octave — the finest
+    /// octave is already a tile wide and there is nothing below a tile to say.
+    pub dither_period_tiles: u32,
+    /// Texels along each side of the map. One per tile, and there is no reason for it
+    /// to be anything else: the map exists to give each *tile* its own number.
+    pub dither_texels_per_side: u32,
 }
 
 impl Default for TerrainTintConfig {
@@ -130,96 +122,37 @@ impl Default for TerrainTintConfig {
             tint_low: 0.42,
             tint_high: 0.88,
             strength: 0.82,
+            dither_period_tiles: 128,
+            dither_texels_per_side: 128,
         }
     }
 }
 
-/// The ramp, flattened into the layout the shader reads.
+/// One tiling period of a smooth per-tile field, repeated over the world.
 ///
-/// Field order **is** the wgsl binding layout — see `assets/shaders/tint.wgsl`,
-/// which declares the same struct. Vectors before scalars, so the std140 padding is
-/// the same on both sides and WebGL2 agrees with the desktop.
-#[derive(Component, Clone, Copy, Default, ShaderType)]
-pub(super) struct TerrainTintUniform {
-    /// The beam and the sky, from [`crate::gameplay::sun`]. `vec4` rather than
-    /// `vec3` because std140 pads a `vec3` to sixteen bytes, and a padding
-    /// disagreement between these two structs is a runtime shader failure rather
-    /// than a build error. The fourth component is not read.
-    sun_direct: Vec4,
-    sun_sky: Vec4,
-    view_centre_tiles: Vec2,
-    view_half_extent_tiles: Vec2,
-    world_tiles: Vec2,
-    /// Which way the sun lies, on the ground. The occlusion test walks along it.
-    sun_bearing: Vec2,
-    water_line: f32,
-    tint_low: f32,
-    tint_high: f32,
-    strength: f32,
-    sun_ray_slope: f32,
-    shadow_softness: f32,
-    relief_tiles: f32,
-    shadow_near_tiles: f32,
-    shadow_mid_tiles: f32,
-    shadow_far_tiles: f32,
-}
-
-/// Lives on the one world camera while [`Screen::Gameplay`] is up.
+/// **Smooth rather than white noise, and that is the whole of it.** Thresholding a
+/// correlated field gives coherent patches that shrink from their *edges* as the
+/// coverage falls, which is what melting snow does; white noise would give
+/// salt-and-pepper that dissolves uniformly everywhere at once.
 ///
-/// The ramp half of it is written once — that is config, and the view is filled in
-/// at extract. The sun half moves, so [`crate::gameplay::sun`] writes it every
-/// frame through [`TerrainTintOverlay::set_sun`]; the uniform's layout stays in
-/// here, where the shader that reads it is.
-#[derive(Component, Clone, Copy, Default)]
-pub(super) struct TerrainTintOverlay(TerrainTintUniform);
+/// This is the noise half of gh-13 — a per-tile number so identical tiles do not
+/// repeat exactly — arriving early and for a different reason. It lives here because
+/// this is the module that decides how a smooth quantity becomes a *tile*, and it is
+/// a knob rather than world state: baked once at startup and outliving every session,
+/// like the configs.
+#[derive(Resource, Clone)]
+pub struct GroundDither(
+    /// Read by `screen.rs`, which binds it so the pass can threshold the snow cover
+    /// tile by tile. A handle and nothing else, like the ground's own two: the render
+    /// world has no use for anything a map is made of.
+    pub(super) Handle<Image>,
+);
 
-impl TerrainTintOverlay {
-    /// Where the sun reaches the screen. Everything about the light and the shadow
-    /// arrives through this one call, so no other module has to know the uniform's
-    /// field order.
-    pub(super) fn set_sun(&mut self, sun: &Sun, config: &PlanetConfig) {
-        self.0.sun_direct = sun.light.direct.extend(0.0);
-        self.0.sun_sky = sun.light.sky.extend(0.0);
-        self.0.sun_bearing = sun.position.bearing;
-        self.0.sun_ray_slope = sun.position.ray_slope;
-        self.0.shadow_softness = config.shadow_softness;
-        self.0.relief_tiles = config.relief_tiles;
-        self.0.shadow_near_tiles = config.shadow_near_tiles;
-        self.0.shadow_mid_tiles = config.shadow_mid_tiles;
-        self.0.shadow_far_tiles = config.shadow_far_tiles;
-    }
-}
+impl ExtractResource for GroundDither {
+    type Source = Self;
 
-impl SyncComponent for TerrainTintOverlay {
-    // The removal target. Extraction only ever inserts, so if the render world is
-    // not told what to drop, the shading outlives gameplay and shades the menus.
-    type Target = TerrainTintUniform;
-}
-
-impl ExtractComponent for TerrainTintOverlay {
-    type QueryData = (
-        &'static Self,
-        &'static Camera,
-        &'static Projection,
-        &'static GlobalTransform,
-    );
-    type QueryFilter = ();
-    type Out = TerrainTintUniform;
-
-    fn extract_component(
-        (overlay, camera, projection, transform): QueryItem<'_, '_, Self::QueryData>,
-    ) -> Option<Self::Out> {
-        let half_extent = visible_half_extent(camera, projection);
-        // A viewport with no size gives no scale to map screen back to world with,
-        // and would collapse the whole world onto one tile.
-        if half_extent.x <= 0.0 || half_extent.y <= 0.0 {
-            return None;
-        }
-
-        let mut uniform = overlay.0;
-        uniform.view_centre_tiles = tile_position_at(transform.translation().truncate());
-        uniform.view_half_extent_tiles = half_extent / TILE_DISPLAY_SIZE.as_vec2();
-        Some(uniform)
+    fn extract_resource(source: &Self) -> Self {
+        source.clone()
     }
 }
 
@@ -228,406 +161,114 @@ pub struct TerrainTintPlugin;
 impl Plugin for TerrainTintPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerrainTintConfig>();
-        app.add_plugins((
-            ExtractComponentPlugin::<TerrainTintOverlay>::default(),
-            UniformComponentPlugin::<TerrainTintUniform>::default(),
-        ));
-        app.add_systems(OnEnter(Screen::Gameplay), attach_terrain_tint);
-        app.add_systems(OnExit(Screen::Gameplay), detach_terrain_tint);
-
-        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
-        render_app.add_systems(RenderStartup, init_tint_pipeline);
-        render_app.add_systems(ExtractSchedule, extract_height_uploads);
-        render_app.add_systems(
-            Render,
-            (
-                prepare_height_texture.in_set(RenderSystems::PrepareResources),
-                prepare_tint_pipelines.in_set(RenderSystems::Prepare),
-                prepare_tint_bind_groups.in_set(RenderSystems::PrepareBindGroups),
-            ),
-        );
-        // Configured here rather than in the weather, because this is the pass that
-        // introduces the constraint: before it there was only one of them.
-        render_app.configure_sets(
-            Core2d,
-            (ScreenEffectSystems::Tint, ScreenEffectSystems::Weather).chain(),
-        );
-        // After tonemapping, so the scaling works on the same values the screen
-        // shows; in PostProcess, because `bevy_ui_render` puts its pass after that
-        // whole set, which is what keeps the shading off the menus and tooltips.
-        render_app.add_systems(
-            Core2d,
-            terrain_tint_pass
-                .in_set(Core2dSystems::PostProcess)
-                .in_set(ScreenEffectSystems::Tint)
-                .after(tonemapping),
+        app.add_plugins(ExtractResourcePlugin::<GroundDither>::default());
+        // At `Startup` rather than on entering gameplay, because the dither is not
+        // world state: it is 16 KB built once, and a session that rebuilt it would
+        // only be making the same map again. `TerrainConfig` is a knob too, so its
+        // seed is already there.
+        app.add_systems(Startup, bake_ground_dither);
+        // The ramp is config: written once when the overlay appears and never again,
+        // unlike the sun and the sky, which move. Ordered after the attach because
+        // there is nothing to write into before it — a system is usable as an
+        // ordering label wherever its parameter types are visible, and this one's
+        // are.
+        app.add_systems(
+            OnEnter(Screen::Gameplay),
+            sync_tint_ramp.after(attach_screen_overlay),
         );
     }
 }
 
-fn attach_terrain_tint(
+fn sync_tint_ramp(
+    terrain: Res<TerrainConfig>,
+    config: Res<TerrainTintConfig>,
+    mut overlay: Single<&mut ScreenOverlay>,
+) {
+    overlay.set_ramp(&terrain, &config);
+}
+
+/// One period of the dither field, one texel per tile.
+///
+/// Cheap enough to build on the main thread at startup — 16 K samples of a
+/// three-octave field, against the weather's 260 K — so it needs none of the task
+/// machinery the climate and the sky bakes have.
+fn bake_ground_dither(
     mut commands: Commands,
-    camera: Single<Entity, With<WorldCamera>>,
+    mut images: ResMut<Assets<Image>>,
     terrain: Res<TerrainConfig>,
     config: Res<TerrainTintConfig>,
 ) {
-    commands
-        .entity(*camera)
-        .insert(TerrainTintOverlay(TerrainTintUniform {
-            world_tiles: WORLD_TILES.as_vec2(),
-            // Read rather than restated, so that "where the sea stops" stays one
-            // number in the crate.
-            water_line: terrain.shallow_water_max,
-            tint_low: config.tint_low,
-            tint_high: config.tint_high,
-            strength: config.strength,
-            // Full daylight and a flat ray until the sun's first sync — the same
-            // fallback an unbaked sky gives the weather, and what this pass shows if
-            // the sun plugin is not in the app at all. A zeroed uniform would draw
-            // the world black.
-            sun_direct: Vec4::new(1.0, 1.0, 1.0, 0.0),
-            ..default()
-        }));
-}
-
-/// Takes the overlay off the camera, which survives this transition.
-///
-/// The session's heightmap needs no help here: it goes with the upload queue, which
-/// [`crate::gameplay::world`] drops on the same transition.
-fn detach_terrain_tint(mut commands: Commands, camera: Single<Entity, With<WorldCamera>>) {
-    commands.entity(*camera).remove::<TerrainTintOverlay>();
-}
-
-// -- Render world -----------------------------------------------------------
-
-/// The chunks whose heights this frame's extract took off the main world's queue.
-#[derive(Resource, Default)]
-struct PendingHeightUploads(Vec<ChunkHeights>);
-
-/// The render world's copy of the world's heights, and the only thing the shader
-/// reads: one texel per tile over the whole world.
-#[derive(Resource)]
-struct TerrainHeightTexture {
-    texture: Texture,
-    view: TextureView,
-}
-
-/// Moves the queued chunks across, rather than copying them, so a chunk is queued
-/// once, uploaded once, and cannot be missed or repeated.
-///
-/// The queue's *absence* is the other half of this: it lives and dies with
-/// `WorldMap`, so no queue means no session, and the heightmap goes with it. A
-/// session can therefore never be shown under the next session's terrain.
-fn extract_height_uploads(mut commands: Commands, mut main_world: ResMut<MainWorld>) {
-    let Some(mut queue) = main_world.get_resource_mut::<HeightUploadQueue>() else {
-        commands.remove_resource::<TerrainHeightTexture>();
-        commands.remove_resource::<PendingHeightUploads>();
-        return;
-    };
-
-    commands.insert_resource(PendingHeightUploads(queue.take()));
-}
-
-fn prepare_height_texture(
-    mut commands: Commands,
-    texture: Option<Res<TerrainHeightTexture>>,
-    pending: Option<ResMut<PendingHeightUploads>>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
-) {
-    let Some(mut pending) = pending else {
-        return;
-    };
-
-    // Created and written to in the same call, deliberately. Inserting the resource
-    // and leaving the writes to the next frame would lose everything queued on the
-    // frame it was created — which is the whole first screenful, since entering
-    // gameplay generates that unbudgeted. The texture is only needed as a value to
-    // write into; the resource is for the bind group, which can wait a frame.
-    let texture = match texture {
-        Some(texture) => texture.texture.clone(),
-        None => {
-            // wgpu zero-initializes, and zero is below any water line, so a world
-            // whose chunks have not arrived yet is untinted rather than wrong — the
-            // absence is the fallback, the way an unbaked sky is clear.
-            let texture = render_device.create_texture(&TextureDescriptor {
-                label: Some("terrain_height_texture"),
-                size: Extent3d {
-                    width: WORLD_TILES.x,
-                    height: WORLD_TILES.y,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::R8Unorm,
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&TextureViewDescriptor::default());
-            commands.insert_resource(TerrainHeightTexture {
-                texture: texture.clone(),
-                view,
-            });
-            texture
-        }
-    };
-
-    // No budget of its own: the background pass yields at most one chunk per pool
-    // thread per frame, so this is a few tens of kilobytes — where a whole-map
-    // upload would have been 16 MB every time a chunk landed.
-    for chunk in pending.0.drain(..) {
-        let coord = UVec2::new(
-            chunk.chunk as u32 % WORLD_CHUNKS.x,
-            chunk.chunk as u32 / WORLD_CHUNKS.x,
-        );
-        let origin = coord * CHUNK_SIZE;
-
-        render_queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: origin.x,
-                    y: origin.y,
-                    z: 0,
-                },
-                aspect: TextureAspect::All,
-            },
-            &chunk.texels,
-            TexelCopyBufferLayout {
-                offset: 0,
-                // One byte per tile, and the chunk's rows are stored bottom-up in
-                // the same order the texture's are — so no flip exists anywhere,
-                // and the shader can load by tile coordinate directly.
-                //
-                // 64 is not a multiple of the 256-byte row alignment, which is fine:
-                // that requirement is `copy_buffer_to_texture`'s, and `write_texture`
-                // explicitly waives it.
-                bytes_per_row: Some(CHUNK_SIZE.x),
-                rows_per_image: Some(CHUNK_SIZE.y),
-            },
-            Extent3d {
-                width: CHUNK_SIZE.x,
-                height: CHUNK_SIZE.y,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-}
-
-#[derive(Resource)]
-struct TerrainTintPipeline {
-    layout: BindGroupLayoutDescriptor,
-    /// For the scene texture. The heightmap needs none — the shader loads it by
-    /// tile coordinate rather than sampling it.
-    scene_sampler: Sampler,
-    variants: Variants<RenderPipeline, TerrainTintSpecializer>,
-}
-
-struct TerrainTintSpecializer;
-
-#[derive(PartialEq, Eq, Hash, Clone, Copy, SpecializerKey)]
-struct TerrainTintPipelineKey {
-    target_format: TextureFormat,
-}
-
-impl Specializer<RenderPipeline> for TerrainTintSpecializer {
-    type Key = TerrainTintPipelineKey;
-
-    fn specialize(
-        &self,
-        key: Self::Key,
-        descriptor: &mut RenderPipelineDescriptor,
-    ) -> Result<Canonical<Self::Key>, BevyError> {
-        descriptor.fragment_mut()?.set_target(
-            0,
-            ColorTargetState {
-                format: key.target_format,
-                blend: None,
-                write_mask: ColorWrites::ALL,
-            },
-        );
-        Ok(key)
-    }
-}
-
-fn init_tint_pipeline(
-    mut commands: Commands,
-    render_device: Res<RenderDevice>,
-    asset_server: Res<AssetServer>,
-    fullscreen_shader: Res<FullscreenShader>,
-) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "terrain_tint_bind_group_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::FRAGMENT,
-            (
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                sampler(SamplerBindingType::Filtering),
-                texture_2d(TextureSampleType::Float { filterable: true }),
-                uniform_buffer::<TerrainTintUniform>(true),
-            ),
-        ),
+    let side = config.dither_texels_per_side.max(1);
+    let field = TilingNoiseField::new(
+        terrain.seed,
+        DITHER_SALT,
+        DITHER_LATTICE_PERIOD,
+        DITHER_OCTAVES,
     );
+    let cells_per_texel = DITHER_LATTICE_PERIOD as f32 / side as f32;
 
-    commands.insert_resource(TerrainTintPipeline {
-        layout: layout.clone(),
-        scene_sampler: render_device.create_sampler(&SamplerDescriptor::default()),
-        variants: Variants::new(
-            TerrainTintSpecializer,
-            RenderPipelineDescriptor {
-                label: Some("terrain_tint_pipeline".into()),
-                layout: vec![layout],
-                vertex: fullscreen_shader.to_vertex_state(),
-                fragment: Some(FragmentState {
-                    shader: asset_server.load(TINT_SHADER_PATH),
-                    targets: vec![Some(ColorTargetState {
-                        format: TextureFormat::Rgba8UnormSrgb,
-                        blend: None,
-                        write_mask: ColorWrites::ALL,
-                    })],
-                    ..default()
-                }),
-                ..default()
-            },
-        ),
+    let mut texels = Vec::with_capacity((side * side) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let cell = Vec2::new(x as f32, y as f32) * cells_per_texel;
+            texels.push((field.sample(cell.x, cell.y).clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+
+    let mut image = Image::new(
+        Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        texels,
+        TextureFormat::R8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    // **Nearest**, unlike every other map in the crate, and repeated. One texel is
+    // one tile and the point of the whole map is that a tile gets *its own* number —
+    // filtering would blend it with its neighbours' and put a snow edge inside a tile.
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        min_filter: ImageFilterMode::Nearest,
+        mag_filter: ImageFilterMode::Nearest,
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
     });
-}
 
-#[derive(Component)]
-struct TerrainTintPipelineId(CachedRenderPipelineId);
-
-fn prepare_tint_pipelines(
-    mut commands: Commands,
-    pipeline_cache: Res<PipelineCache>,
-    mut pipeline: ResMut<TerrainTintPipeline>,
-    views: Query<(Entity, &ExtractedView), With<ExtractedCamera>>,
-) -> Result<(), BevyError> {
-    for (entity, view) in &views {
-        let id = pipeline.variants.specialize(
-            &pipeline_cache,
-            TerrainTintPipelineKey {
-                target_format: view.target_format,
-            },
-        )?;
-        commands.entity(entity).insert(TerrainTintPipelineId(id));
-    }
-
-    Ok(())
-}
-
-/// A bind group for each of the two textures the view target ping-pongs between,
-/// since which one is the source is only known inside the pass.
-///
-/// `a_view` is which view `a` samples, and it has to be recorded rather than
-/// re-derived: `post_process_write` flips the target *before* handing back its
-/// source, so `main_texture_view()` inside the pass is the destination, and there
-/// is nothing left in the target that says which texture `a` was built from.
-#[derive(Component)]
-struct TerrainTintBindGroups {
-    a_view: TextureViewId,
-    a: BindGroup,
-    b: BindGroup,
-}
-
-fn prepare_tint_bind_groups(
-    mut commands: Commands,
-    views: Query<(Entity, &ViewTarget), With<TerrainTintUniform>>,
-    pipeline: Option<Res<TerrainTintPipeline>>,
-    pipeline_cache: Res<PipelineCache>,
-    uniforms: Res<ComponentUniforms<TerrainTintUniform>>,
-    heights: Option<Res<TerrainHeightTexture>>,
-    render_device: Res<RenderDevice>,
-) {
-    let Some(pipeline) = pipeline else {
-        return;
-    };
-    let Some(uniform_binding) = uniforms.uniforms().binding() else {
-        return;
-    };
-    let Some(heights) = heights else {
-        return;
-    };
-    let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
-
-    for (entity, target) in &views {
-        let bind_group = |scene: &_| {
-            render_device.create_bind_group(
-                "terrain_tint_bind_group",
-                &layout,
-                &BindGroupEntries::sequential((
-                    scene,
-                    &pipeline.scene_sampler,
-                    &heights.view,
-                    uniform_binding.clone(),
-                )),
-            )
-        };
-
-        commands.entity(entity).insert(TerrainTintBindGroups {
-            a_view: target.main_texture_view().id(),
-            a: bind_group(target.main_texture_view()),
-            b: bind_group(target.main_texture_other_view()),
-        });
-    }
-}
-
-/// Shades the rendered world by the height under each fragment.
-///
-/// Every part of the guard is the query: a view with no `TerrainTintUniform` — a
-/// menu, or a session whose first chunk has not landed — matches nothing, the
-/// system is skipped, and the scene is never even copied.
-fn terrain_tint_pass(
-    view: ViewQuery<(
-        &ViewTarget,
-        &DynamicUniformIndex<TerrainTintUniform>,
-        &TerrainTintBindGroups,
-        &TerrainTintPipelineId,
-    )>,
-    pipeline_cache: Res<PipelineCache>,
-    mut ctx: RenderContext,
-) {
-    let (target, uniform_index, bind_groups, pipeline_id) = view.into_inner();
-
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id.0) else {
-        return;
-    };
-
-    let post_process = target.post_process_write();
-    let bind_group = if post_process.source.id() == bind_groups.a_view {
-        &bind_groups.a
-    } else {
-        &bind_groups.b
-    };
-
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&RenderPassDescriptor {
-            label: Some("terrain_tint_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: post_process.destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations::default(),
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[uniform_index.index()]);
-    pass.draw(0..3, 0..1);
+    commands.insert_resource(GroundDither(images.add(image)));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::gameplay::terrain::height_byte;
+    use crate::gameplay::{ground::GroundConfig, terrain::height_byte};
+
+    /// How much of a tile's snow is actually drawn, given its own dither value.
+    ///
+    /// **The shader's arithmetic, transcribed** — `assets/shaders/screen.wgsl` does
+    /// this per fragment, and the two are edited together, on the same terms
+    /// `sun.rs`'s `shadow_at` transcribes the occlusion test. It is here so the
+    /// property that matters can be checked without a GPU.
+    ///
+    /// The threshold is squeezed into `softness..1 - softness` rather than being the
+    /// dither value itself, and that is what makes the endpoints exact: full coverage
+    /// snows every tile and no coverage snows none, whatever number the tile drew.
+    fn snow_lying(coverage: f32, dither: f32, softness: f32) -> f32 {
+        let softness = softness.clamp(0.0, 0.5);
+        let threshold = softness + dither.clamp(0.0, 1.0) * (1.0 - 2.0 * softness);
+        smoothstep(threshold - softness, threshold + softness, coverage)
+    }
+
+    fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        if edge1 <= edge0 {
+            return if x < edge0 { 0.0 } else { 1.0 };
+        }
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
 
     /// A screenful in tiles, taken from a real extract: a half extent of
     /// 59.75 x 72.625 tiles at scale 1.
@@ -704,6 +345,58 @@ mod tests {
             "a strength of {} would drive a tile to black",
             config.strength
         );
+    }
+
+    /// The guard the biome's cover dither has, applied to this one: the threshold is
+    /// *per tile*, so nothing about it may be allowed to leak into a region that is
+    /// wholly covered or wholly bare. Full coverage snows every tile and no coverage
+    /// snows none, whatever number the tile drew.
+    ///
+    /// This is the property that makes the squeeze into `softness..1 - softness`
+    /// worth doing rather than thresholding against the raw dither value — with the
+    /// raw value, any tile whose dither fell under the softness would be faintly
+    /// snowed on a bare summer afternoon.
+    #[test]
+    fn the_dither_leaves_full_and_empty_coverage_alone() {
+        let softness = GroundConfig::default().snow_dither_softness;
+        for i in 0..=255u32 {
+            let dither = i as f32 / 255.0;
+            assert_eq!(
+                snow_lying(0.0, dither, softness),
+                0.0,
+                "a tile with dither {dither} was snowed at zero coverage"
+            );
+            assert_eq!(
+                snow_lying(1.0, dither, softness),
+                1.0,
+                "a tile with dither {dither} was bare at full coverage"
+            );
+        }
+    }
+
+    /// And the other half: in between it must *actually* dither, or the map is dead
+    /// weight and a snowfield arrives everywhere at once. What makes a melting field
+    /// shrink from its edges is that the tiles do not all cross together.
+    #[test]
+    fn the_dither_splits_a_partly_covered_world_tile_by_tile() {
+        let softness = GroundConfig::default().snow_dither_softness;
+        let drawn = (0..=255u32)
+            .filter(|i| snow_lying(0.5, *i as f32 / 255.0, softness) > 0.5)
+            .count();
+        assert!(
+            (32..224).contains(&drawn),
+            "at half coverage {drawn}/256 dither values drew snow, which is not a split"
+        );
+
+        // And it is monotone in the coverage, so a field only ever grows as it snows
+        // and only ever shrinks as it melts.
+        let dither = 0.5;
+        let mut previous = 0.0;
+        for i in 0..=20u32 {
+            let lying = snow_lying(i as f32 / 20.0, dither, softness);
+            assert!(lying >= previous, "the field shrank as the coverage rose");
+            previous = lying;
+        }
     }
 
     /// The ramp has to span land the world actually produces, and to run the right
