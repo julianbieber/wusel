@@ -901,9 +901,16 @@ a field under snow is a change to that module and not to this one. It is explici
 
 ### The inspection overlay (`gameplay/inspect.rs`)
 
-`Tab` (or `overlay <field>` from the ctl) draws the fields the world is built out of as false colour:
-height, temperature, moisture, wetness, snow, cloud. It is a debug view, and the first thing in the
-crate that exists to be *looked at* rather than played.
+The digit keys — `1` height, `2` temperature, `3` moisture, `4` wetness, `5` snow, `6` cloud, `0` off,
+or `overlay <field>` from the ctl — draw the fields the world is built out of as false colour. It is a
+debug view, and the first thing in the crate that exists to be *looked at* rather than played.
+
+**The key is the discriminant is what the shader switches on.** Pressing `2` and the uniform carrying
+2 are the same 2, so there is no third table mapping one to the other, and `OverlayField::ALL` is in
+discriminant order because the key lookup walks it. `0` is off because off is that enum's zero rather
+than a seventh state beside it. It replaced a `Tab` cycle, which with seven fields put the one you
+wanted up to six presses away with no way back except round; the ctl lost its bare cycling form with
+it, so every verb is again exactly one thing a player can do.
 
 **It needs no new maps.** Every field is already bound to the one pass because something else needed
 it there — the heightmap for the ramp and the shadows, the climate map for what falls as snow, the
@@ -1083,9 +1090,9 @@ exists while every scenario still passes. Concretely —
   `season <orbit_phase>` for this: without them a scenario has to wait 300 real seconds to see
   midnight, and there is no way at all to see a winter. The rotation *is* the sun's only state, so
   writing it is the whole of moving the clock — everything else is re-derived the same frame.
-- **A view mode needs a verb, and the verb should be able to do what the key does.** `overlay <field>`
-  selects one; bare `overlay` *cycles*, which is exactly what `Tab` does — so a scenario drives the
-  player's interaction rather than only the one the ctl invented for itself.
+- **A view mode needs a verb, and one verb per thing the player can actually do.** `overlay <field>`
+  is one digit key each, and there is deliberately no cycling form — the keyboard has none either, and
+  a ctl verb with no key behind it is the drift this rule exists to prevent.
 
 **Two traps in driving a world with clocks in it**, both found by getting them wrong:
 

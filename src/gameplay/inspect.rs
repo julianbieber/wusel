@@ -112,7 +112,8 @@ pub enum OverlayField {
 }
 
 impl OverlayField {
-    /// Cycling order, and what `overlay` with no argument steps through.
+    /// Every field, **in discriminant order** — which is also key order, and what the
+    /// key lookup walks. Nothing may be inserted in the middle.
     pub const ALL: [OverlayField; 7] = [
         OverlayField::Off,
         OverlayField::Height,
@@ -135,10 +136,40 @@ impl OverlayField {
         }
     }
 
-    /// The next field in the cycle, which is what the key press does.
-    pub fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
+    /// The digit that selects this field, on the number row and on the numpad.
+    ///
+    /// **The key is the discriminant**, which is also what the shader switches on —
+    /// so pressing `2` and the uniform carrying 2 are the same 2, and there is no
+    /// third table anywhere mapping one to the other. `0` is off, because off is the
+    /// zero of that enum rather than a seventh state beside it.
+    ///
+    /// Both spellings, matching the zoom's `Equal`/`NumpadAdd` pair — a keyboard with
+    /// a numpad has two keys with a `2` on them and it is not the player's job to
+    /// know which one the game reads.
+    fn keys(self) -> (KeyCode, KeyCode) {
+        match self {
+            OverlayField::Off => (KeyCode::Digit0, KeyCode::Numpad0),
+            OverlayField::Height => (KeyCode::Digit1, KeyCode::Numpad1),
+            OverlayField::Temperature => (KeyCode::Digit2, KeyCode::Numpad2),
+            OverlayField::Moisture => (KeyCode::Digit3, KeyCode::Numpad3),
+            OverlayField::Wetness => (KeyCode::Digit4, KeyCode::Numpad4),
+            OverlayField::Snow => (KeyCode::Digit5, KeyCode::Numpad5),
+            OverlayField::Cloud => (KeyCode::Digit6, KeyCode::Numpad6),
+        }
+    }
+
+    /// That digit as text, for the legend — so the key that got you here is on
+    /// screen and the rest of them are one guess away.
+    fn key_label(self) -> &'static str {
+        match self {
+            OverlayField::Off => "0",
+            OverlayField::Height => "1",
+            OverlayField::Temperature => "2",
+            OverlayField::Moisture => "3",
+            OverlayField::Wetness => "4",
+            OverlayField::Snow => "5",
+            OverlayField::Cloud => "6",
+        }
     }
 
     /// The unit this field is measured in, for the legend.
@@ -450,11 +481,6 @@ impl FieldSources<'_> {
     }
 }
 
-/// The key that cycles the overlay. Everything else on the keyboard is spoken for —
-/// WASD pans, `+`/`-` zoom, Escape leaves — and Tab is the one a debug view is
-/// usually behind.
-const CYCLE_KEY: KeyCode = KeyCode::Tab;
-
 /// Marks the legend, and remembers what it was built for. Comparing that against the
 /// current field is the whole of "does this need rebuilding" — no change detection,
 /// and it survives the legend being despawned with the session.
@@ -491,7 +517,7 @@ impl Plugin for InspectPlugin {
             // The fit reads the camera, so it has to be one chain: measure what is on
             // screen, tell the pass, then tell the legend the same thing.
             (
-                cycle_overlay_field,
+                select_overlay_field,
                 sync_inspect_overlay,
                 sync_overlay_legend,
             )
@@ -501,9 +527,18 @@ impl Plugin for InspectPlugin {
     }
 }
 
-fn cycle_overlay_field(keys: Res<ButtonInput<KeyCode>>, mut field: ResMut<OverlayField>) {
-    if keys.just_pressed(CYCLE_KEY) {
-        *field = field.next();
+/// A digit selects its field. Nothing else on the keyboard is a number — WASD pans,
+/// `+`/`-` zoom, Escape leaves — so the whole row was free.
+///
+/// Direct selection rather than the cycle this replaced: with seven fields a cycle
+/// puts the one you want up to six presses away and offers no way back except round.
+fn select_overlay_field(keys: Res<ButtonInput<KeyCode>>, mut field: ResMut<OverlayField>) {
+    for candidate in OverlayField::ALL {
+        let (row, numpad) = candidate.keys();
+        if keys.just_pressed(row) || keys.just_pressed(numpad) {
+            *field = candidate;
+            return;
+        }
     }
 }
 
@@ -639,7 +674,13 @@ fn spawn_legend(
             BackgroundColor(Color::srgba(0.102, 0.102, 0.098, 0.86)),
         ))
         .with_children(|panel| {
-            panel.spawn(label(field.label().to_string(), 15.0, ink));
+            // The key it is on, beside the name — so the one that got you here is on
+            // screen and the other six are one guess away.
+            panel.spawn(label(
+                format!("[{}] {}", field.key_label(), field.label()),
+                15.0,
+                ink,
+            ));
 
             // The strip, cut from the same `OverlayRange::colour` the shader
             // transcribes — so a swatch and the map under it cannot disagree about
@@ -921,23 +962,50 @@ mod tests {
         assert!((range.normalize(4.0) - 0.5).abs() < 1.0e-6);
     }
 
-    /// Cycling has to visit every field and come back, or a mode is unreachable from
-    /// the keyboard and only the ctl can select it.
+    /// Every field is one key press away and no two share a key, or a mode is
+    /// unreachable from the keyboard and only the ctl can select it.
     #[test]
-    fn cycling_visits_every_field_and_returns_to_off() {
-        let mut seen = Vec::new();
-        let mut field = OverlayField::Off;
-        for _ in 0..OverlayField::ALL.len() {
-            seen.push(field);
-            field = field.next();
+    fn every_field_has_a_key_of_its_own() {
+        let mut taken = Vec::new();
+        for field in OverlayField::ALL {
+            let (row, numpad) = field.keys();
+            assert!(!taken.contains(&row), "{field:?} reuses a key");
+            assert!(!taken.contains(&numpad), "{field:?} reuses a numpad key");
+            taken.push(row);
+            taken.push(numpad);
         }
-        assert_eq!(
-            field,
-            OverlayField::Off,
-            "the cycle did not come back round"
-        );
-        for expected in OverlayField::ALL {
-            assert!(seen.contains(&expected), "{expected:?} is unreachable");
+    }
+
+    /// **The key, the label and the discriminant are one number.** The shader
+    /// switches on the discriminant and the player presses the digit, so if those
+    /// ever parted company the overlay would draw a different field from the one the
+    /// legend names — and nothing else in the crate would notice.
+    #[test]
+    fn the_key_a_field_is_on_is_its_own_discriminant() {
+        const DIGITS: [KeyCode; 7] = [
+            KeyCode::Digit0,
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+        ];
+        for (index, field) in OverlayField::ALL.into_iter().enumerate() {
+            assert_eq!(
+                field as u32 as usize, index,
+                "{field:?} is not in discriminant order in ALL",
+            );
+            assert_eq!(
+                field.key_label(),
+                index.to_string(),
+                "{field:?} is labelled with a digit it is not on",
+            );
+            assert_eq!(
+                field.keys().0,
+                DIGITS[index],
+                "{field:?} is on the wrong key"
+            );
         }
     }
 

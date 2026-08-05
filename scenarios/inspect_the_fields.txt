@@ -61,9 +61,14 @@ overlay cloud
 observe overlay
 capture /tmp/wusel-inspect/cloud.png
 
-# And cycling with no argument, which is what the key does — so the ctl drives the
-# player's interaction rather than only its own. From cloud the next one is off.
-overlay
+# And the keys themselves, which are a *different code path* from the verb above:
+# `overlay <field>` writes the resource, where a press goes in as a `KeyboardInput`
+# message and is read by the same system a player's keyboard feeds. Driving only the
+# verb would leave that path unexercised, and a broken key binding would pass every
+# check in this file.
+hold 2 1
+observe overlay
+hold 0 1
 observe overlay
 capture /tmp/wusel-inspect/off.png
 

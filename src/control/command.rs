@@ -76,10 +76,9 @@ pub(super) enum Command {
     Turn(f32),
     /// Where to put its orbit, on 0..1 from the northward equinox.
     Season(f32),
-    /// Which field the inspection overlay draws. `None` cycles, exactly as the key
-    /// does, so a scenario can drive the same interaction a player has rather than
-    /// only the one the ctl invented.
-    Overlay(Option<OverlayField>),
+    /// Which field the inspection overlay draws — one verb per digit key, so the ctl
+    /// reaches exactly what a player can and nothing more.
+    Overlay(OverlayField),
     Quit,
 }
 
@@ -186,10 +185,9 @@ impl Command {
             "season" => Ok(Self::Season(number(
                 rest.first().ok_or("season needs an orbit phase on 0..1")?,
             )?)),
-            "overlay" => Ok(Self::Overlay(match rest.first() {
-                None => None,
-                Some(word) => Some(overlay_field(word)?),
-            })),
+            "overlay" => Ok(Self::Overlay(overlay_field(
+                rest.first().ok_or("overlay needs a field")?,
+            )?)),
             "quit" => Ok(Self::Quit),
             other => Err(format!("unknown command: {other}")),
         }
@@ -375,15 +373,13 @@ impl Command {
             }
 
             // The mode is a resource and nothing else, so setting it is the whole of
-            // the interaction — the legend and the pass both read it the same frame.
+            // the interaction — the legend and the pass both read it the same frame,
+            // exactly as they would after the key press this stands in for.
             Self::Overlay(field) => {
                 let Some(mut current) = world.get_resource_mut::<OverlayField>() else {
                     return Poll::Failed("no overlay field resource".into());
                 };
-                *current = match field {
-                    Some(field) => *field,
-                    None => current.next(),
-                };
+                *current = *field;
                 Poll::Done(json!({ "field": current.label() }))
             }
 
@@ -550,6 +546,9 @@ fn overlay_field(word: &str) -> Result<OverlayField, String> {
         })
 }
 
+/// The keys a scenario can press. The digits are here so the overlay's *real* input
+/// path can be driven — `overlay <field>` writes the resource, which is the same
+/// thing the key press ends up doing but not the same code getting there.
 fn key_code(word: &str) -> Result<KeyCode, String> {
     match word.to_ascii_lowercase().as_str() {
         "w" => Ok(KeyCode::KeyW),
@@ -560,6 +559,13 @@ fn key_code(word: &str) -> Result<KeyCode, String> {
         "equal" | "plus" => Ok(KeyCode::Equal),
         "minus" => Ok(KeyCode::Minus),
         "space" => Ok(KeyCode::Space),
+        "0" => Ok(KeyCode::Digit0),
+        "1" => Ok(KeyCode::Digit1),
+        "2" => Ok(KeyCode::Digit2),
+        "3" => Ok(KeyCode::Digit3),
+        "4" => Ok(KeyCode::Digit4),
+        "5" => Ok(KeyCode::Digit5),
+        "6" => Ok(KeyCode::Digit6),
         other => Err(format!("unknown key: {other}")),
     }
 }
