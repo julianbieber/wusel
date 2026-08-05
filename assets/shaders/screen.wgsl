@@ -69,6 +69,7 @@ struct ScreenUniform {
     overlay_high: f32,
     overlay_diverging: f32,
     overlay_opacity: f32,
+    overlay_seam: f32,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -84,7 +85,9 @@ struct ScreenUniform {
 @group(0) @binding(10) var dither_sampler: sampler;
 @group(0) @binding(11) var climate_texture: texture_2d<f32>;
 @group(0) @binding(12) var climate_sampler: sampler;
-@group(0) @binding(13) var<uniform> screen: ScreenUniform;
+@group(0) @binding(13) var prospect_texture: texture_2d<f32>;
+@group(0) @binding(14) var prospect_sampler: sampler;
+@group(0) @binding(15) var<uniform> screen: ScreenUniform;
 
 /// How a colour is weighed into one number. Matches `LUMINANCE` in gameplay/sun.rs,
 /// which is where the same weighting decides what the simulation reads.
@@ -300,7 +303,43 @@ fn overlay_value(at: vec2<f32>, tile: vec2<f32>) -> f32 {
         }
         return cover.g;
     }
-    return cloud_density(cloud_field(at));
+    if field < 6.5 {
+        return cloud_density(cloud_field(at));
+    }
+    // The three prospectivity fields, whose scores are the map's first three channels
+    // in the order gameplay/prospect.rs packs them. **Sampled**, like every other
+    // field, because the score is a continuous quantity and the blocking is a true
+    // property of the resolution it was taken at.
+    let score = textureSampleLevel(
+        prospect_texture,
+        prospect_sampler,
+        at / screen.world_tiles,
+        0.0,
+    );
+    if field < 7.5 {
+        return score.r;
+    }
+    if field < 8.5 {
+        return score.g;
+    }
+    return score.b;
+}
+
+/// Whether a seam of the active overlay's own resource is drawn at this texel.
+///
+/// **`textureLoad`, at nearest, and never sampled.** The fourth channel is a
+/// *category*: bilinear filtering across it interpolates between categories, so a
+/// texel halfway between an iron seam and nothing reads as copper. This is the one
+/// channel that must not be filtered — and the byte quantization is why the
+/// comparison needs a tolerance at all rather than an equality.
+fn seam_here(at: vec2<f32>) -> bool {
+    if screen.overlay_seam <= 0.0 {
+        return false;
+    }
+    let side = f32(textureDimensions(prospect_texture).x);
+    let texel = vec2<i32>(clamp(at / screen.world_tiles * side, vec2(0.0), vec2(side - 1.0)));
+    let mark = textureLoad(prospect_texture, texel, 0).a;
+    return abs(mark - screen.overlay_seam) < 0.06;
 }
 
 /// A value onto the ramp's 0..1, with the range's midpoint pinned to the middle.
@@ -343,7 +382,13 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // the edge of the world there is no field to read, so the world's own border
     // stays visible.
     if screen.overlay_field > 0.5 && inside_world(tile) {
-        let field = overlay_colour(overlay_position(overlay_value(at, tile)));
+        // A seam draws at the ramp's warm pole, so a site reads as the strongest mark
+        // on a map whose warm end already means "worth digging".
+        var t = overlay_position(overlay_value(at, tile));
+        if seam_here(at) {
+            t = 1.0;
+        }
+        let field = overlay_colour(t);
         return vec4(mix(scene.rgb, field, screen.overlay_opacity), scene.a);
     }
 

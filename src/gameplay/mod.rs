@@ -3,12 +3,15 @@ use bevy::prelude::*;
 mod biome;
 pub(crate) mod city;
 mod city_panel;
+pub(crate) mod deposit;
 mod drainage;
 pub(crate) mod ground;
 pub(crate) mod growth;
+pub(crate) mod industry;
 pub(crate) mod inspect;
 mod noise;
 pub(crate) mod plan;
+pub(crate) mod prospect;
 mod river;
 pub(crate) mod road;
 mod screen;
@@ -50,6 +53,7 @@ impl Plugin for GameplayPlugin {
             weather::WeatherPlugin,
             ground::GroundPlugin,
             inspect::InspectPlugin,
+            prospect::ProspectPlugin,
             city_panel::CityPanelPlugin,
             sun::SunPlugin,
         ));

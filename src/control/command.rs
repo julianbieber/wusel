@@ -27,6 +27,7 @@ use crate::{
         ground::ClimateMaps,
         inspect::OverlayField,
         plan::WorldPlan,
+        prospect::ProspectMaps,
         sun::{PlanetConfig, Sun},
         weather::WeatherMaps,
         world::{BackgroundGeneration, tile_translation},
@@ -87,6 +88,7 @@ pub(super) enum Condition {
     Plan,
     Sky,
     Ground,
+    Prospect,
     Screen(Screen),
 }
 
@@ -398,10 +400,11 @@ impl Condition {
             "plan" => Ok(Self::Plan),
             "sky" => Ok(Self::Sky),
             "ground" => Ok(Self::Ground),
+            "prospect" => Ok(Self::Prospect),
             "main" | "help" | "gameplay" => Ok(Self::Screen(screen(word)?)),
             other => Err(format!(
                 "unknown wait condition: {other} \
-                 (terrain, plan, sky, ground, main, help, gameplay)"
+                 (terrain, plan, sky, ground, prospect, main, help, gameplay)"
             )),
         }
     }
@@ -412,6 +415,7 @@ impl Condition {
             Self::Plan => "plan",
             Self::Sky => "sky",
             Self::Ground => "ground",
+            Self::Prospect => "prospect",
             Self::Screen(_) => "screen",
         }
     }
@@ -427,6 +431,11 @@ impl Condition {
             // no climate the world is dry, so a scenario that skipped this would
             // capture bare ground and call it a thaw.
             Self::Ground => world.get_resource::<ClimateMaps>().is_some(),
+            // The prospectivity bake, which lands on wall-clock like every other one
+            // — so a scenario that counted frames against it would be flaky by
+            // construction. It does not gate the plan, so `wait plan` says nothing
+            // about it and this is not a convenience but the standing rule.
+            Self::Prospect => world.get_resource::<ProspectMaps>().is_some(),
             Self::Screen(target) => world
                 .get_resource::<State<Screen>>()
                 .is_some_and(|screen| screen.get() == target),
@@ -447,6 +456,7 @@ impl Condition {
             },
             Self::Sky => "the weather maps have not been baked".into(),
             Self::Ground => "the climate map has not been baked".into(),
+            Self::Prospect => "the prospectivity map has not been baked".into(),
             Self::Screen(_) => match world.get_resource::<State<Screen>>() {
                 Some(screen) => format!("screen is {:?}", screen.get()),
                 None => "no screen state".into(),

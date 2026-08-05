@@ -472,6 +472,69 @@ world starving for the hundreds of steps its fields took to fill.
 Defaults carry their measurements, from the `#[ignore]`d
 `the_default_config_grows_the_world_into_a_steady_state`.
 
+### Deposits and industry (`gameplay/deposit.rs`, `gameplay/industry.rs`, `gameplay/prospect.rs`)
+
+Cities hold six resources, not one. **A seam is a place, a wood is an area** — that split is the
+whole design. Iron, copper and salt are discrete sites laid out once from the finished world (one
+jittered candidate per `deposit_cell_tiles` square, kept if the ground clears `deposit_threshold`),
+and a site has exactly **one owner**. Wood and stone are read off the `Forest` and
+`Rock`/`Mountain`/`Gravel` tiles inside a city's reach, so two cities whose reaches overlap both log
+the same hillside — the one place "a tile has one owner" deliberately does not extend, because
+standing timber is not consumed by being worked.
+
+`Deposit` is a component, so a seam entity *is* the record of it existing, and `DespawnOnExit` is the
+whole of its lifetime. `DepositMap` is an index by chunk holding no data of its own, exactly as
+`CityMap` is. **Nothing here stamps a tile**: no chunk refresh, no height upload, no new kind. The
+`Deposits` stage sits between `Drainage` and `Cities` — after the valleys, because a wadi changes the
+ground a salt pan is read off.
+
+**The density knob is chosen against the share of *cities*, never the share of the map**, and the two
+are barely related: cities sit on habitable ground and seams sit on bare, high or dry ground, so the
+populations are anti-correlated. At reach 56 a city's disc is 9852 tiles of a 16.7 M-tile world and 520
+seams *should* give one to a quarter of them; the measured figure is 5%. The shipped 64/112 pair gives
+**one city in five working a seam, nearly all of them a single kind** — going denser buys mining cities
+and spends the differentiation.
+
+`industry.rs` splits the population across professions. **A profession *is* the resource its hands
+produce** — no `Profession` enum, so the two lists cannot drift. Food is now a stock with a granary,
+and the capacity is `(harvest + granary release) / food_per_person`: the store may only ever make up a
+shortfall, never raise the ceiling, so a full granary cannot start a cycle. Happiness scales the growth
+**rate** and never K, which is what keeps gh-6's "food sizes population" literally true.
+
+**One thing is not what the spec said, and it is the load-bearing one.** The spec scales the harvest by
+"hands on the fields over hands the fields want". That ratio contains the population, so `capacity ∝ p`
+and the logistic has no stable non-zero equilibrium — measured, the world came out at a **median
+population of 22 with 80 of 92 cities shrinking**. `industry::effort` is a share of the *land* instead,
+with the population entering only through a `min` that binds for 15 cities of 92. A seam still costs a
+city its harvest, and the split is now more literally "a function of the estate" than before. The
+whole-world measurement asserts the stretched share stays under a quarter — that assertion is the
+guard against reintroducing the collapse.
+
+Two more corrections worth keeping. **An unhappy city cannot be modelled by a negative logistic rate**:
+above K, `r·p·(1 - p/K)` is a negative times a negative, so it *grows*, and past `p = K/(1 - e^r)` the
+closed form's denominator goes through zero — flooring the rate fixes neither. `grow` runs the logistic
+at the non-negative part of the rate and applies the negative part as an exponential bleed. And
+`resum` is the **caller's** now, hoisted out of `step_city`, because the industry step reads
+`static_yield` and the two must see the same number.
+
+`prospect.rs` is the overlay behind the seams, on digits 7/8/9. **It draws prospectivity, not seams**:
+the recipe score everywhere, *before* the threshold, with the sites themselves in a fourth channel.
+It is the first overlay field with a bake behind it, and the reason is honest — a recipe reads the
+tile's **kind** and its **biome**, neither of which is on the GPU. The three scores are sampled
+bilinearly; **the fourth channel is categorical and must never be filtered**, because a texel halfway
+between an iron seam and nothing interpolates to copper. The neutral band is `deposit_threshold` read
+from `WorldPlanConfig`, the same discipline that puts the temperature overlay's band on the snow line.
+That is the pass's **one new binding** — fifteen of WebGL2's sixteen, worth checking before a second.
+
+Defaults carry their measurements, from the `#[ignore]`d
+`the_default_config_lays_seams_of_every_resource` and `the_default_config_grows_the_world_into_a_steady_state`.
+At the shipped values: 520 seams, 36 of them worked by 20 of 92 cities; median population **5640**
+against gh-6's 6940 — the fifth of every city's effort that is no longer farming — and a step costing
+**0.678 ms** against gh-6's 0.53. By region, per head: Forest is the only one with iron, Desert holds
+copper and salt and no wood, Wetland is wet timber and salt, Plains has neither iron nor salt. That
+correlation is the ground showing through — **nothing in `industry.rs` has ever learned what a biome
+is**.
+
 ### The world (`gameplay/world.rs`)
 
 A fixed 64×64 grid of chunks — 4096×4096 tiles — centred on the world origin, so it has a hard edge
@@ -1039,6 +1102,10 @@ that is deferred to its own task.
 that one handle. Sixteen columns now: the biome rework appended Sand (8), Snow (9), Rock (10) and
 Marsh (11), gh-14 appended Scrub (12), Gravel (13) and Reed (14), and gh-6 appended Farmland (15), so
 nothing existing moved.
+
+gh-24 added **no** column, and that is a property of its design rather than an omission: a deposit is
+a record on an entity, so the seams reach the player through the panel and the overlay rather than
+through the map. A mine is invisible on the ground, deliberately.
 
 `Gravel` is deliberately not `Rock`: `Rock` is cold alpine scree and reads wrong at sea level, where a
 desert hardpan and a stripped lowland outcrop both live.

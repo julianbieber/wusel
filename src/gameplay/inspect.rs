@@ -54,7 +54,10 @@ use bevy::{input::ButtonInput, prelude::*, ui::widget::Text};
 use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
+        deposit::Resource,
         ground::{ClimateMaps, GroundConfig, GroundCover, TemperatureOffset, temperature_offset},
+        plan::WorldPlanConfig,
+        prospect::ProspectMaps,
         screen::ScreenOverlay,
         sun::{PlanetConfig, Sun},
         weather::SkySampler,
@@ -109,12 +112,19 @@ pub enum OverlayField {
     Snow = 5,
     /// How much cloud is overhead this instant.
     Cloud = 6,
+    /// **Prospectivity, not seams**: how good this ground is for iron, before the
+    /// threshold. A seam exists only where a cell's own jittered candidate landed on
+    /// ground that cleared it, so this says "could there be iron here" — where there
+    /// *is* one is the mark drawn over it, and `observe deposits`.
+    Iron = 7,
+    Copper = 8,
+    Salt = 9,
 }
 
 impl OverlayField {
     /// Every field, **in discriminant order** — which is also key order, and what the
     /// key lookup walks. Nothing may be inserted in the middle.
-    pub const ALL: [OverlayField; 7] = [
+    pub const ALL: [OverlayField; 10] = [
         OverlayField::Off,
         OverlayField::Height,
         OverlayField::Temperature,
@@ -122,6 +132,9 @@ impl OverlayField {
         OverlayField::Wetness,
         OverlayField::Snow,
         OverlayField::Cloud,
+        OverlayField::Iron,
+        OverlayField::Copper,
+        OverlayField::Salt,
     ];
 
     pub fn label(self) -> &'static str {
@@ -133,6 +146,23 @@ impl OverlayField {
             OverlayField::Wetness => "wetness",
             OverlayField::Snow => "snow",
             OverlayField::Cloud => "cloud",
+            OverlayField::Iron => "iron",
+            OverlayField::Copper => "copper",
+            OverlayField::Salt => "salt",
+        }
+    }
+
+    /// The resource this field is the prospectivity of, if it is one.
+    ///
+    /// The bridge between the two enums, and the only one — the overlay names a
+    /// resource, so a seventh resource with a recipe is a variant here and a row in
+    /// `deposit.rs`, with nothing in between to keep in step.
+    pub fn resource(self) -> Option<Resource> {
+        match self {
+            OverlayField::Iron => Some(Resource::Iron),
+            OverlayField::Copper => Some(Resource::Copper),
+            OverlayField::Salt => Some(Resource::Salt),
+            _ => None,
         }
     }
 
@@ -155,6 +185,11 @@ impl OverlayField {
             OverlayField::Wetness => (KeyCode::Digit4, KeyCode::Numpad4),
             OverlayField::Snow => (KeyCode::Digit5, KeyCode::Numpad5),
             OverlayField::Cloud => (KeyCode::Digit6, KeyCode::Numpad6),
+            OverlayField::Iron => (KeyCode::Digit7, KeyCode::Numpad7),
+            OverlayField::Copper => (KeyCode::Digit8, KeyCode::Numpad8),
+            // The last three the number row has, which is also why nothing else may be
+            // added without a second way of selecting a field.
+            OverlayField::Salt => (KeyCode::Digit9, KeyCode::Numpad9),
         }
     }
 
@@ -169,6 +204,9 @@ impl OverlayField {
             OverlayField::Wetness => "4",
             OverlayField::Snow => "5",
             OverlayField::Cloud => "6",
+            OverlayField::Iron => "7",
+            OverlayField::Copper => "8",
+            OverlayField::Salt => "9",
         }
     }
 
@@ -198,6 +236,11 @@ impl OverlayField {
     /// - **Saturating** — wetness, snow, cloud — are 0 or 1 over most of the map by
     ///   construction. They already use their whole range, and fitting one would make
     ///   a dry screen's numerical noise look like weather.
+    ///
+    /// A recipe score is **not** fitted, on exactly the saturating fields' argument:
+    /// it is zero over most of the world by construction — wrong kind, wrong biome —
+    /// so it already uses its whole range, and fitting one would make an empty
+    /// screen's numerical noise look like ore.
     fn fits_the_screen(self) -> bool {
         matches!(
             self,
@@ -207,8 +250,14 @@ impl OverlayField {
 
     /// Temperature is the one field with a meaningful zero, so it is the one drawn on
     /// the diverging ramp.
+    /// Which fields have a meaningful zero, and so get the diverging ramp.
+    ///
+    /// Temperature's is the freezing point. A recipe score's is `deposit_threshold` —
+    /// where ground stops being ordinary and starts being worth digging — which is
+    /// exactly the same shape of zero, and gives the same payoff: the line between
+    /// prospective and not is the neutral band, visible without reading a number.
     fn diverging(self) -> bool {
-        matches!(self, OverlayField::Temperature)
+        matches!(self, OverlayField::Temperature) || self.resource().is_some()
     }
 
     /// What this field's values run between, and how they are coloured.
@@ -223,6 +272,7 @@ impl OverlayField {
         self,
         config: &InspectConfig,
         ground: &GroundConfig,
+        plan: &WorldPlanConfig,
         seen: Option<(f32, f32)>,
     ) -> Option<OverlayRange> {
         if self == OverlayField::Off {
@@ -250,10 +300,13 @@ impl OverlayField {
         // **The freezing point, read from the module that freezes things** rather than
         // restated as zero — that is what puts the neutral band exactly on the snow
         // line rather than near it.
-        let mid = if self.diverging() {
-            ground.freezing_celsius
-        } else {
-            0.5 * (low + high)
+        // **Read from the module that decides it** rather than restated — that is what
+        // puts a neutral band exactly on the line rather than near it, for the snow
+        // line and for the line between ground worth digging and ground that is not.
+        let mid = match self {
+            OverlayField::Temperature => ground.freezing_celsius,
+            _ if self.resource().is_some() => plan.deposit_threshold,
+            _ => 0.5 * (low + high),
         };
 
         if self.diverging() {
@@ -425,6 +478,9 @@ pub struct FieldSources<'a> {
     pub climate: Option<&'a ClimateMaps>,
     pub cover: Option<&'a GroundCover>,
     pub sky: Option<&'a SkySampler>,
+    /// The prospectivity map, absent until its bake lands — which is what makes the
+    /// three resource fields draw nothing rather than a wrong colour before then.
+    pub prospect: Option<&'a ProspectMaps>,
     pub offset: TemperatureOffset,
 }
 
@@ -446,6 +502,12 @@ impl FieldSources<'_> {
                 let humidity = self.climate?.at(tile).humidity;
                 Some(self.sky?.cloud_at(tile, humidity))
             }
+            // The recipe score, read from the CPU's own copy of the baked map — a
+            // cross-check against what the shader sampled, exactly as every other
+            // field's observation is.
+            OverlayField::Iron | OverlayField::Copper | OverlayField::Salt => self
+                .prospect?
+                .score_at(tile, field.resource().expect("a resource field")),
         }
     }
 
@@ -558,6 +620,8 @@ fn sync_inspect_overlay(
     climate: Option<Res<ClimateMaps>>,
     cover: Option<Res<GroundCover>>,
     sky: Option<Res<SkySampler>>,
+    prospect: Option<Res<ProspectMaps>>,
+    plan: Res<WorldPlanConfig>,
     camera: Single<(&Camera, &Projection, &Transform), With<WorldCamera>>,
     mut active: ResMut<ActiveOverlay>,
     mut overlay: Single<&mut ScreenOverlay>,
@@ -571,6 +635,7 @@ fn sync_inspect_overlay(
             climate: climate.as_deref(),
             cover: cover.as_deref(),
             sky: sky.as_deref(),
+            prospect: prospect.as_deref(),
             offset: temperature_offset(&ground, &planet, &sun),
         };
         let seen = sources.spread(
@@ -579,7 +644,7 @@ fn sync_inspect_overlay(
             visible_half_extent(camera, projection) / TILE_DISPLAY_SIZE.as_vec2(),
             &config,
         );
-        field.range(&config, &ground, seen)
+        field.range(&config, &ground, &plan, seen)
     };
 
     *active = ActiveOverlay {
@@ -757,6 +822,11 @@ fn reading(value: f32, unit: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The plan's knobs, for the fields whose neutral band is `deposit_threshold`.
+    fn plan() -> WorldPlanConfig {
+        WorldPlanConfig::default()
+    }
+
     use super::*;
 
     /// Relative luminance, which is what "monotone in lightness" is measured on and
@@ -854,6 +924,7 @@ mod tests {
             .range(
                 &InspectConfig::default(),
                 &GroundConfig::default(),
+                &plan(),
                 Some((0.0, 1.0)),
             )
             .expect("height has a range");
@@ -875,7 +946,7 @@ mod tests {
         // A highland screenful: a third of the height range, nowhere near either end.
         let seen = (0.62, 0.79);
         let range = OverlayField::Height
-            .range(&config, &ground, Some(seen))
+            .range(&config, &ground, &plan(), Some(seen))
             .expect("height has a range");
 
         assert!(range.low <= seen.0 && seen.1 <= range.high);
@@ -904,7 +975,7 @@ mod tests {
             OverlayField::Cloud,
         ] {
             let range = field
-                .range(&config, &ground, Some((0.0, 0.004)))
+                .range(&config, &ground, &plan(), Some((0.0, 0.004)))
                 .expect("a range");
             assert_eq!((range.low, range.high), (0.0, 1.0), "{field:?} was fitted");
         }
@@ -916,7 +987,12 @@ mod tests {
     fn a_flat_screenful_does_not_have_its_noise_magnified() {
         let config = InspectConfig::default();
         let range = OverlayField::Height
-            .range(&config, &GroundConfig::default(), Some((0.5, 0.5001)))
+            .range(
+                &config,
+                &GroundConfig::default(),
+                &plan(),
+                Some((0.5, 0.5001)),
+            )
             .expect("height has a range");
 
         // To within an epsilon: the ends are rebuilt from a centre, so subtracting
@@ -936,6 +1012,7 @@ mod tests {
             .range(
                 &InspectConfig::default(),
                 &GroundConfig::default(),
+                &plan(),
                 Some((-14.0, -3.0)),
             )
             .expect("temperature has a range");
@@ -956,7 +1033,12 @@ mod tests {
             ..default()
         };
         let range = OverlayField::Temperature
-            .range(&InspectConfig::default(), &ground, Some((-5.0, 12.0)))
+            .range(
+                &InspectConfig::default(),
+                &ground,
+                &plan(),
+                Some((-5.0, 12.0)),
+            )
             .expect("temperature has a range");
         assert_eq!(range.mid, 4.0);
         assert!((range.normalize(4.0) - 0.5).abs() < 1.0e-6);
@@ -982,7 +1064,9 @@ mod tests {
     /// legend names — and nothing else in the crate would notice.
     #[test]
     fn the_key_a_field_is_on_is_its_own_discriminant() {
-        const DIGITS: [KeyCode; 7] = [
+        // The whole number row, which is also the ceiling: a field past 9 would need a
+        // second way of selecting one, and the enum has none.
+        const DIGITS: [KeyCode; 10] = [
             KeyCode::Digit0,
             KeyCode::Digit1,
             KeyCode::Digit2,
@@ -990,7 +1074,14 @@ mod tests {
             KeyCode::Digit4,
             KeyCode::Digit5,
             KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
         ];
+        assert!(
+            OverlayField::ALL.len() <= DIGITS.len(),
+            "there are more fields than there are digits to select them with"
+        );
         for (index, field) in OverlayField::ALL.into_iter().enumerate() {
             assert_eq!(
                 field as u32 as usize, index,
@@ -1016,16 +1107,25 @@ mod tests {
     fn off_is_the_absence_of_a_range() {
         let config = InspectConfig::default();
         let ground = GroundConfig::default();
-        assert!(OverlayField::Off.range(&config, &ground, None).is_none());
+        assert!(
+            OverlayField::Off
+                .range(&config, &ground, &plan(), None)
+                .is_none()
+        );
         for field in OverlayField::ALL
             .iter()
             .filter(|f| **f != OverlayField::Off)
         {
             // And every other field has one with or without a screenful to fit to,
             // so an unbaked climate is a wrong-looking map rather than a missing one.
-            assert!(field.range(&config, &ground, None).is_some(), "{field:?}");
             assert!(
-                field.range(&config, &ground, Some((0.2, 0.4))).is_some(),
+                field.range(&config, &ground, &plan(), None).is_some(),
+                "{field:?}"
+            );
+            assert!(
+                field
+                    .range(&config, &ground, &plan(), Some((0.2, 0.4)))
+                    .is_some(),
                 "{field:?}"
             );
         }

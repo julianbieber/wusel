@@ -22,7 +22,9 @@ use bevy::{
 use crate::{
     gameplay::{
         city::{City, CityMap, PlannedCity, plan_cities},
+        deposit::{Deposit, DepositMap, chunk_of_deposit, plan_deposits},
         drainage::{DrainagePlan, plan_drainage},
+        prospect::start_prospect_bake,
         river::{RiverPlan, plan_rivers},
         road::{RoadNetwork, RoutedRoad, choose_pairs, route_road},
         terrain::TerrainConfig,
@@ -280,6 +282,53 @@ pub struct WorldPlanConfig {
     /// How many chunks of dry valley are stamped per frame, on the same terms as
     /// the rivers'.
     pub drain_chunks_stamped_per_frame: u32,
+    /// The world is cut into squares this wide, each proposing at most one seam.
+    ///
+    /// With `deposit_threshold` this is the lever on how many mines the world has,
+    /// and the yardstick is unlike every other density here: a seam is not measured
+    /// as a share of the *map* but as a share of the *cities*, because a seam nobody
+    /// can reach is one the simulation never sees.
+    ///
+    /// **The two populations are anti-correlated, and that is the whole difficulty.**
+    /// A city sits on habitable ground and a seam sits on bare, high or dry ground —
+    /// `Mountain`, `Rock`, `Gravel`, `Sand`, `Marsh`, none of them habitable — so a
+    /// city reaches a seam far less often than a uniform scatter of the same density
+    /// would suggest. At `estate_reach_tiles` 56 a city's disc is 9852 tiles of a
+    /// 16.7 M-tile world and 520 seams should give one to a quarter of them; the
+    /// measured figure is 5%. Reading the density off the map area is the mistake
+    /// this note exists to prevent.
+    ///
+    /// Measured on the default world, as the share of cities holding no seam, exactly
+    /// one resource, and two or more (`the_default_config_lays_seams_of_every_resource`):
+    ///
+    /// ```text
+    ///                reach 56          reach 80          reach 112
+    ///   cell  seams   0    1   2+     0    1   2+      0    1   2+
+    ///    128    110  100%  0%   0%   96%   3%   0%    91%   7%   1%
+    ///     64    520   94%  5%   0%   89%  10%   0%    78%  20%   1%
+    ///     48    879   93%  4%   2%   82%  15%   2%    72%  20%   6%
+    ///     32   2111   90%  4%   5%   77%  11%  10%    60%  23%  15%
+    ///     24   3591   83% 13%   3%   75%  15%   9%    58%  28%  13%
+    /// ```
+    ///
+    /// 64 against a reach of 112 is the default, and the column that matters is the
+    /// middle one rather than the first: **one city in five works a seam, and nearly
+    /// every one of those works a single kind.** Going denser buys more mining cities
+    /// and spends the differentiation — at cell 32 fifteen percent of cities hold two
+    /// resources or more, and a world where the big cities all have everything is the
+    /// homogenisation this feature exists to undo.
+    pub deposit_cell_tiles: u32,
+    /// How far across a cell a seam's candidate may fall. Below `deposit_cell_tiles`
+    /// it insets the candidate, so two neighbouring seams are at least
+    /// `deposit_cell_tiles - deposit_jitter_tiles` apart and the layout needs no
+    /// spacing pass of its own.
+    pub deposit_jitter_tiles: u32,
+    /// How well a candidate's ground must suit a recipe before there is a seam
+    /// there. What it clears this by is the seam's `richness`, so it is also the
+    /// zero of that scale — and it is what
+    /// [`crate::gameplay::inspect`]'s prospectivity overlay puts its neutral band
+    /// on, read from here rather than restated.
+    pub deposit_threshold: f32,
 }
 
 impl Default for WorldPlanConfig {
@@ -314,6 +363,9 @@ impl Default for WorldPlanConfig {
             drain_max_width: 2,
             drain_max_steps: 512,
             drain_chunks_stamped_per_frame: 64,
+            deposit_cell_tiles: 64,
+            deposit_jitter_tiles: 48,
+            deposit_threshold: 0.5,
         }
     }
 }
@@ -333,6 +385,14 @@ pub enum WorldPlan {
     /// a wadi through a desert lays down settleable ground, and a city stage that
     /// had already run would never see it.
     Drainage(DrainageStamping),
+    /// The seams, between the drainage and the cities. After the drainage, because a
+    /// wadi changes the ground a salt pan is read off; before the cities, so that a
+    /// later change can let a settlement score read what is under the site. Nothing
+    /// does yet, and siting is unchanged by this stage.
+    ///
+    /// It stamps no tile, so unlike the two stages before it there is nothing to
+    /// spread across frames — the task lands and every seam is spawned at once.
+    Deposits(Task<Vec<Deposit>>),
     Cities(Task<Vec<PlannedCity>>),
     Roads(RoadPlanning),
     Done,
@@ -406,6 +466,7 @@ impl Plugin for WorldPlanPlugin {
                 start_river_plan,
                 apply_river_plan,
                 apply_drainage_plan,
+                apply_deposit_plan,
                 apply_city_plan,
                 drive_road_plan,
             )
@@ -418,12 +479,18 @@ impl Plugin for WorldPlanPlugin {
 fn start_plan(mut commands: Commands) {
     commands.insert_resource(WorldPlan::WaitingForTerrain);
     commands.insert_resource(CityMap::default());
+    commands.insert_resource(DepositMap::default());
     commands.insert_resource(RoadNetwork::default());
 }
 
+/// The seams themselves go with the screen, because every deposit entity carries
+/// `DespawnOnExit(Screen::Gameplay)` — the crate's only lifecycle mechanism. All
+/// that is dropped here is the index into them, on the same transition, so a seam
+/// can never outlive the world it was read off.
 fn tear_down_plan(mut commands: Commands) {
     commands.remove_resource::<WorldPlan>();
     commands.remove_resource::<CityMap>();
+    commands.remove_resource::<DepositMap>();
     commands.remove_resource::<RoadNetwork>();
 }
 
@@ -508,14 +575,15 @@ fn apply_river_plan(
     });
 }
 
-/// Stamps the dry valleys a batch of chunks at a time, and opens the city stage
+/// Stamps the dry valleys a batch of chunks at a time, and opens the deposit stage
 /// once the last of them is down.
 ///
-/// The city stage starts from here for the reason it used to start from the river
-/// stage: the snapshot it plans against has to be the one *with* the valleys in it.
-/// This stage moves tiles across the habitable line in both directions — a wadi
-/// turns desert `Sand` into settleable `Scrub` — so a city plan taken before it
-/// would be planning a different world from the one on screen.
+/// The next stage starts from here for the reason the city stage used to: the
+/// snapshot it reads has to be the one *with* the valleys in it. This stage moves
+/// tiles across the habitable line in both directions — a wadi turns desert `Sand`
+/// into settleable `Scrub` — so a layout taken before it would be reading a
+/// different world from the one on screen. A salt pan is read off exactly the ground
+/// a wadi changes, which is why the seams come after the valleys and not before.
 fn apply_drainage_plan(
     mut plan: ResMut<WorldPlan>,
     mut map: ResMut<WorldMap>,
@@ -550,6 +618,55 @@ fn apply_drainage_plan(
     let world = map
         .snapshot()
         .expect("the world was complete when the plan started");
+    let terrain = terrain.clone();
+    let config = config.clone();
+    let task =
+        AsyncComputeTaskPool::get().spawn(async move { plan_deposits(&terrain, &config, &world) });
+    *plan = WorldPlan::Deposits(task);
+}
+
+/// Spawns a seam per site, indexes it, and opens the city stage.
+///
+/// Nothing is stamped here, so unlike every stage above there is no edit list and no
+/// chunk to refresh — a deposit is a record, and the map it was read off is
+/// untouched. The city stage therefore plans against exactly the world the drainage
+/// stage left behind.
+fn apply_deposit_plan(
+    mut commands: Commands,
+    mut plan: ResMut<WorldPlan>,
+    mut deposits: ResMut<DepositMap>,
+    map: Res<WorldMap>,
+    terrain: Res<TerrainConfig>,
+    config: Res<WorldPlanConfig>,
+) {
+    let WorldPlan::Deposits(task) = &mut *plan else {
+        return;
+    };
+    let Some(planned) = block_on(poll_once(task)) else {
+        return;
+    };
+
+    // In cell order, which is the order `plan_deposits` produced them in, so the
+    // index rows are one fixed order across runs. The `Entity` values are not, and
+    // nothing may key on them.
+    for deposit in &planned {
+        let entity = commands
+            .spawn((*deposit, DespawnOnExit(Screen::Gameplay)))
+            .id();
+        deposits.insert(chunk_of_deposit(deposit), entity);
+    }
+
+    let world = map
+        .snapshot()
+        .expect("the world was complete when the plan started");
+
+    // The prospectivity map is baked from **this** snapshot and this seam list, which
+    // is the whole reason the bake is opened from here rather than by a system of its
+    // own: the map and the seams on it can never disagree about the world they read.
+    // It does not gate the plan — the city stage opens below whatever the bake is
+    // doing.
+    start_prospect_bake(&mut commands, &terrain, world.clone(), planned);
+
     let terrain = terrain.clone();
     let config = config.clone();
     let task =

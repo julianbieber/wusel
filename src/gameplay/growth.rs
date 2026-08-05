@@ -28,6 +28,10 @@ use bevy::{platform::collections::HashSet, prelude::*};
 use crate::{
     gameplay::{
         city::{City, CityMap, CitySize, MAX_CITY_RADIUS},
+        deposit::{Deposit, DepositMap},
+        industry::{
+            CityIndustry, EstateOffsets, IndustryConfig, Labour, seed_industry, step_industry,
+        },
         plan::WorldPlan,
         terrain::{TerrainConfig, TerrainKind, TerrainSampler},
         weather::SkySampler,
@@ -291,6 +295,17 @@ impl CityGrowth {
         self.claims.len() - self.town_claims
     }
 
+    /// The harvest with the weather *and* the labour taken out: what this city's
+    /// fields are worth if every one of them is worked.
+    ///
+    /// Read by [`crate::gameplay::industry`], which is the module that decides how
+    /// many of them are. Exposed rather than recomputed there, because two answers to
+    /// "what is this land worth" is exactly what the incremental sum exists to
+    /// prevent.
+    pub fn static_yield(&self) -> f32 {
+        self.static_yield
+    }
+
     /// Tiles the city has *built* on, as opposed to farms. Reported rather than
     /// derived from `City::radius`, which is the area rounded into a circle: a city
     /// clipped by a coast holds fewer tiles than its radius suggests, and the count
@@ -364,9 +379,13 @@ fn seed_cities(
     mut map: ResMut<WorldMap>,
     mut dirty: ResMut<DirtyChunks>,
     mut cities: ResMut<CityMap>,
+    mut seams: Query<&mut Deposit>,
     config: Res<GrowthConfig>,
+    industry_config: Res<IndustryConfig>,
     fields: Res<GrowthFields>,
     offsets: Res<ClaimOffsets>,
+    estate: Res<EstateOffsets>,
+    deposits: Res<DepositMap>,
     plan: Res<WorldPlan>,
     unseeded: Query<(Entity, &City), Without<CityGrowth>>,
 ) {
@@ -398,7 +417,33 @@ fn seed_cities(
             &mut edits,
         );
         map.apply_edits(&edits, &mut dirty);
-        commands.entity(entity).insert(growth);
+
+        // In the same id order and in the same breath, so which of two neighbours
+        // takes a contested seam is one fixed answer — and so the seam's `owner` and
+        // the city's list are written from one act rather than derived from each
+        // other later.
+        let industry = seed_industry(
+            &industry_config,
+            &map,
+            estate.offsets(),
+            &city,
+            &growth,
+            &deposits,
+            |seam| {
+                seams
+                    .get(seam)
+                    .ok()
+                    .filter(|deposit| deposit.owner.is_none())
+                    .map(|deposit| deposit.tile)
+            },
+        );
+        for &seam in industry.seam_entities() {
+            if let Ok(mut deposit) = seams.get_mut(seam) {
+                deposit.owner = Some(entity);
+            }
+        }
+
+        commands.entity(entity).insert((growth, industry));
     }
 }
 
@@ -466,6 +511,9 @@ fn seed_city(
         entity,
         city,
         want,
+        // Founding predates the industry: the city has not been told who works what
+        // yet, so the ring it is founded with is the one gh-6 laid.
+        1.0,
         usize::MAX,
         map,
         sampler,
@@ -485,10 +533,13 @@ fn simulate_cities(
     mut clock: ResMut<GrowthClock>,
     mut cities: ResMut<CityMap>,
     mut order: Local<Vec<Entity>>,
-    mut query: Query<(Entity, &mut City, &mut CityGrowth)>,
+    mut query: Query<(Entity, &mut City, &mut CityGrowth, &mut CityIndustry)>,
+    seams: Query<&Deposit>,
     config: Res<GrowthConfig>,
+    industry_config: Res<IndustryConfig>,
     fields: Res<GrowthFields>,
     offsets: Res<ClaimOffsets>,
+    estate: Res<EstateOffsets>,
     sky: Option<Res<SkySampler>>,
     plan: Res<WorldPlan>,
     time: Res<Time>,
@@ -513,7 +564,7 @@ fn simulate_cities(
 
     if order.len() != query.iter().len() {
         let mut ordered: Vec<(u32, Entity)> =
-            query.iter().map(|(e, city, _)| (city.id, e)).collect();
+            query.iter().map(|(e, city, _, _)| (city.id, e)).collect();
         ordered.sort_unstable();
         *order = ordered.into_iter().map(|(_, e)| e).collect();
     }
@@ -524,7 +575,7 @@ fn simulate_cities(
         let sweep = (clock.step as usize).checked_rem(order.len()).unwrap_or(0);
 
         for (index, &entity) in order.iter().enumerate() {
-            let Ok((_, mut city, mut growth)) = query.get_mut(entity) else {
+            let Ok((_, mut city, mut growth, mut industry)) = query.get_mut(entity) else {
                 continue;
             };
 
@@ -532,6 +583,35 @@ fn simulate_cities(
             let rain = sky
                 .as_ref()
                 .map_or(0.0, |sky| sky.rain_at(centre, growth.humidity));
+            let swept = index == sweep;
+
+            // Hoisted out of `step_city` so that the industry step below reads the
+            // *same* `static_yield` the growth step will. It still runs before
+            // anything is stamped, which is the ordering that made it load-bearing.
+            if swept {
+                growth.resum(&map);
+            }
+
+            // One loop, one clock: the industry step, then the growth step. They have
+            // to interleave per step rather than per frame, which is why this is a
+            // call rather than a system of its own.
+            let labour = step_industry(
+                &industry_config,
+                &config,
+                &map,
+                estate.offsets(),
+                Sky { rain },
+                swept,
+                &city,
+                &growth,
+                &mut industry,
+                |seam| {
+                    seams
+                        .get(seam)
+                        .ok()
+                        .map(|deposit| (deposit.resource, deposit.richness))
+                },
+            );
 
             edits.clear();
             step_city(
@@ -540,7 +620,8 @@ fn simulate_cities(
                 &fields.0,
                 &offsets.0,
                 Sky { rain },
-                index == sweep,
+                labour,
+                swept,
                 entity,
                 &mut city,
                 &mut growth,
@@ -559,9 +640,17 @@ fn simulate_cities(
 
 /// One city, one step: harvest, grow, resize the town, resize the fields.
 ///
-/// Pure but for the map it reads and the edits it appends, and the sky arrives as an
-/// argument — which is what makes every property of the simulation testable with no
-/// app and no GPU.
+/// Pure but for the map it reads and the edits it appends. The sky and the [`Labour`]
+/// both arrive as arguments — which is what makes every property of the simulation
+/// testable with no app and no GPU. `Labour::default()` is gh-6's loop exactly.
+///
+/// **`resum` is the caller's now, not this function's.** The industry step reads
+/// `static_yield` to size its harvest, so it has to see the same number this does;
+/// with the sweep in here the two would disagree on exactly the steps where the
+/// ledger changed. The ordering that made it load-bearing is unchanged — it still
+/// runs before anything is stamped, because this step's edits do not reach the map
+/// until the caller applies them and a sweep after them would see every converted
+/// tile as stale and drop it.
 #[allow(clippy::too_many_arguments)]
 fn step_city(
     config: &GrowthConfig,
@@ -569,6 +658,7 @@ fn step_city(
     sampler: &TerrainSampler,
     offsets: &[IVec2],
     sky: Sky,
+    labour: Labour,
     swept: bool,
     entity: Entity,
     city: &mut City,
@@ -576,23 +666,42 @@ fn step_city(
     cities: &mut CityMap,
     edits: &mut Vec<TileEdit>,
 ) {
-    // Before anything is stamped, and that ordering is load-bearing: this step's
-    // edits do not reach the map until the caller applies them, so a sweep run at
-    // the end would see every tile it had just converted as stale and drop it.
-    if swept {
-        growth.resum(map);
-    }
-
-    growth.food = growth.static_yield * harvest_multiplier(config, sky);
+    // Reported as itself, so the panel's Harvest row keeps meaning what it meant: the
+    // food off the fields, with the hands that worked them and the sky over them.
+    growth.food = growth.static_yield * labour.farmer_share * harvest_multiplier(config, sky);
     growth.demand = growth.population * config.food_per_person;
-    growth.capacity = growth.food / config.food_per_person.max(f32::EPSILON);
-    growth.population = grow(config, growth.population, growth.capacity);
+    // The granary's release enters here and nowhere else. It is capped at what demand
+    // is short of the harvest, so a full store can only ever stop the ceiling falling
+    // — it can never push K above the land.
+    growth.capacity =
+        (growth.food + labour.granary_release) / config.food_per_person.max(f32::EPSILON);
+    growth.population = grow(
+        config,
+        growth.population,
+        growth.capacity,
+        rate(config, labour),
+    );
 
     let budget = config.claims_per_step.max(1) as usize;
-    resize_town(config, growth, city, map, sampler, budget, edits);
+    resize_town(
+        config,
+        growth,
+        city,
+        map,
+        sampler,
+        budget,
+        labour.build_allowance,
+        edits,
+    );
 
+    // The fields are sized against the rain-free, labour-limited yield. **Neither the
+    // rain nor the granary is in this comparison**, and for the same reason: a city
+    // that released a ring because its store was full would starve the step the store
+    // emptied, and the round trip is lossy twice over — a neighbour can take the
+    // freed tile, and re-claiming re-reads the yield from whatever it was restored to.
+    let workable = growth.static_yield * labour.farmer_share;
     let want = growth.wanted_yield(config);
-    if growth.static_yield < want {
+    if workable < want {
         // A city that has run out of table and still wants land gets one rescan,
         // and only when its turn comes round: the cursor never goes back on its own,
         // so a tile skipped because a neighbour held it would otherwise be lost for
@@ -601,11 +710,44 @@ fn step_city(
             growth.frontier = 0;
         }
         claim_towards(
-            growth, entity, city, want, budget, map, sampler, offsets, config, cities, edits,
+            growth,
+            entity,
+            city,
+            want,
+            labour.farmer_share,
+            budget,
+            map,
+            sampler,
+            offsets,
+            config,
+            cities,
+            edits,
         );
-    } else if growth.static_yield > want * (1.0 + config.farm_hysteresis) {
-        release_towards(growth, want, budget, map, sampler, edits);
+    } else if workable > want * (1.0 + config.farm_hysteresis) {
+        release_towards(
+            growth,
+            want,
+            labour.farmer_share,
+            budget,
+            map,
+            sampler,
+            edits,
+        );
     }
+}
+
+/// The logistic's rate for this step: the base rate scaled by how well the city is
+/// supplied.
+///
+/// The *scale* rather than the happiness arrives in the [`Labour`], because the knobs
+/// that turn one into the other — the swing, the neutral point and the floor — belong
+/// to `IndustryConfig`, and this module has no business knowing what a basket is. At
+/// a scale of 1 this is `growth_rate` exactly, which is gh-6.
+///
+/// It may go negative, which is the point — see [`grow`] for what happens then, which
+/// is deliberately *not* a negative logistic rate.
+fn rate(config: &GrowthConfig, labour: Labour) -> f32 {
+    config.growth_rate * labour.growth_scale
 }
 
 /// What this step does to a harvest.
@@ -613,7 +755,7 @@ fn step_city(
 /// Rain, and nothing else: each field's climate is already baked into its own
 /// `base_yield` at the moment it was claimed, so `static_yield` *is* the steady
 /// harvest and this only ever adds to it.
-fn harvest_multiplier(config: &GrowthConfig, sky: Sky) -> f32 {
+pub fn harvest_multiplier(config: &GrowthConfig, sky: Sky) -> f32 {
     1.0 + config.yield_rain_weight * sky.rain
 }
 
@@ -628,7 +770,7 @@ fn fertility_floor(config: &GrowthConfig) -> f32 {
         * (config.yield_base_weight + config.yield_humidity_weight)
 }
 
-/// The logistic step, in closed form.
+/// The logistic step, in closed form, plus the bleed an unhappy city suffers.
 ///
 /// Closed form rather than `p + r·p·(1 - p/K)` for two reasons. The Euler form
 /// oscillates and then diverges once the rate is large, which makes `growth_rate` and
@@ -636,11 +778,22 @@ fn fertility_floor(config: &GrowthConfig) -> f32 {
 /// every city on its first step** — inf, then NaN, and a population of NaN gives a
 /// radius of 0 and releases the whole city. Here K is floored instead, so a city with
 /// no fields decays smoothly to the minimum rather than falling off a cliff.
-fn grow(config: &GrowthConfig, population: f32, capacity: f32) -> f32 {
+///
+/// **The unhappiness is a separate decay and not a negative rate**, and that is a
+/// correction to how gh-24's spec described it. Feeding a negative `r` to the closed
+/// form does not model decline: for `p > K` the logistic's own derivative
+/// `r·p·(1 - p/K)` is a negative times a negative, so an unhappy city *grows* — and
+/// past `p = K/(1 - e^r)` the denominator goes through zero as well. Flooring the
+/// rate fixes neither. So the logistic runs at the non-negative part of the rate and
+/// the negative part is applied as an exponential bleed, which is monotone in the
+/// rate, total for every population, and exactly gh-6's loop whenever the rate is
+/// positive.
+fn grow(config: &GrowthConfig, population: f32, capacity: f32, rate: f32) -> f32 {
     let carrying = capacity.max(config.min_population);
-    let rate = config.growth_rate.exp();
-    let next = carrying * population * rate / (carrying + population * (rate - 1.0));
-    next.max(config.min_population)
+    let growth = rate.max(0.0).exp();
+    let next = carrying * population * growth / (carrying + population * (growth - 1.0));
+    // An unhappy city bleeds people while its fields still feed them.
+    (next * rate.min(0.0).exp()).max(config.min_population)
 }
 
 impl CityGrowth {
@@ -720,12 +873,54 @@ impl CityGrowth {
     }
 }
 
+#[cfg(test)]
+impl CityGrowth {
+    /// A ledger of the given shape and nothing else.
+    ///
+    /// [`crate::gameplay::industry`] reads exactly four numbers off a city —
+    /// population, static yield, field count and town count — so this constructor is
+    /// the whole of the coupling between the two modules, written down. If it ever
+    /// needs a fifth argument, that is the signal that the industry has started
+    /// reading the ledger rather than its summary.
+    pub(crate) fn for_test(population: f32, static_yield: f32, fields: usize, town: usize) -> Self {
+        Self {
+            population,
+            food: 0.0,
+            demand: 0.0,
+            capacity: 0.0,
+            humidity: 0.0,
+            static_yield,
+            frontier: 0,
+            claims: vec![
+                Claim {
+                    tile: IVec2::ZERO,
+                    base_yield: 0.0,
+                };
+                town + fields
+            ],
+            town_claims: town,
+            chunks: HashSet::new(),
+        }
+    }
+}
+
 /// Moves the town's edge to where the population puts it.
 ///
 /// The town is driven by *tile count* rather than by radius, which is what keeps a
 /// clipped city honest: a coastal town whose disc is half sea holds half as many
 /// people, and its radius is then reported from the tiles it actually has rather than
 /// from a circle it never filled.
+/// How many tiles of town a population of this size wants.
+///
+/// Pulled out and made public because [`crate::gameplay::industry`] has to spend on
+/// the tiles this step is about to add *before* they are added — a city builds out of
+/// its stores, so the decision is taken where the stores are. Two answers to "how big
+/// should this town be" would let a city pay for tiles it never lays.
+pub fn town_target(config: &GrowthConfig, population: f32) -> usize {
+    let cap = (std::f32::consts::PI * (MAX_CITY_RADIUS * MAX_CITY_RADIUS) as f32) as usize;
+    ((population / config.town_people_per_tile.max(f32::EPSILON)).round() as usize).clamp(1, cap)
+}
+
 fn resize_town(
     config: &GrowthConfig,
     growth: &mut CityGrowth,
@@ -733,19 +928,25 @@ fn resize_town(
     map: &WorldMap,
     sampler: &TerrainSampler,
     budget: usize,
+    // `allowance` is what the building spend paid for. Growing *inward* is free — a
+    // city that gives a town tile back is not building anything — so it bounds only
+    // the outward move.
+    allowance: usize,
     edits: &mut Vec<TileEdit>,
 ) {
-    let cap = (std::f32::consts::PI * (MAX_CITY_RADIUS * MAX_CITY_RADIUS) as f32) as usize;
-    let target = ((growth.population / config.town_people_per_tile.max(f32::EPSILON)).round()
-        as usize)
-        .clamp(1, cap);
+    let target = town_target(config, growth.population);
 
     let mut moved = 0;
+    let mut built = 0;
     // Outward: the nearest field becomes town. It leaves the ledger's field half, so
     // its yield stops counting — which is the cost of building, and the reason
     // `town_people_per_tile` has to exceed what a field feeds.
-    while growth.town_claims < target && growth.town_claims < growth.claims.len() && moved < budget
+    while growth.town_claims < target
+        && growth.town_claims < growth.claims.len()
+        && moved < budget
+        && built < allowance
     {
+        built += 1;
         let claim = growth.claims[growth.town_claims];
         growth.static_yield -= claim.base_yield;
         growth.town_claims += 1;
@@ -793,6 +994,9 @@ fn claim_towards(
     entity: Entity,
     city: &City,
     want: f32,
+    // The share of the fields the city has the hands to work. A city that has sent
+    // its people to a seam is sized against what those hands can actually bring in.
+    share: f32,
     budget: usize,
     map: &WorldMap,
     sampler: &TerrainSampler,
@@ -803,7 +1007,7 @@ fn claim_towards(
 ) {
     let floor = fertility_floor(config);
     let mut taken = 0;
-    while growth.static_yield < want && taken < budget && growth.frontier < offsets.len() {
+    while growth.static_yield * share < want && taken < budget && growth.frontier < offsets.len() {
         let tile = city.centre + offsets[growth.frontier];
         growth.frontier += 1;
 
@@ -841,6 +1045,7 @@ fn claim_towards(
 fn release_towards(
     growth: &mut CityGrowth,
     want: f32,
+    share: f32,
     budget: usize,
     map: &WorldMap,
     sampler: &TerrainSampler,
@@ -849,7 +1054,7 @@ fn release_towards(
     let mut given = 0;
     while growth.claims.len() > growth.town_claims
         && given < budget
-        && growth.static_yield - growth.claims[growth.claims.len() - 1].base_yield >= want
+        && (growth.static_yield - growth.claims[growth.claims.len() - 1].base_yield) * share >= want
     {
         let claim = growth.claims.pop().expect("checked non-empty");
         growth.static_yield -= claim.base_yield;
@@ -950,6 +1155,10 @@ mod tests {
         sampler: TerrainSampler,
         city: City,
         growth: CityGrowth,
+        /// Injected, exactly as the sky is, and defaulting to "no industry at all" —
+        /// which is gh-6's loop. A test that wants to see what sending hands to a
+        /// seam costs sets it and steps.
+        labour: Labour,
     }
 
     impl Sim {
@@ -1016,17 +1225,22 @@ mod tests {
                 sampler,
                 city,
                 growth,
+                labour: Labour::default(),
             }
         }
 
         fn step(&mut self, rain: f32) -> Vec<TileEdit> {
             let mut edits = Vec::new();
+            // The sweep is what `simulate_cities` hoisted out, so the harness has to
+            // do it too — and in the same place, before anything is stamped.
+            self.growth.resum(&self.map);
             step_city(
                 &self.config,
                 &self.map,
                 &self.sampler,
                 &self.offsets,
                 Sky { rain },
+                self.labour,
                 true,
                 Entity::PLACEHOLDER,
                 &mut self.city,
@@ -1053,7 +1267,7 @@ mod tests {
         let config = GrowthConfig::default();
         let mut population = 5000.0;
         for _ in 0..200 {
-            population = grow(&config, population, 0.0);
+            population = grow(&config, population, 0.0, config.growth_rate);
             assert!(population.is_finite(), "population went to {population}");
             assert!(population >= config.min_population);
         }
@@ -1073,12 +1287,176 @@ mod tests {
         let mut from_below = config.min_population;
         let mut from_above = capacity * 3.0;
         for _ in 0..4000 {
-            from_below = grow(&config, from_below, capacity);
-            from_above = grow(&config, from_above, capacity);
+            from_below = grow(&config, from_below, capacity, config.growth_rate);
+            from_above = grow(&config, from_above, capacity, config.growth_rate);
         }
 
         assert!((from_below - capacity).abs() < 1.0, "{from_below}");
         assert!((from_above - capacity).abs() < 1.0, "{from_above}");
+    }
+
+    /// An unhappy city loses people while its fields still feed them — and that is
+    /// what a negative rate has to mean.
+    ///
+    /// The obvious implementation is a negative `r` in the logistic, and it is wrong
+    /// in two ways at once. `r·p·(1 - p/K)` above K is a negative times a negative, so
+    /// an unhappy city over its capacity *grows*; and past `p = K/(1 - e^r)` the
+    /// closed form's denominator goes through zero, which flooring the rate does not
+    /// fix. Hence the bleed is applied outside the logistic, and this is the test that
+    /// says so — it runs the case a naive floor would have blown up on.
+    #[test]
+    fn an_unhappy_city_bleeds_people_whatever_its_capacity_is() {
+        let config = GrowthConfig::default();
+
+        for capacity in [0.0f32, 100.0, 5000.0] {
+            // Deliberately far above capacity, which is exactly where a negative
+            // logistic rate misbehaves.
+            let mut population = 20_000.0;
+            for _ in 0..200 {
+                let next = grow(&config, population, capacity, -0.02);
+                assert!(next.is_finite(), "population went to {next}");
+                assert!(
+                    next <= population + 1e-3,
+                    "an unhappy city grew from {population} to {next} at capacity {capacity}"
+                );
+                population = next;
+            }
+            assert!(
+                population < 20_000.0,
+                "the city never lost anyone at capacity {capacity}"
+            );
+        }
+    }
+
+    /// The whole domain, not just the shipped defaults: no rate, population or
+    /// capacity may produce a NaN, an infinity or a negative population.
+    #[test]
+    fn no_rate_takes_the_population_to_nan_or_through_zero() {
+        let config = GrowthConfig::default();
+
+        for rate in [-1.0f32, -0.2, -0.02, 0.0, 0.02, 0.5, 2.0] {
+            for capacity in [0.0f32, 1.0, 20.0, 5000.0, 1e6] {
+                for start in [0.0f32, config.min_population, 1000.0, 1e6] {
+                    let mut population = start;
+                    for _ in 0..500 {
+                        population = grow(&config, population, capacity, rate);
+                        assert!(
+                            population.is_finite() && population >= config.min_population,
+                            "rate {rate}, capacity {capacity}, from {start}: {population}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The acceptance criterion gh-24 turns on, stated as an invariant: **food still
+    /// sizes the population**. Nothing that is not food enters the logistic's K, so a
+    /// city handed a full warehouse of everything else has exactly the capacity its
+    /// fields give it — happiness is on the rate alone.
+    #[test]
+    fn nothing_but_food_enters_the_capacity() {
+        let mut plain = Sim::found(5, TerrainKind::Grass);
+        let mut happy = Sim::found(5, TerrainKind::Grass);
+        happy.labour = Labour {
+            growth_scale: 3.0,
+            ..Labour::default()
+        };
+
+        plain.step(0.0);
+        happy.step(0.0);
+
+        assert_eq!(
+            plain.growth.capacity, happy.growth.capacity,
+            "happiness moved the capacity"
+        );
+        assert!(
+            happy.growth.population > plain.growth.population,
+            "happiness did not move the rate either, so it does nothing at all"
+        );
+    }
+
+    /// The granary can only ever stop the ceiling *falling*: what it releases enters
+    /// the capacity, and a city living off its stores is one whose Supports row
+    /// exceeds its Harvest row.
+    #[test]
+    fn the_granarys_release_holds_the_ceiling_up() {
+        let mut fed = Sim::found(5, TerrainKind::Grass);
+        let mut living_off_stores = Sim::found(5, TerrainKind::Grass);
+        living_off_stores.labour = Labour {
+            granary_release: 500.0,
+            ..Labour::default()
+        };
+
+        fed.step(0.0);
+        living_off_stores.step(0.0);
+
+        assert_eq!(
+            fed.growth.food, living_off_stores.growth.food,
+            "the harvest moved"
+        );
+        assert!(
+            living_off_stores.growth.capacity > fed.growth.capacity,
+            "the release did not reach the capacity"
+        );
+    }
+
+    /// A city that has sent its people elsewhere brings in less food off the same
+    /// fields — which is what makes a seam cost something.
+    #[test]
+    fn fewer_farmers_means_a_smaller_harvest_off_the_same_land() {
+        let mut whole = Sim::found(5, TerrainKind::Grass);
+        let mut halved = Sim::found(5, TerrainKind::Grass);
+        halved.labour = Labour {
+            farmer_share: 0.5,
+            ..Labour::default()
+        };
+
+        whole.step(0.0);
+        halved.step(0.0);
+
+        assert!(
+            (halved.growth.food - whole.growth.food * 0.5).abs() < 1e-2,
+            "{} against half of {}",
+            halved.growth.food,
+            whole.growth.food
+        );
+
+        whole.run(400, 0.0);
+        halved.run(400, 0.0);
+        assert!(
+            halved.growth.population < whole.growth.population,
+            "sending half the hands away cost the city nothing: {} against {}",
+            halved.growth.population,
+            whole.growth.population
+        );
+    }
+
+    /// A city that cannot afford stone does not stop growing in *people*; it stops
+    /// building, and grows crowded instead.
+    #[test]
+    fn a_city_that_cannot_pay_for_stone_stops_building_not_growing() {
+        let mut building = Sim::found(4, TerrainKind::Grass);
+        let mut broke = Sim::found(4, TerrainKind::Grass);
+        broke.labour = Labour {
+            build_allowance: 0,
+            ..Labour::default()
+        };
+
+        building.run(300, 0.0);
+        broke.run(300, 0.0);
+
+        assert!(
+            broke.growth.town() < building.growth.town(),
+            "the allowance did not stop the town growing: {} against {}",
+            broke.growth.town(),
+            building.growth.town()
+        );
+        // But the people are still there — crowded rather than absent.
+        assert!(
+            broke.growth.population > broke.config.min_population * 2.0,
+            "the city emptied out instead of growing crowded"
+        );
     }
 
     /// A town tile is built *on* a field. If it housed fewer people than that field
@@ -1291,12 +1669,14 @@ mod tests {
         for _ in 0..400 {
             for (city, growth) in state.iter_mut() {
                 let mut edits = Vec::new();
+                growth.resum(&map);
                 step_city(
                     &config,
                     &map,
                     &sampler,
                     &offsets,
                     Sky { rain: 0.0 },
+                    Labour::default(),
                     true,
                     Entity::PLACEHOLDER,
                     city,
@@ -1385,11 +1765,16 @@ mod tests {
 mod measurements {
     use super::*;
     use crate::gameplay::{
+        biome::Biome,
         city::plan_cities,
+        deposit::{Resource, plan_deposits},
+        drainage::plan_drainage,
+        industry::EstateOffsets,
         plan::WorldPlanConfig,
         river::plan_rivers,
-        world::{WORLD_TILES, WorldSnapshot},
+        world::{WORLD_TILES, WorldSnapshot, chunk_index_of_tile},
     };
+    use bevy::platform::collections::HashMap;
 
     /// Where the figures in [`GrowthConfig`]'s doc comments come from.
     ///
@@ -1411,6 +1796,8 @@ mod measurements {
         let plan_config = WorldPlanConfig::default();
         let config = GrowthConfig::default();
 
+        let industry_config = IndustryConfig::default();
+
         let base = WorldSnapshot::generated(&terrain);
         let river_edits: Vec<TileEdit> = plan_rivers(&terrain, &plan_config, &base)
             .by_chunk
@@ -1418,7 +1805,18 @@ mod measurements {
             .flatten()
             .copied()
             .collect();
-        let planned_world = base.with_edits(&river_edits);
+        let watered = base.with_edits(&river_edits);
+        // The drainage stage is not optional now that the industry reads the ground: a
+        // wadi moves tiles across the habitable line and onto the salt recipe's list,
+        // so a world without it is not the world the game plans against.
+        let drain_edits: Vec<TileEdit> = plan_drainage(&terrain, &plan_config, &watered)
+            .by_chunk
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let planned_world = watered.with_edits(&drain_edits);
+        let sites = plan_deposits(&terrain, &plan_config, &planned_world);
         let planned = plan_cities(&terrain, &plan_config, &planned_world);
 
         let mut map = WorldMap::from_fn(|tile| planned_world.tile(tile).expect("inside the world"));
@@ -1432,9 +1830,23 @@ mod measurements {
         let mut cities = CityMap::default();
         let mut taken = HashSet::new();
 
+        // The seams, indexed the way the plan indexes them. The entity values stand
+        // for nothing and nothing keys on them — the lookup below answers from a list
+        // where the app answers from a query, which is the same shape.
+        let mut seam_map = DepositMap::default();
+        let mut seam_index: HashMap<Entity, usize> = HashMap::new();
+        for (index, site) in sites.iter().enumerate() {
+            let entity = Entity::from_raw_u32(index as u32 + 1).expect("nonzero");
+            seam_map.insert(chunk_index_of_tile(site.tile), entity);
+            seam_index.insert(entity, index);
+        }
+        let mut seam_owner: Vec<Option<usize>> = vec![None; sites.len()];
+        let of_seam = |entity: Entity| seam_index.get(&entity).map(|&index| (index, sites[index]));
+        let estate = EstateOffsets::build(industry_config.estate_reach_tiles);
+
         let started = std::time::Instant::now();
-        let mut state: Vec<(City, CityGrowth, CitySize)> = Vec::new();
-        for planned_city in &planned {
+        let mut state: Vec<(City, CityGrowth, CityIndustry, CitySize)> = Vec::new();
+        for (order, planned_city) in planned.iter().enumerate() {
             let city = planned_city.city;
             let mut edits = Vec::new();
             let growth = seed_city(
@@ -1449,11 +1861,30 @@ mod measurements {
                 &mut edits,
             );
             map.apply_edits(&edits, &mut dirty);
-            state.push((city, growth, city.size));
+
+            let industry = seed_industry(
+                &industry_config,
+                &map,
+                estate.offsets(),
+                &city,
+                &growth,
+                &seam_map,
+                |entity| {
+                    of_seam(entity)
+                        .and_then(|(index, site)| seam_owner[index].is_none().then_some(site.tile))
+                },
+            );
+            for &seam in industry.seam_entities() {
+                if let Some((index, _)) = of_seam(seam) {
+                    seam_owner[index] = Some(order);
+                }
+            }
+
+            state.push((city, growth, industry, city.size));
         }
         let seeding = started.elapsed();
 
-        let founding_fields: usize = state.iter().map(|(_, g, _)| g.fields()).sum();
+        let founding_fields: usize = state.iter().map(|(_, g, _, _)| g.fields()).sum();
         println!(
             "\n{} cities seeded in {:.0} ms — {founding_fields} tiles of founding field",
             state.len(),
@@ -1466,14 +1897,30 @@ mod measurements {
         let started = std::time::Instant::now();
         for step in 0..STEPS {
             let sweep = step % state.len();
-            for (index, (city, growth, _)) in state.iter_mut().enumerate() {
+            for (index, (city, growth, industry, _)) in state.iter_mut().enumerate() {
                 let mut edits = Vec::new();
+                if index == sweep {
+                    growth.resum(&map);
+                }
+                let labour = step_industry(
+                    &industry_config,
+                    &config,
+                    &map,
+                    estate.offsets(),
+                    Sky { rain: 0.0 },
+                    index == sweep,
+                    city,
+                    growth,
+                    industry,
+                    |entity| of_seam(entity).map(|(_, site)| (site.resource, site.richness)),
+                );
                 step_city(
                     &config,
                     &map,
                     &sampler,
                     &offsets,
                     Sky { rain: 0.0 },
+                    labour,
                     index == sweep,
                     Entity::PLACEHOLDER,
                     city,
@@ -1486,10 +1933,10 @@ mod measurements {
         }
         let elapsed = started.elapsed();
 
-        let mut populations: Vec<f32> = state.iter().map(|(_, g, _)| g.population).collect();
+        let mut populations: Vec<f32> = state.iter().map(|(_, g, _, _)| g.population).collect();
         populations.sort_by(f32::total_cmp);
-        let fields: usize = state.iter().map(|(_, g, _)| g.fields()).sum();
-        let town: usize = state.iter().map(|(_, g, _)| g.town_claims).sum();
+        let fields: usize = state.iter().map(|(_, g, _, _)| g.fields()).sum();
+        let town: usize = state.iter().map(|(_, g, _, _)| g.town_claims).sum();
         let floored = populations
             .iter()
             .filter(|p| **p <= config.min_population * 1.01)
@@ -1500,7 +1947,7 @@ mod measurements {
         // land from one that has taken everything within reach.
         let mut held: Vec<f64> = state
             .iter()
-            .map(|(_, g, _)| g.claims.len() as f64 / offsets.len() as f64)
+            .map(|(_, g, _, _)| g.claims.len() as f64 / offsets.len() as f64)
             .collect();
         held.sort_by(f64::total_cmp);
         let world_tiles = (WORLD_TILES.x as u64 * WORLD_TILES.y as u64) as f64;
@@ -1539,13 +1986,13 @@ mod measurements {
             CitySize::Borough,
             CitySize::Metropolis,
         ] {
-            let founded = state.iter().filter(|(_, _, was)| *was == size).count();
-            let now = state.iter().filter(|(c, _, _)| c.size == size).count();
+            let founded = state.iter().filter(|(_, _, _, was)| *was == size).count();
+            let now = state.iter().filter(|(c, _, _, _)| c.size == size).count();
             let mean: f32 = {
                 let of_size: Vec<f32> = state
                     .iter()
-                    .filter(|(_, _, was)| *was == size)
-                    .map(|(_, g, _)| g.population)
+                    .filter(|(_, _, _, was)| *was == size)
+                    .map(|(_, g, _, _)| g.population)
                     .collect();
                 if of_size.is_empty() {
                     0.0
@@ -1561,7 +2008,7 @@ mod measurements {
         // doing anything.
         let moved = state
             .iter()
-            .filter(|(city, _, was)| city.size != *was)
+            .filter(|(city, _, _, was)| city.size != *was)
             .count();
         println!("  {moved} cities are no longer the size they were founded at\n");
         assert!(moved > 0, "not one city changed size in {STEPS} steps");
@@ -1586,21 +2033,139 @@ mod measurements {
             CitySize::Metropolis,
         ]
         .iter()
-        .filter(|size| state.iter().any(|(city, _, _)| city.size == **size))
+        .filter(|size| state.iter().any(|(city, _, _, _)| city.size == **size))
         .count();
         assert!(
             tiers >= 3,
             "the world's cities collapsed into {tiers} tier(s)"
         );
 
+        // **The acceptance criterion gh-24 turns on**, and it is a measurement rather
+        // than an assertion about any one city: two cities in different biomes end up
+        // holding different resources.
+        //
+        // Reported by the *dominant biome under the city's centre* rather than by
+        // anything the industry knows — nothing in this module has ever learned what
+        // a biome is, so the correlation being there at all is the ground showing
+        // through the simulation.
+        println!("\n  what a city holds, by the region its centre sits in:");
+        println!(
+            "  {:<10}{:>7}{:>10}{:>9}{:>9}{:>9}{:>9}{:>8}",
+            "biome", "cities", "wood", "stone", "iron", "copper", "salt", "happy"
+        );
+        let mut profiles: Vec<(Biome, [f32; 5])> = Vec::new();
+        for biome in Biome::ALL {
+            let here: Vec<&(City, CityGrowth, CityIndustry, CitySize)> = state
+                .iter()
+                .filter(|(city, _, _, _)| {
+                    sampler
+                        .sample(city.centre.x as f32, city.centre.y as f32)
+                        .dominant
+                        == biome
+                })
+                .collect();
+            if here.is_empty() {
+                continue;
+            }
+
+            let mean = |read: &dyn Fn(&CityIndustry) -> f32| {
+                here.iter().map(|(_, _, i, _)| read(i)).sum::<f32>() / here.len() as f32
+            };
+            // Per head, so a region of big cities does not simply out-hold a region of
+            // small ones and the columns compare what the *land* gave them.
+            let per_head = |resource: Resource| {
+                here.iter()
+                    .map(|(_, g, i, _)| i.stock(resource) / g.population.max(1.0))
+                    .sum::<f32>()
+                    / here.len() as f32
+            };
+
+            let profile = [
+                per_head(Resource::Wood),
+                per_head(Resource::Stone),
+                per_head(Resource::Iron),
+                per_head(Resource::Copper),
+                per_head(Resource::Salt),
+            ];
+            println!(
+                "  {:<10}{:>7}{:>10.3}{:>9.3}{:>9.3}{:>9.3}{:>9.3}{:>8.2}",
+                format!("{biome:?}"),
+                here.len(),
+                profile[0],
+                profile[1],
+                profile[2],
+                profile[3],
+                profile[4],
+                mean(&|industry| industry.happiness()),
+            );
+            profiles.push((biome, profile));
+        }
+
+        let seams_worked: usize = state.iter().map(|(_, _, i, _)| i.seams()).sum();
+        let mining = state.iter().filter(|(_, _, i, _)| i.seams() > 0).count();
+        println!(
+            "  {seams_worked} of {} seams are worked, by {mining} of {} cities",
+            sites.len(),
+            state.len()
+        );
+
+        // **The stability condition**, and the reason `effort` is a share of the land
+        // rather than a staffing ratio. Where a city has fewer people than its land
+        // offers work, `staffing` is `population / total`, which puts the population
+        // back into the capacity and leaves the logistic with no stable equilibrium.
+        // The knobs have to keep essentially every city off that branch.
+        let stretched = state
+            .iter()
+            .filter(|(_, g, i, _)| i.total_hands_wanted() > g.population)
+            .count();
+        println!(
+            "  {stretched} of {} cities want more hands than they have",
+            state.len()
+        );
+        assert!(
+            stretched * 4 < state.len(),
+            "{stretched} of {} cities are labour-stretched — the capacity is \
+             proportional to the population for all of them, which is the collapse \
+             `effort` exists to prevent",
+            state.len()
+        );
+
+        // Two regions have to differ, or the whole feature is decoration. Compared as
+        // the largest gap in any one resource between any two regions, per head — a
+        // world where every region held the same basket would score ~0.
+        let mut widest: (f32, &str) = (0.0, "");
+        for (index, (a_biome, a)) in profiles.iter().enumerate() {
+            for (b_biome, b) in &profiles[index + 1..] {
+                for (slot, name) in ["wood", "stone", "iron", "copper", "salt"]
+                    .iter()
+                    .enumerate()
+                {
+                    let gap = (a[slot] - b[slot]).abs() / a[slot].max(b[slot]).max(f32::EPSILON);
+                    if gap > widest.0 {
+                        widest = (gap, name);
+                        println!(
+                            "    {a_biome:?} against {b_biome:?}: {name} differs by {:.0}%",
+                            gap * 100.0
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            widest.0 > 0.25,
+            "no two regions differ by more than {:.0}% in any resource — \
+             the cities are interchangeable after all",
+            widest.0 * 100.0
+        );
+
         // And it has to move in both directions, or the "simulation" is a ratchet.
         let grew = state
             .iter()
-            .filter(|(city, _, was)| city.radius > was.radius())
+            .filter(|(city, _, _, was)| city.radius > was.radius())
             .count();
         let shrank = state
             .iter()
-            .filter(|(city, _, was)| city.radius < was.radius())
+            .filter(|(city, _, _, was)| city.radius < was.radius())
             .count();
         println!("  {grew} cities grew, {shrank} shrank");
         assert!(grew > 0 && shrank > 0, "{grew} grew and {shrank} shrank");

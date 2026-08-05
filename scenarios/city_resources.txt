@@ -1,0 +1,88 @@
+# What a city holds, and why it holds it.
+#
+# Run with:  just drive run scenarios/city_resources.txt
+#
+# This is the file gh-24's acceptance criterion actually turns on — "two cities in
+# different biomes end up with different resources, **measured**" is an observation
+# and not a mechanic, so without this the whole feature is invisible and nothing says
+# so. `observe cities` reports every city's stocks and hands; `observe deposits`
+# reports the seams and which city works each one; and the overlay captures at the end
+# show the ground those seams were read off.
+
+# Clocks frozen through the waits, so two runs of this file are comparable. Every clock
+# in the game is driven by `Time::delta`, while generation, the plan and the bakes are
+# polled per frame and so still land — see the comment in snow_falls_and_melts.txt for
+# why that is not a formality.
+fixed-delta 0
+
+enter gameplay
+wait terrain
+
+# The Deposits stage sits inside the plan, between the drainage and the cities, so
+# `wait plan` covers the layout for free. The prospectivity *bake* is a different
+# matter: it is started by that stage but deliberately does not gate it, so it lands on
+# wall-clock and counting frames against it would be flaky by construction.
+wait plan
+wait prospect
+
+# A wgsl error draws nothing rather than drawing wrong, and every capture below would
+# still be written. `observe log` drains, so this has to come first — this is the only
+# read that can see startup.
+observe log
+
+# The seams as laid, before anyone has claimed one: `owner` is null on every row here.
+# Sorted by tile, so this diffs cleanly across runs — the `Entity` values are not
+# reproducible and nothing may key on them.
+observe deposits
+
+# Let the simulation run. Cities are seeded in the first step after the plan reaches
+# `Done` — which is where each one claims the unowned seams in its estate reach, in id
+# order, once and for the session.
+fixed-delta 1/4
+step 400
+
+# The same list again, now with owners: every row whose `owner` is no longer null is a
+# seam some city is working, and the id is the same key `observe cities` is sorted by.
+observe deposits
+
+# **The measurement.** Each city reports its stocks and its hands by profession beside
+# the population and food it already reported. A city with a seam has miners in it and
+# a city without has none, and two cities in different biomes hold different baskets —
+# which is the sentence gh-24 was opened for.
+observe cities
+
+# And the panel, which is where that becomes legible without reading JSON: the second
+# column is one row per resource, carrying the stock and the hands together. Click a
+# city rather than a pixel — `click-tile` does the camera arithmetic, which is the
+# driver's problem and not the author's.
+click-tile 2343 1969
+step 2
+capture /tmp/wusel-resources/panel.png
+
+# Then the map that explains *why*, in the same run as the numbers. These draw
+# **prospectivity** — the recipe score before the threshold, so "could there be iron
+# here" — with the seams themselves marked at the ramp's warm pole. The neutral band is
+# `deposit_threshold` read from the plan's own config, so the line between ground worth
+# digging and ground that is not is visible without reading a number.
+overlay iron
+observe overlay
+capture /tmp/wusel-resources/iron.png
+
+overlay copper
+observe overlay
+capture /tmp/wusel-resources/copper.png
+
+overlay salt
+observe overlay
+capture /tmp/wusel-resources/salt.png
+
+# The keys themselves, which are a *different code path* from the verb above: the verb
+# writes the resource, where a press goes in as a `KeyboardInput` message and is read by
+# the same system a player's keyboard feeds. Driving only the verb would leave that path
+# unexercised and a broken binding would pass every check in this file.
+hold 7 1
+observe overlay
+hold 0 1
+observe overlay
+
+observe log

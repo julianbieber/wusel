@@ -33,7 +33,9 @@ use crate::{
     camera::{WorldCamera, orthographic_scale},
     gameplay::{
         city::{City, CityMap, CitySize},
+        deposit::Resource,
         growth::CityGrowth,
+        industry::CityIndustry,
         road::RoadNetwork,
         world::{
             CHUNK_SIZE, TILE_DISPLAY_SIZE, WORLD_CHUNKS, WorldSystems, chunk_index_of_tile,
@@ -68,6 +70,11 @@ const HEADER_HEIGHT_PX: f32 = 18.0;
 const ROW_HEIGHT_PX: f32 = 14.0;
 const ROW_GAP_PX: f32 = 2.0;
 const VALUE_COLUMN_PX: f32 = 76.0;
+/// The two columns and the gap between them. `panel_width_px` has to be at least their
+/// sum plus the padding, or the resource column wraps under the stats one.
+const STATS_COLUMN_PX: f32 = 168.0;
+const RESOURCE_COLUMN_PX: f32 = 138.0;
+const COLUMN_GAP_PX: f32 = 14.0;
 const HEADER_FONT_PX: f32 = 14.0;
 const ROW_FONT_PX: f32 = 11.0;
 
@@ -104,6 +111,10 @@ pub enum CityStat {
     Capacity,
     TownTiles,
     FieldTiles,
+    /// Properties of the *city* rather than of a resource, which is why they join this
+    /// column instead of the resource one beside it.
+    Happiness,
+    Idle,
     Roads,
     Centre,
 }
@@ -112,7 +123,7 @@ impl CityStat {
     /// Every stat, in the order they are laid out. The spawn loop and the readout both
     /// walk this, so adding a tenth stat is one variant and one match arm rather than
     /// three lists that have to agree.
-    const ALL: [CityStat; 9] = [
+    const ALL: [CityStat; 11] = [
         CityStat::Tier,
         CityStat::Population,
         CityStat::Harvest,
@@ -120,6 +131,8 @@ impl CityStat {
         CityStat::Capacity,
         CityStat::TownTiles,
         CityStat::FieldTiles,
+        CityStat::Happiness,
+        CityStat::Idle,
         CityStat::Roads,
         CityStat::Centre,
     ];
@@ -133,6 +146,8 @@ impl CityStat {
             CityStat::Capacity => "Supports",
             CityStat::TownTiles => "Town",
             CityStat::FieldTiles => "Fields",
+            CityStat::Happiness => "Content",
+            CityStat::Idle => "Idle",
             CityStat::Roads => "Roads",
             CityStat::Centre => "At",
         }
@@ -147,10 +162,21 @@ impl CityStat {
     /// time — during which the towns are on the map and clickable. `roads` is missing
     /// only while the panel is being spawned, since counting them needs a resource the
     /// scene builder has no reason to hold.
-    fn format(self, city: &City, growth: Option<&CityGrowth>, roads: Option<usize>) -> String {
+    fn format(
+        self,
+        city: &City,
+        growth: Option<&CityGrowth>,
+        industry: Option<&CityIndustry>,
+        roads: Option<usize>,
+    ) -> String {
         const UNKNOWN: &str = "—";
         let of_growth =
             |f: &dyn Fn(&CityGrowth) -> String| growth.map_or_else(|| UNKNOWN.to_string(), f);
+        // Missing on exactly the same terms `growth` is, and for the same reason: both
+        // are written by `seed_cities`, which waits for `WorldPlan::Done` while the
+        // towns are already on the map and clickable.
+        let of_industry =
+            |f: &dyn Fn(&CityIndustry) -> String| industry.map_or_else(|| UNKNOWN.to_string(), f);
         match self {
             CityStat::Tier => tier_name(city.size).to_string(),
             CityStat::Centre => format!("{}, {}", city.centre.x, city.centre.y),
@@ -160,6 +186,8 @@ impl CityStat {
             CityStat::Capacity => of_growth(&|g| format!("{:.0}", g.capacity)),
             CityStat::TownTiles => of_growth(&|g| g.town().to_string()),
             CityStat::FieldTiles => of_growth(&|g| g.fields().to_string()),
+            CityStat::Happiness => of_industry(&|i| format!("{:.0}%", i.happiness() * 100.0)),
+            CityStat::Idle => of_industry(&|i| format!("{:.0}", i.idle())),
             CityStat::Roads => roads.map_or_else(|| UNKNOWN.to_string(), |n| n.to_string()),
         }
     }
@@ -198,6 +226,44 @@ pub struct CityStatsPanel {
 /// lets the readout rewrite all nine without knowing the outline is there.
 #[derive(Component, Clone, Copy)]
 pub struct CityStatValue(CityStat);
+
+/// One row of the resource column, on exactly the same terms: it rides on all nine
+/// outline copies, so the ordinary query rewrites them without knowing the outline
+/// exists.
+#[derive(Component, Clone, Copy)]
+pub struct CityResourceValue(Resource);
+
+/// What one resource row says: the store, and who is working it.
+///
+/// **The stock and the hands together**, because the store and who is working it are
+/// one reading — splitting them into two columns would be twelve rows to say six
+/// things. The Food row *is* the granary, so the one number that says how long a city
+/// can eat through a bad spell needs no row of its own; the Harvest row beside it
+/// still reports the harvest alone, and Supports still reports the capacity, which now
+/// has the granary's release in it. **The two differing is exactly the reading "this
+/// city is living off its stores".**
+fn resource_row(industry: Option<&CityIndustry>, resource: Resource) -> String {
+    match industry {
+        None => "—".to_string(),
+        Some(industry) => format!(
+            "{:.0} ({:.0})",
+            industry.stock(resource),
+            industry.hands(resource)
+        ),
+    }
+}
+
+/// The resource column's label. Capitalised here rather than on [`Resource`], because
+/// that label is also the word the ctl matches on and a verb a player types should not
+/// carry capitals.
+fn resource_label(resource: Resource) -> String {
+    let label = resource.label();
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => label.to_string(),
+    }
+}
 
 /// The capacity bar's node.
 ///
@@ -246,7 +312,7 @@ impl Default for CityPanelConfig {
     fn default() -> Self {
         Self {
             pick_slack_px: 12.0,
-            panel_width_px: 190.0,
+            panel_width_px: 340.0,
             cursor_offset_px: Vec2::new(14.0, 14.0),
             ink: Color::WHITE,
             outline: Color::BLACK,
@@ -546,8 +612,13 @@ fn bar_fill(population: f32, capacity: f32) -> f32 {
 }
 
 /// The panel's height, summed from what it is about to contain.
+///
+/// The taller of the two columns, since they sit side by side — which is the whole
+/// point of a second column rather than more rows: the stats column is eleven rows
+/// already, and six resources under it would make the window taller than a hamlet is
+/// wide on screen.
 fn panel_height_px(config: &CityPanelConfig) -> f32 {
-    let rows = CityStat::ALL.len() as f32;
+    let rows = CityStat::ALL.len().max(Resource::ALL.len()) as f32;
     PANEL_PADDING_PX * 2.0
         + HEADER_HEIGHT_PX
         + config.bar_height_px
@@ -713,40 +784,94 @@ fn spawn_panel(
                 },
                 MaterialNode(bar),
             ));
-            for stat in CityStat::ALL {
-                panel
-                    .spawn(Node {
-                        width: percent(100),
-                        height: px(ROW_HEIGHT_PX),
-                        justify_content: JustifyContent::SpaceBetween,
-                        align_items: AlignItems::Center,
+            // Two columns side by side. Both are spawned with their true strings rather
+            // than placeholders, so nothing about what is displayed depends on when the
+            // sync point for these commands happens to fall. Every value is fixed width
+            // and right aligned, so a population crossing from 999 to 1000 does not
+            // shove its own label sideways.
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    column_gap: px(COLUMN_GAP_PX),
+                    ..default()
+                })
+                .with_children(|body| {
+                    body.spawn(Node {
+                        width: px(STATS_COLUMN_PX),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(ROW_GAP_PX),
                         ..default()
                     })
-                    .with_children(|row| {
-                        row.spawn(outlined_text(
-                            stat.label().to_string(),
-                            ROW_FONT_PX,
-                            config,
-                            None,
-                            Justify::Left,
-                            (),
-                        ));
-                        // Spawned with its true string rather than a placeholder, so
-                        // nothing about what is displayed depends on when the sync point
-                        // for these commands happens to fall.
-                        //
-                        // Fixed width and right aligned, so a population crossing from
-                        // 999 to 1000 does not shove its own label sideways.
-                        row.spawn(outlined_text(
-                            stat.format(city, None, None),
-                            ROW_FONT_PX,
-                            config,
-                            Some(VALUE_COLUMN_PX),
-                            Justify::Right,
-                            CityStatValue(stat),
-                        ));
+                    .with_children(|column| {
+                        for stat in CityStat::ALL {
+                            spawn_row(
+                                column,
+                                config,
+                                stat.label().to_string(),
+                                stat.format(city, None, None, None),
+                                CityStatValue(stat),
+                            );
+                        }
                     });
-            }
+
+                    body.spawn(Node {
+                        width: px(RESOURCE_COLUMN_PX),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(ROW_GAP_PX),
+                        ..default()
+                    })
+                    .with_children(|column| {
+                        // Walked from `Resource::ALL`, never from a hand-written list of
+                        // six — so a seventh resource is a table row in `deposit.rs` and
+                        // nothing here.
+                        for resource in Resource::ALL {
+                            spawn_row(
+                                column,
+                                config,
+                                resource_label(resource),
+                                resource_row(None, resource),
+                                CityResourceValue(resource),
+                            );
+                        }
+                    });
+                });
+        });
+}
+
+/// One label-and-value row, in whichever column. Shared so the two columns cannot drift
+/// in height or alignment, which is what `panel_height_px` assumes of both.
+fn spawn_row(
+    parent: &mut ChildSpawnerCommands,
+    config: &CityPanelConfig,
+    label: String,
+    value: String,
+    marker: impl Bundle + Clone,
+) {
+    parent
+        .spawn(Node {
+            width: percent(100),
+            height: px(ROW_HEIGHT_PX),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(outlined_text(
+                label,
+                ROW_FONT_PX,
+                config,
+                None,
+                Justify::Left,
+                (),
+            ));
+            row.spawn(outlined_text(
+                value,
+                ROW_FONT_PX,
+                config,
+                Some(VALUE_COLUMN_PX),
+                Justify::Right,
+                marker,
+            ));
         });
 }
 
@@ -762,10 +887,11 @@ fn spawn_panel(
 fn refresh_city_panel(
     mut commands: Commands,
     panel: Option<Single<(Entity, &CityStatsPanel)>>,
-    cities: Query<(&City, Option<&CityGrowth>)>,
+    cities: Query<(&City, Option<&CityGrowth>, Option<&CityIndustry>)>,
     roads: Res<RoadNetwork>,
     config: Res<CityPanelConfig>,
     mut values: Query<(&CityStatValue, &mut Text)>,
+    mut resources: Query<(&CityResourceValue, &mut Text), Without<CityStatValue>>,
     mut bars: Query<(&mut CityCapacityBar, &MaterialNode<WoodPanelMaterial>)>,
     mut materials: ResMut<Assets<WoodPanelMaterial>>,
 ) {
@@ -774,7 +900,7 @@ fn refresh_city_panel(
     };
     let (panel_entity, panel_state) = *panel;
 
-    let Ok((city, growth)) = cities.get(panel_state.city) else {
+    let Ok((city, growth, industry)) = cities.get(panel_state.city) else {
         // Nothing despawns a city mid-session — the cities and this panel go together on
         // leaving gameplay — so this is the shape of the guard rather than a live path.
         // It is not a substitute for the state gate on the set.
@@ -789,7 +915,10 @@ fn refresh_city_panel(
         .count();
 
     for (value, mut text) in &mut values {
-        text.set_if_neq(Text(value.0.format(city, growth, Some(links))));
+        text.set_if_neq(Text(value.0.format(city, growth, industry, Some(links))));
+    }
+    for (value, mut text) in &mut resources {
+        text.set_if_neq(Text(resource_row(industry, value.0)));
     }
 
     let (fill, growing) = match growth {
@@ -972,6 +1101,40 @@ mod tests {
         assert_eq!(bar_fill(50.0, 100.0), 0.5);
     }
 
+    /// The two columns sit side by side, so the panel has to be wide enough to hold
+    /// both — otherwise flexbox wraps the resource column under the stats one and the
+    /// height `panel_height_px` computed is a lie.
+    #[test]
+    fn the_panel_is_wide_enough_for_both_its_columns() {
+        let config = CityPanelConfig::default();
+        let needed = STATS_COLUMN_PX + COLUMN_GAP_PX + RESOURCE_COLUMN_PX + PANEL_PADDING_PX * 2.0;
+        assert!(
+            config.panel_width_px >= needed,
+            "the panel is {} px wide and its columns need {needed}",
+            config.panel_width_px
+        );
+        // And each column's value text has to fit inside its own column, or the label
+        // beside it is squeezed to nothing.
+        assert!(VALUE_COLUMN_PX < RESOURCE_COLUMN_PX.min(STATS_COLUMN_PX));
+    }
+
+    /// Every resource gets a row, and it is built by walking `Resource::ALL` rather
+    /// than by a hand-written list — so a seventh resource is a table row in
+    /// `deposit.rs` and nothing in this module.
+    #[test]
+    fn the_resource_column_names_its_resource_and_shows_the_hands_beside_the_stock() {
+        assert_eq!(resource_label(Resource::Food), "Food");
+        assert_eq!(resource_label(Resource::Copper), "Copper");
+        for resource in Resource::ALL {
+            let label = resource_label(resource);
+            assert!(
+                label.starts_with(|c: char| c.is_uppercase()),
+                "{label} is not capitalised for the panel"
+            );
+            assert_eq!(label.to_lowercase(), resource.label(), "{label} drifted");
+        }
+    }
+
     #[test]
     fn a_panel_opens_fully_inside_the_window_wherever_the_cursor_is() {
         let window = Vec2::new(1920.0, 1080.0);
@@ -1002,11 +1165,18 @@ mod tests {
     #[test]
     fn a_city_without_growth_shows_dashes_rather_than_nothing() {
         let city = city(7, IVec2::new(-12, 40), 8);
-        assert_eq!(CityStat::Population.format(&city, None, None), "—");
-        assert_eq!(CityStat::Tier.format(&city, None, None), "Borough");
-        assert_eq!(CityStat::Centre.format(&city, None, None), "-12, 40");
+        assert_eq!(CityStat::Population.format(&city, None, None, None), "—");
+        assert_eq!(CityStat::Tier.format(&city, None, None, None), "Borough");
+        assert_eq!(CityStat::Centre.format(&city, None, None, None), "-12, 40");
         // Roads are known before the growth is, and each is missing on its own terms.
-        assert_eq!(CityStat::Roads.format(&city, None, Some(3)), "3");
-        assert_eq!(CityStat::Roads.format(&city, None, None), "—");
+        assert_eq!(CityStat::Roads.format(&city, None, None, Some(3)), "3");
+        // The industry half reads unknown on exactly the same terms, and a city is
+        // clickable through the whole road-planning stage during which it is.
+        assert_eq!(CityStat::Happiness.format(&city, None, None, None), "—");
+        assert_eq!(CityStat::Idle.format(&city, None, None, None), "—");
+        for resource in Resource::ALL {
+            assert_eq!(resource_row(None, resource), "—");
+        }
+        assert_eq!(CityStat::Roads.format(&city, None, None, None), "—");
     }
 }

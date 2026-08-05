@@ -14,10 +14,13 @@ use crate::{
     camera::{WorldCamera, orthographic_scale, visible_half_extent},
     gameplay::{
         city::{City, CitySize},
+        deposit::{Deposit, Resource},
         ground::{ClimateMaps, GroundConfig, GroundCover, temperature_offset},
         growth::CityGrowth,
+        industry::CityIndustry,
         inspect::{ActiveOverlay, FieldSources},
         plan::WorldPlan,
+        prospect::ProspectMaps,
         road::RoadNetwork,
         sun::{PlanetConfig, Sun},
         terrain::TerrainKind,
@@ -37,6 +40,7 @@ pub(super) enum Topic {
     Plan,
     Camera,
     Cities,
+    Deposits,
     Ground,
     Sun,
     Overlay,
@@ -51,6 +55,7 @@ impl Topic {
             "plan" => Ok(Self::Plan),
             "camera" => Ok(Self::Camera),
             "cities" => Ok(Self::Cities),
+            "deposits" => Ok(Self::Deposits),
             "ground" => Ok(Self::Ground),
             "sun" => Ok(Self::Sun),
             "overlay" => Ok(Self::Overlay),
@@ -58,7 +63,8 @@ impl Topic {
             "log" => Ok(Self::Log),
             other => Err(format!(
                 "unknown observation: {other} \
-                 (terrain, plan, camera, cities, ground, sun, overlay, screen, log)"
+                 (terrain, plan, camera, cities, deposits, ground, sun, overlay, \
+                 screen, log)"
             )),
         }
     }
@@ -70,6 +76,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Plan => plan(world),
         Topic::Camera => camera(world),
         Topic::Cities => cities(world),
+        Topic::Deposits => deposits(world),
         Topic::Ground => ground(world),
         Topic::Sun => sun(world),
         Topic::Overlay => overlay(world),
@@ -295,10 +302,29 @@ fn camera(world: &mut World) -> Value {
 }
 
 fn cities(world: &mut World) -> Value {
-    let mut query = world.query::<(&City, Option<&CityGrowth>)>();
+    let mut query = world.query::<(&City, Option<&CityGrowth>, Option<&CityIndustry>)>();
     let mut list: Vec<Value> = query
         .iter(world)
-        .map(|(city, growth)| {
+        .map(|(city, growth, industry)| {
+            // Both maps are built by walking `Resource::ALL`, never by a hand-written
+            // list of six — so a seventh resource reaches this topic as a table row in
+            // `deposit.rs` and nothing here.
+            let by_resource = |read: &dyn Fn(&CityIndustry, Resource) -> f32| -> Option<Value> {
+                industry.map(|industry| {
+                    Value::Object(
+                        Resource::ALL
+                            .iter()
+                            .map(|resource| {
+                                (
+                                    resource.label().to_string(),
+                                    json!(read(industry, *resource)),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+            };
+
             json!({
                 "id": city.id,
                 "centre": [city.centre.x, city.centre.y],
@@ -307,6 +333,30 @@ fn cities(world: &mut World) -> Value {
                 "population": growth.map(|growth| growth.population),
                 "food": growth.map(|growth| growth.food),
                 "capacity": growth.map(|growth| growth.capacity),
+                "stocks": by_resource(&|industry, resource| industry.stock(resource)),
+                // Keyed by profession rather than by resource, because that is what a
+                // hand *is* — and the two lists cannot drift, since a profession is a
+                // label on `Resource` rather than an enum of its own.
+                "hands": industry.map(|industry| {
+                    Value::Object(
+                        Resource::ALL
+                            .iter()
+                            .map(|resource| {
+                                (
+                                    resource.profession().to_string(),
+                                    json!(industry.hands(*resource)),
+                                )
+                            })
+                            .collect(),
+                    )
+                }),
+                "idle": industry.map(|industry| industry.idle()),
+                // What the land asks for in all. Above the population the city is
+                // labour-stretched, which is the branch `industry::effort` documents as
+                // the one the knobs keep it off — so it is worth being able to see.
+                "hands_wanted": industry.map(|industry| industry.total_hands_wanted()),
+                "happiness": industry.map(|industry| industry.happiness()),
+                "seams": industry.map(|industry| industry.seams()),
             })
         })
         .collect();
@@ -315,6 +365,45 @@ fn cities(world: &mut World) -> Value {
     // iteration order is an ECS implementation detail and would make a diff noise.
     list.sort_by_key(|city| city["id"].as_u64().unwrap_or_default());
     json!({ "count": list.len(), "cities": list })
+}
+
+/// The seams, and who works each one.
+///
+/// The owning city is reported as its `City.id` and **never as an `Entity`**: an id is
+/// stable across runs and an entity is not, and the cities topic is already keyed that
+/// way. Present but empty before the Deposits stage has run, and absent outside a
+/// session — which is the same shape every other world topic has.
+fn deposits(world: &mut World) -> Value {
+    // Read in two passes because the owner is an entity on one component and an id on
+    // another; collecting the seams first keeps the borrow of each query short.
+    let seams: Vec<Deposit> = world.query::<&Deposit>().iter(world).copied().collect();
+    let mut owners = world.query::<(Entity, &City)>();
+    let owner_ids: Vec<(Entity, u32)> = owners.iter(world).map(|(e, city)| (e, city.id)).collect();
+
+    let mut list: Vec<Value> = seams
+        .iter()
+        .map(|seam| {
+            json!({
+                "resource": seam.resource.label(),
+                "tile": [seam.tile.x, seam.tile.y],
+                "richness": seam.richness,
+                "owner": seam.owner.and_then(|entity| {
+                    owner_ids.iter().find(|(e, _)| *e == entity).map(|(_, id)| *id)
+                }),
+            })
+        })
+        .collect();
+
+    // Sorted by tile, so two runs of a scenario diff cleanly — the same rule the
+    // cities list is sorted under, and for the same reason.
+    list.sort_by_key(|seam| {
+        let tile = &seam["tile"];
+        (
+            tile[1].as_i64().unwrap_or_default(),
+            tile[0].as_i64().unwrap_or_default(),
+        )
+    });
+    json!({ "count": list.len(), "deposits": list })
 }
 
 /// What the inspection overlay is drawing, and what it is drawing at the middle of
@@ -360,6 +449,7 @@ fn overlay(world: &mut World) -> Value {
             climate: world.get_resource::<ClimateMaps>(),
             cover: world.get_resource::<GroundCover>(),
             sky: world.get_resource::<SkySampler>(),
+            prospect: world.get_resource::<ProspectMaps>(),
             offset,
         }
         .value(active.field, tile)
@@ -392,6 +482,7 @@ pub(super) fn plan_stage(plan: &WorldPlan) -> &'static str {
         WorldPlan::WaitingForTerrain => "waiting-for-terrain",
         WorldPlan::Rivers(_) => "rivers",
         WorldPlan::Drainage(_) => "drainage",
+        WorldPlan::Deposits(_) => "deposits",
         WorldPlan::Cities(_) => "cities",
         WorldPlan::Roads(_) => "roads",
         WorldPlan::Done => "done",
