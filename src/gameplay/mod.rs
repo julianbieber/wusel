@@ -50,8 +50,14 @@ impl Plugin for GameplayPlugin {
         // list follows is "edits tiles → inside the world's plugin", and reading implies
         // neither — the panel asks `CityMap` a question and takes the answer away.
         //
-        // The sun goes in after the two overlays it writes to, because its sync
-        // system expects both of them on the camera.
+        // The order in this list is *not* load-bearing: every overlay is attached in
+        // OnEnter, which finishes before Update, so the sun's sync finds the two it
+        // writes to however these are listed.
+        //
+        // What is worth knowing is the failure mode. That sync takes both overlays
+        // as one `Single`, so it is silently *skipped* while either is missing —
+        // which means dropping the weather plugin, as a capture experiment might,
+        // stops the sun advancing on screen too rather than merely removing clouds.
         app.add_plugins((
             world::WorldPlugin,
             tint::TerrainTintPlugin,
