@@ -145,6 +145,7 @@ impl RidgedNoiseField {
 /// scrolled forever, which is how the weather overlay animates without evaluating
 /// any noise per fragment. Nothing in the terrain wants this — a world that repeats
 /// every few hundred tiles would be visible from the ground.
+#[derive(Clone)]
 pub struct TilingNoiseField {
     offset: Vec2,
     period: u32,

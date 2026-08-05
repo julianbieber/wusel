@@ -177,6 +177,34 @@ pub struct TerrainConfig {
     pub vegetation_scale: f32,
     pub settlement_scale: f32,
     pub humidity_scale: f32,
+    /// The climate normal at sea level, in degrees Celsius, before the lapse rate
+    /// takes any of it back. Read only by [`TerrainSampler::temperature`], the way
+    /// the settlement figures are read only by `city.rs`.
+    ///
+    /// **Degrees rather than the crate's usual dimensionless 0..1**, because this is
+    /// the one field with a threshold that has to mean something: water freezes at a
+    /// particular number, and no amount of remapping makes 0.42 that number.
+    pub sea_level_celsius: f32,
+    /// How much colder the top of the height range is than the bottom. The whole
+    /// range, not a real km-per-degree figure — the heightmap has no vertical scale
+    /// and `PlanetConfig::relief_tiles`, which does, is a lighting number nothing
+    /// else may read.
+    ///
+    /// Together with `sea_level_celsius` this places the **transient snow band**: the
+    /// ground that freezes overnight and thaws by afternoon is where the normal is
+    /// within one diurnal amplitude of freezing, so the band is
+    /// `2 * amplitude / lapse_celsius` of the height range. At 26/34 with a ~7-degree
+    /// swing that is elevation 0.55 to 0.97 — nearly all the land above the middle of
+    /// the lowland band, and the reason the loop is visible in one 300-second day
+    /// rather than only in a configured winter.
+    pub lapse_celsius: f32,
+    /// The wavelength of the regional temperature anomaly, coarser than the humidity
+    /// field's ~50 tiles: which country is having a cold spell is a bigger thing than
+    /// which valley is wet.
+    pub temperature_scale: f32,
+    /// How wide that anomaly swings, peak to peak. Small against the lapse rate, so
+    /// it moves the snow line about rather than deciding where it is.
+    pub temperature_noise_celsius: f32,
     /// The Voronoi lattice the biomes are drawn on. 384 tiles is six chunks: two or
     /// three regions across the screen at `MAX_ZOOM_SCALE`, and a walk of about a
     /// minute to cross one.
@@ -329,6 +357,11 @@ impl Default for TerrainConfig {
             // Coarser than the vegetation field: weather covers more ground than
             // a wood does, so a whole range is wet rather than one peak in it.
             humidity_scale: 0.02,
+            sea_level_celsius: 26.0,
+            lapse_celsius: 34.0,
+            // ~125 tiles, against the humidity field's ~50.
+            temperature_scale: 0.008,
+            temperature_noise_celsius: 4.0,
             biome_cell_tiles: 384,
             biome_blend_tiles: 48,
             biome_warp_tiles: 160.0,
@@ -381,6 +414,7 @@ const CONTINENT_SALT: u32 = 0x27d4_eb2d;
 const RIDGE_SALT: u32 = 0x1656_67b1;
 const LITHOLOGY_SALT: u32 = 0x3b9a_ca07;
 const DUNE_SALT: u32 = 0x6f4e_2b13;
+const TEMPERATURE_SALT: u32 = 0x4d2b_7f11;
 
 /// The continent layer is there for its longest wavelength, so octaves finer than
 /// the relief layer already provides are paid for on every tile and then buried
@@ -480,6 +514,10 @@ pub struct TerrainSampler {
     dune_field: RidgedNoiseField,
     vegetation_field: NoiseField,
     humidity_field: NoiseField,
+    temperature_field: NoiseField,
+    sea_level_celsius: f32,
+    lapse_celsius: f32,
+    temperature_noise_celsius: f32,
     continent_relief: f32,
     /// `(cos, sin)` of the lithology strike, taken once — the rotation is per tile
     /// and a `to_radians().cos()` on every one of 16 M tiles is not free.
@@ -537,6 +575,14 @@ impl TerrainSampler {
                 config.vegetation_scale,
             ),
             humidity_field: NoiseField::new(config.seed, HUMIDITY_SALT, config.humidity_scale),
+            temperature_field: NoiseField::new(
+                config.seed,
+                TEMPERATURE_SALT,
+                config.temperature_scale,
+            ),
+            sea_level_celsius: config.sea_level_celsius,
+            lapse_celsius: config.lapse_celsius,
+            temperature_noise_celsius: config.temperature_noise_celsius,
             continent_relief: config.continent_relief,
             lithology_strike: Vec2::new(strike_cos, strike_sin),
             lithology_aspect: config.lithology_aspect.max(1.0),
@@ -682,6 +728,30 @@ impl TerrainSampler {
     pub fn humidity(&self, x: f32, y: f32) -> f32 {
         let bias = self.biomes.blend(x, y).recipe.humidity_bias;
         (self.humidity_field.sample(x, y) + bias).clamp(0.0, 1.0)
+    }
+
+    /// The **climate normal** at a tile, in degrees Celsius: how warm it is here on
+    /// an average day, before the sun has moved and before any weather.
+    ///
+    /// Degrees rather than the crate's usual dimensionless 0..1, because a freezing
+    /// point has to mean something. Read by [`crate::gameplay::ground`], which adds
+    /// the day's swing to it and decides whether what falls is rain or snow.
+    ///
+    /// **It is deliberately not part of [`TileSample`], and `classify` may never read
+    /// it.** Putting it there would cost an extra field evaluation on all 16.7 M
+    /// tiles for a value no band is allowed to consult — and it is not allowed to, on
+    /// exactly the terms `PlanetConfig::relief_tiles` may only be read by the
+    /// lighting: a tile's *kind* must not start depending on the weather. The alpine
+    /// `Snow` kind still means the height band it always did, with a transient snow
+    /// line moving around underneath it.
+    ///
+    /// One blend and one height, not two: calling [`Self::elevation`] here would
+    /// re-do the biome lookup, which is the expensive half.
+    pub fn temperature(&self, x: f32, y: f32) -> f32 {
+        let recipe = self.biomes.blend(x, y).recipe;
+        self.sea_level_celsius - self.lapse_celsius * self.height(&recipe, x, y)
+            + recipe.temperature_bias
+            + self.temperature_noise_celsius * (self.temperature_field.sample(x, y) - 0.5)
     }
 
     /// Everything about a tile, for the one caller that needs all of it.
@@ -954,6 +1024,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The lapse rate is the whole reason the field is worth sampling per tile: a
+    /// mountain has to be colder than the plain beside it, or the snow line is not a
+    /// line and the ground cover is a flat sheet.
+    ///
+    /// Checked as a *rank* rather than as a difference, over pairs sharing a place —
+    /// so it is the height doing this and not the regional anomaly.
+    #[test]
+    fn the_temperature_field_falls_with_height() {
+        let config = TerrainConfig::default();
+        let sampler = config.sampler();
+
+        // The lapse rate acting alone, at one place: everything else about the tile
+        // is held fixed, so the drop is the height and only the height.
+        let recipe = Biome::Plains.recipe();
+        let at = |height: f32| {
+            sampler.sea_level_celsius - sampler.lapse_celsius * height + recipe.temperature_bias
+        };
+        assert!(
+            at(0.8) < at(0.5),
+            "a world that warms with height has no snow line"
+        );
+
+        // And over the real world, where the anomaly and the biome bias are also in
+        // play: the high ground still has to come out the colder end.
+        let mut low = Vec::new();
+        let mut high = Vec::new();
+        for i in 0..8000u32 {
+            let x = (i.wrapping_mul(2654435761) % 4000) as f32;
+            let y = (i.wrapping_mul(40503) % 4000) as f32;
+            let elevation = sampler.elevation(x, y);
+            let temperature = sampler.temperature(x, y);
+            if elevation < 0.5 {
+                low.push(temperature);
+            } else if elevation > 0.8 {
+                high.push(temperature);
+            }
+        }
+
+        assert!(
+            low.len() > 100 && high.len() > 100,
+            "not enough of either to compare: {} low, {} high",
+            low.len(),
+            high.len()
+        );
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let (low, high) = (mean(&low), mean(&high));
+        assert!(
+            high < low - 5.0,
+            "the high ground averages {high:.1} C against the lowland's {low:.1} C, \
+             which is not enough of a drop to put a snow line anywhere"
+        );
+    }
+
+    /// The temperature must not be a second view of a landscape already drawn. Its
+    /// own salt is what makes a cold spell cross a valley rather than follow it —
+    /// the shape of `hardness_is_uncorrelated_with_the_biome_map`, applied to the
+    /// field this one shares its position with.
+    #[test]
+    fn temperature_is_independent_of_the_other_fields() {
+        let config = TerrainConfig::default();
+        let sampler = config.sampler();
+
+        // The anomaly alone: the normal with the height and the biome taken out, so
+        // what is left is the field's own contribution.
+        let mut anomaly = Vec::new();
+        let mut humidity = Vec::new();
+        for i in 0..8000u32 {
+            let x = (i.wrapping_mul(2654435761) % 4000) as f32;
+            let y = (i.wrapping_mul(40503) % 4000) as f32;
+            let blended = sampler.biomes.blend(x, y);
+            anomaly.push(
+                sampler.temperature(x, y) - sampler.sea_level_celsius
+                    + sampler.lapse_celsius * sampler.height(&blended.recipe, x, y)
+                    - blended.recipe.temperature_bias,
+            );
+            humidity.push(sampler.humidity(x, y));
+        }
+
+        let correlation = correlation(&anomaly, &humidity);
+        assert!(
+            correlation.abs() < 0.15,
+            "the temperature anomaly correlates {correlation:.3} with humidity, so it is \
+             the same landscape read twice rather than a field of its own"
+        );
+    }
+
+    /// The `produces_every_base_kind` of this feature: a default that quietly gives a
+    /// world which never freezes has no snow in it, and one that never thaws has snow
+    /// that never goes away. Both are the same defect — a transient effect that is
+    /// not transient — and neither is visible in any other test here.
+    ///
+    /// Measured against the *normal alone*, without the day's swing, so it is a claim
+    /// about the climate rather than about how the ground module happens to be tuned.
+    #[test]
+    fn the_default_config_leaves_the_world_both_freezing_and_thawed() {
+        let config = TerrainConfig::default();
+        let sampler = config.sampler();
+
+        let mut land = 0u32;
+        let mut cold = 0u32;
+        for i in 0..20000u32 {
+            let x = (i.wrapping_mul(2654435761) % 4000) as f32;
+            let y = (i.wrapping_mul(40503) % 4000) as f32;
+            // The sea is excluded: nothing lies on it, and the pass that draws the
+            // cover already knows that.
+            if sampler.elevation(x, y) <= config.shallow_water_max {
+                continue;
+            }
+            land += 1;
+            // Within a plausible night's swing of freezing is what "it snows here
+            // sometimes" means. Ten degrees is generous on purpose — this guards
+            // against a world tens of degrees off, not against a retune.
+            if sampler.temperature(x, y) < 10.0 {
+                cold += 1;
+            }
+        }
+
+        let share = cold as f32 / land as f32;
+        assert!(
+            (0.05..0.9).contains(&share),
+            "{:.1}% of the land is within a night's swing of freezing: at one end it \
+             never snows, at the other it never thaws",
+            share * 100.0
+        );
+    }
+
+    /// Pearson's, for the independence check above.
+    fn correlation(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len() as f32;
+        let mean_a = a.iter().sum::<f32>() / n;
+        let mean_b = b.iter().sum::<f32>() / n;
+        let mut covariance = 0.0;
+        let mut variance_a = 0.0;
+        let mut variance_b = 0.0;
+        for (a, b) in a.iter().zip(b) {
+            let (da, db) = (a - mean_a, b - mean_b);
+            covariance += da * db;
+            variance_a += da * da;
+            variance_b += db * db;
+        }
+        covariance / (variance_a.sqrt() * variance_b.sqrt()).max(f32::EPSILON)
     }
 
     /// The thresholds are only useful if the default config actually produces a

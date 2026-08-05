@@ -4,13 +4,14 @@ mod biome;
 pub(crate) mod city;
 mod city_panel;
 mod drainage;
+pub(crate) mod ground;
 pub(crate) mod growth;
 mod noise;
 pub(crate) mod plan;
 mod river;
 pub(crate) mod road;
 mod screen;
-mod sun;
+pub(crate) mod sun;
 pub(crate) mod terrain;
 mod tint;
 pub(crate) mod weather;
@@ -46,6 +47,7 @@ impl Plugin for GameplayPlugin {
             screen::ScreenEffectPlugin,
             tint::TerrainTintPlugin,
             weather::WeatherPlugin,
+            ground::GroundPlugin,
             city_panel::CityPanelPlugin,
             sun::SunPlugin,
         ));

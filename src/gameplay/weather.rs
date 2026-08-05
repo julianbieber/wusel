@@ -289,21 +289,14 @@ fn advance_weather_clock(
     mut sky: ResMut<SkySampler>,
 ) {
     let delta = time.delta_secs();
-    let drift = config.wind_drift_tiles_per_second / config.shape_period_tiles * delta;
 
-    // Wrapped rather than accumulated: an offset that grew all session would
-    // eventually quantize, and a map period is exactly where a wrap is invisible.
-    clock.coarse_offset = (clock.coarse_offset + drift).fract();
-    clock.fine_offset =
-        (clock.fine_offset + drift * config.cloud_fine_drift * config.cloud_fine_scale).fract();
+    // The sky drifts itself and the clock reads it back, so there is one copy of
+    // where the weather is rather than two kept in step. `streak_phase` is the
+    // clock's own: streaks are screen-space decoration and nothing off screen can be
+    // rained on by them, so the sampler has no use for it.
+    sky.drift(delta);
+    (clock.coarse_offset, clock.fine_offset) = sky.offsets();
     clock.streak_phase = (clock.streak_phase + config.rain_streak_speed * delta).fract();
-
-    // The CPU sky is drifted from the same clock in the same system, so the
-    // simulation and the overlay can never be a frame apart about where the
-    // weather is. `streak_phase` is not carried across: streaks are screen-space
-    // decoration and nothing off-screen can be rained on by them.
-    sky.coarse_offset = clock.coarse_offset;
-    sky.fine_offset = clock.fine_offset;
 }
 
 /// Hands this frame's sky to the one pass that draws it. The clock goes over as
@@ -411,7 +404,11 @@ fn shape_at(
 /// gets an answer, not the machinery. Its absence is a clear sky, the same fallback
 /// an unbaked map gives the overlay, which is what lets the simulation run in a test
 /// with no weather plugin at all.
-#[derive(Resource)]
+/// `Clone` because [`crate::gameplay::ground`]'s step runs on the compute pool and
+/// has to own everything it reads — the sampler is two `Vec2`s, a config and a noise
+/// field's offset, so copying it per step is nothing beside the 65k evaluations it
+/// is copied for.
+#[derive(Resource, Clone)]
 pub struct SkySampler {
     field: TilingNoiseField,
     config: WeatherConfig,
@@ -420,7 +417,7 @@ pub struct SkySampler {
 }
 
 impl SkySampler {
-    fn new(terrain: &TerrainConfig, config: &WeatherConfig) -> Self {
+    pub(super) fn new(terrain: &TerrainConfig, config: &WeatherConfig) -> Self {
         Self {
             field: TilingNoiseField::new(
                 terrain.seed,
@@ -432,6 +429,29 @@ impl SkySampler {
             coarse_offset: Vec2::ZERO,
             fine_offset: Vec2::ZERO,
         }
+    }
+
+    /// Drift the sky by `seconds` of game time.
+    ///
+    /// **The clock's arithmetic, and its only copy.** `advance_weather_clock` calls
+    /// this and then reads the offsets back, so the sky the simulation asks and the
+    /// sky the overlay draws can never be a frame apart about where the weather is.
+    ///
+    /// The offsets are wrapped rather than accumulated: an offset that grew all
+    /// session would eventually quantize, and a map period is exactly where a wrap is
+    /// invisible.
+    pub(super) fn drift(&mut self, seconds: f32) {
+        let drift =
+            self.config.wind_drift_tiles_per_second / self.config.shape_period_tiles * seconds;
+        self.coarse_offset = (self.coarse_offset + drift).fract();
+        self.fine_offset = (self.fine_offset
+            + drift * self.config.cloud_fine_drift * self.config.cloud_fine_scale)
+            .fract();
+    }
+
+    /// Where it has drifted to, in map periods.
+    pub(super) fn offsets(&self) -> (Vec2, Vec2) {
+        (self.coarse_offset, self.fine_offset)
     }
 
     /// How hard it is raining over a tile, on 0..1.
@@ -743,22 +763,24 @@ mod tests {
     /// bound is on the wrap rather than on how long you play.
     #[test]
     fn a_long_session_does_not_quantize_the_weather_clock() {
+        let terrain = TerrainConfig::default();
         let config = WeatherConfig::default();
+        let mut sky = SkySampler::new(&terrain, &config);
         let mut clock = WeatherClock::default();
         let delta = 1.0 / 60.0;
-        let drift = config.wind_drift_tiles_per_second / config.shape_period_tiles * delta;
 
-        // Ten hours at 60 fps.
+        // Ten hours at 60 fps, through the same call the running game makes.
         for _ in 0..(60 * 60 * 60 * 10) {
-            clock.coarse_offset = (clock.coarse_offset + drift).fract();
+            sky.drift(delta);
             clock.streak_phase = (clock.streak_phase + config.rain_streak_speed * delta).fract();
         }
 
-        assert!(clock.coarse_offset.x.abs() < 1.0 && clock.coarse_offset.y.abs() < 1.0);
+        let (coarse, _) = sky.offsets();
+        assert!(coarse.x.abs() < 1.0 && coarse.y.abs() < 1.0);
         assert!(clock.streak_phase.abs() < 1.0);
         // The step is still resolvable at the end of it, which is the thing an
         // unwrapped accumulator loses.
-        let stepped = (clock.coarse_offset + drift).fract();
-        assert_ne!(stepped, clock.coarse_offset);
+        sky.drift(delta);
+        assert_ne!(sky.offsets().0, coarse);
     }
 }

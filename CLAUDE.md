@@ -574,7 +574,7 @@ Defaults carry their measurements, taken with the `#[ignore]`d `the_default_conf
 lines in its fragment function** — not an ordering between systems:
 
 ```text
-scene → height ramp → sun light → cloud shadow → rain → cloud
+scene → height ramp → ground cover → sun light → cloud shadow → rain or snowfall → cloud
 ```
 
 There used to be two, ping-ponging the same `ViewTarget`, so the second read what the first wrote.
@@ -583,11 +583,19 @@ the tint had already lit the world, and gh-26 put the sun in the *tint* pass rat
 because the tint was the only thing binding the heightmap — the same argument as merging, applied once
 already. Merged, the light is a local and the field is gone.
 
-**Ownership did not move, only the drawing did.** `tint.rs` still owns the ramp, `weather.rs` the sky
-and its bakes, `sun.rs` the light; each writes its own slice of one `ScreenOverlay` through a setter
-(`set_ramp`, `set_sun`, `set_sky`), so the uniform's field order stays private beside the shader that
-reads it. What `screen.rs` owns outright is the heightmap texture, the pipeline, the specializer, the
-two ping-pong bind groups and the pass.
+**Ownership did not move, only the drawing did.** `tint.rs` still owns the ramp and the dither,
+`weather.rs` the sky and its bakes, `sun.rs` the light, `ground.rs` the wetness and the snow; each
+writes its own slice of one `ScreenOverlay` through a setter (`set_ramp`, `set_sun`, `set_sky`,
+`set_ground`), so the uniform's field order stays private beside the shader that reads it. What
+`screen.rs` owns outright is the heightmap texture, the pipeline, the specializer, the two ping-pong
+bind groups and the pass.
+
+Two things fall out of that ordering for nothing, and they are why gh-28 wanted the merge first. The
+cover composites *before* the light, so snow is lit by the same sun as the ground it lies on and
+shadowed by the same ridge, with nothing plumbed; and the clouds come after, so a cloud shadow crossing
+a snowfield is a later line rather than a coupling. The water exclusion and the tile quantization the
+cover needs were both already written for the height ramp — the cover sits inside the same branch and
+reads the same `tile`.
 
 `ScreenUniform` in `screen.rs` and in `screen.wgsl` are the same struct written twice: **field order is
 the binding layout**. Vectors are declared before scalars so std140 padding agrees on both sides,
@@ -596,11 +604,21 @@ failure when you enter gameplay, not a build error — and `just check-web` only
 will not catch a wgsl construct the web backend rejects. Adding a knob means touching the Rust struct,
 the wgsl struct, the owning module's setter and its config doc comment together.
 
-**Every map has a blank fallback and the pass always draws.** A 1×1 zero R8 texture stands in for a
-heightmap whose session has not started and for a sky whose bake has not landed — zero height is below
-any water line and zero cloud probability is a clear sky, so each absence is the fallback that module
-already documents. That is what lets one bind group layout carry maps arriving at different times; with
-one pass, a missing map that skipped the whole thing would take the *other* effects down with it.
+**Every map has a blank fallback and the pass always draws.** A 1×1 zero texture stands in for a
+heightmap whose session has not started, a sky whose bake has not landed and a ground with no cover —
+zero height is below any water line, zero cloud probability is a clear sky and zero cover is dry
+ground, so each absence is the fallback that module already documents. That is what lets one bind group
+layout carry maps arriving at different times; with one pass, a missing map that skipped the whole
+thing would take the *other* effects down with it.
+
+**The climate map is the one exception, and it is worth knowing why.** Its zero decodes to
+`CLIMATE_MIN_CELSIUS`, which would put the whole world under falling snow for the second its bake
+takes — so it gets its own blank, written with a byte meaning a mild `CLIMATE_FALLBACK_CELSIUS`. An
+unbaked climate rains, which is what the world did before this feature existed. The lesson generalises:
+"absence is the fallback" is a claim about what zero *means* in each map, not a property of zero.
+
+Seven textures now — scene, height, cloud probability, cloud shape, ground cover, dither, climate — and
+five samplers, against WebGL2's sixteen-texture limit.
 
 The pass is registered `.in_set(Core2dSystems::PostProcess).after(tonemapping)`. Bevy 0.19 has **no
 node-based render graph** for Core2d — no `Node2d`, no `bevy_render::render_graph` — so a post-process
@@ -773,9 +791,113 @@ takes those figures. Note none of this is visible to a unit test: what proved th
 is a pair of captures at `strength` 0 and 0.85 with the weather plugin removed, diffed — the ratio came
 out 0.79..0.86 across the view, varying with the terrain under it.
 
-Only the height half of gh-13 is here. The noise half — a per-tile dither so identical tiles do not
-repeat exactly — is a second step with its own spec, and would be a small *tiling* dither map beside
-this one, the same trick the weather's shape map uses.
+**The noise half of gh-13 landed early, and for a different reason.** `GroundDither` is the small
+*tiling* per-tile map this module always wanted — 128×128 R8, one texel per tile, repeated — and it is
+here because this is the module that decides how a smooth quantity becomes a *tile*. gh-28 is what
+needed it first: it is what the snow cover is thresholded against. Three things about it:
+
+- **It is a smooth field, not white noise, and that is the whole of it.** Thresholding a correlated
+  field gives coherent patches that shrink from their *edges* as the coverage falls, which is what
+  melting snow does. White noise gives salt-and-pepper that dissolves uniformly everywhere at once.
+- **The threshold is squeezed into `softness..1 - softness`** rather than being the dither value
+  itself. That is what makes the endpoints exact — full coverage snows every tile, no coverage snows
+  none — and without it any tile whose dither fell under the softness would be faintly snowed on a bare
+  summer afternoon. `the_dither_leaves_full_and_empty_coverage_alone` is the guard, and `snow_lying` in
+  `tint.rs` is the shader's arithmetic transcribed so it can be checked without a GPU.
+- **Nearest and repeated**, unlike every other map in the crate, which are linear. One texel is one
+  tile and the point is that a tile gets its *own* number; filtering would put a snow edge inside an
+  8px tile.
+
+Baked at `Startup` rather than on entering gameplay, because it is a knob and not world state.
+
+### The ground (`gameplay/ground.rs`)
+
+What the weather leaves behind: rain wets the ground and it dries, below freezing what falls lies as
+snow and the snow melts back into wetness. **Nothing here writes a tile.** `WorldMap` is untouched, no
+chunk is ever marked dirty, and the alpine `Snow` *kind* keeps meaning the height band it always did —
+with a transient snow line moving around underneath it.
+
+**This is the first state the weather has ever had.** Everything in `weather.rs` is a pure function of
+`(place, clock)`; wetness and snow are integrals of what has happened, so they have to be remembered.
+Three ways were considered:
+
+- **Per tile.** 16.7 M tiles × 2 bytes is 33 MB beside the heightmap's 16, and a step touching every
+  one. The resolution buys nothing — a rain patch is a cloud interior, tens of tiles across.
+- **Stateless, as an upwind convolution.** Worth knowing about because it almost works: the cloud field
+  translates with the wind, so the rain history at a point is a line *upwind* of it and a dozen taps in
+  the shader would give wet trails with no state at all. It fails because the two shape layers drift at
+  different speeds — so the field is only approximately a translation — and because snow's time
+  constant is a whole day, which is hundreds of taps. Still the right trick if wetness ever has to
+  exist without a grid.
+- **A coarse world grid** ← chosen. 256², one texel per 16 tiles, 128 KB for the whole world. Bilinear
+  on the way out so the *envelope* is smooth; the per-tile look comes from the dither, not the grid.
+
+**The grid does not know where the water is, and must not learn.** Snow accumulating over a lake is
+harmless because the pass that draws it already excludes everything at or below the water line — it had
+to, for the height ramp. That is what keeps this module free of `WorldMap` by construction rather than
+by discipline.
+
+`advance` is the whole model and fits on a screen: a `snowing` ramp across the freezing point (so sleet
+exists and no frame flips a region), a degree-day melt, meltwater into wetness, and an exponential dry
+that is faster the warmer it is. **It is stable for any `dt`** — the gains clamp, the melt is bounded by
+the snow there is, and the decay is an exponential of something that cannot be positive. That matters
+because the step runs on `AsyncComputeTaskPool` at whatever interval the frame rate leaves it, so `dt`
+is not a number this module chooses. `cover_stays_between_none_and_full_under_any_step` fuzzes it.
+
+**A step costs 22.0 ms** — 65k texels × two tiling fbms through `SkySampler` — against a `step_seconds`
+of 0.25, so about 9% of one core continuously and thirteen times a 60 fps frame budget. Hence the pool,
+with one step in flight; a slow step swallows its backlog rather than queueing, because the model is an
+integral and integrating a longer interval is exactly right. The step goes through the public
+`SkySampler` rather than the baked texels so the crate still holds **two** transcriptions of the sky's
+arithmetic and not three; if that ever has to be cheaper the ladder is 128² first (a quarter of the
+bill), then the baked-texel shortcut (~5× at the price of that third transcription), then a compute
+shader — which is a product decision as much as a performance one, since WebGL2 has none and the CPU
+could no longer read the field without an async readback.
+
+**Temperature is a field the world did not have.** `TerrainSampler::temperature` returns the climate
+normal in **degrees Celsius** — a physical unit rather than the crate's usual 0..1, because a freezing
+point has to mean something — from `sea_level_celsius − lapse_celsius × elevation + the biome's
+temperature_bias + its own noise`. It is deliberately **not** part of `TileSample` and `classify` may
+never read it, on exactly the terms `relief_tiles` may only be read by the lighting: a tile's *kind*
+must not start depending on the weather. `HeightRecipe` gains one blendable column for it, and the
+coverage figures are unmoved because nothing in generation reads it.
+
+Two things fall out of the numbers rather than being arranged:
+
+- **The transient snow band is `2 × amplitude / lapse_celsius` of the height range** — at 26/34 with a
+  ~7-degree swing that is elevation 0.55 to 0.97, nearly all the land above the middle of the lowland
+  band. That is why the loop is visible in one 300-second day and not only in a configured winter.
+- **A desert freezes at night**, because the diurnal amplitude is a *field* damped by humidity: dry air
+  swings hard and wet air barely moves. The humidity is already in the climate map, so it costs nothing
+  and nothing here learns what a desert is.
+
+The day's swing comes from `sun::warmth_at`, which is `sin(altitude)` scaled to fit −1..1 — geometry
+again, so a summer night is milder and a midnight sun never reaches −1, with nothing saying so. The lag
+is the caller's (`thermal_lag_rotations`), and it is a *phase shift*: it puts the warmest moment in the
+mid-afternoon, which is right, and the temperature trough in the small hours rather than before dawn,
+which is not quite. A dawn minimum needs an asymmetric response, which is state.
+
+The seasonal term is `seasonal_amplitude_celsius × sin(declination) / sin(axial_tilt)` and is
+**identically zero at the default equinox**, so an orbit landing later changes nothing here.
+
+Defaults carry their measurements from the `#[ignore]`d `the_default_config_measures_a_day_of_weather`.
+At the shipped equinox the snow line walks from elevation **0.59 before dawn to 0.77 in the late
+afternoon and back**, with the snowed share of land running 8.3% → 3.4% → 8.3% over one day and mean
+wetness on 17.3% of it. Two shapes in that worth keeping: the snow peak lands at **04:30**, later than
+the temperature trough, because snow is an *integral* — the lag alone could not have put it there; and
+the wet share barely moves, because wetness is a steady state with weather passing through it rather
+than a cycle. Wetness saturates where it rains (p99 is 1.0 over land) even though the median is 0.
+
+**What proved the pass actually draws it**, since none of the drawing half is visible to a unit test:
+the scenario run twice, once with the cover composite in `screen.wgsl` multiplied out, and the frames
+diffed. **16.1% of pixels lighter by up to +96 luma** where snow lies, and 0% darker — the snow. In
+daylight the wet ground shows as ~1% darker by up to −8. That comparison needs `fixed-delta 0` while
+the waits run or the two runs are not comparable; see the scenario's own comment.
+
+`GroundConfig` is a knob and outlives a session; `GroundCover`, `ClimateMaps` and `ClimateBake` are
+world state and go on `OnExit`, which cancels a bake or a step still in flight. `GroundCover::at` is
+the read seam, built the way `SkySampler` was — an answer, not the machinery — so `growth.rs` starving
+a field under snow is a change to that module and not to this one. It is explicitly out of scope here.
 
 ### City stats panel (`gameplay/city_panel.rs`, `assets/shaders/wood_panel.wgsl`)
 
@@ -899,6 +1021,29 @@ exists while every scenario still passes. Concretely —
   this whole tool exists to remove, and one missing condition reintroduces it.
 - **New world state worth asserting on** needs an `observe` topic, so a scenario can check it without
   a human reading a screenshot.
+- **A clock the world runs on needs a verb to set it.** gh-28 added `sun <rotation>` and
+  `season <orbit_phase>` for this: without them a scenario has to wait 300 real seconds to see
+  midnight, and there is no way at all to see a winter. The rotation *is* the sun's only state, so
+  writing it is the whole of moving the clock — everything else is re-derived the same frame.
+
+**Two traps in driving a world with clocks in it**, both found by getting them wrong:
+
+- **The clock never stops.** `sun 0.5` sets where the planet is *now*; every `step` after it turns the
+  planet on. The hour a capture is taken at is the hour it was set to plus the stepping since, and a
+  scenario that forgets this labels a dusk frame "noon" and still passes.
+- **A knob outlives the session.** `PlanetConfig` and `GroundConfig` are knobs by design, so `season
+  0.75` set by one scenario is still in force for the next one run against the same process. A
+  scenario that depends on the season has to *state* it — `scenarios/snow_falls_and_melts.txt` opens
+  with `season 0` for exactly this reason.
+
+**`fixed-delta 0` is the trick that makes two runs comparable at all**, and it is worth knowing about
+before reaching for anything cleverer. Every clock in the game is driven by `Time::delta`, so a zero
+delta freezes the sun, the weather and the ground — while generation, the plan and the bakes still
+land, because those are polled per frame rather than driven by time. Put it *before* the waits, which
+take a machine-dependent number of frames, and switch to a real delta afterwards: everything from there
+on is a pure function of the seed. Without it the sky has drifted a different distance by the first
+capture and a before/after diff is measuring the weather. Both the pass merge and the ground cover were
+verified this way, and the ground's state came out bit-identical across runs.
 
 The cost is deliberately lopsided in favour of keeping this up: a verb or a topic is a small addition
 to `control/command.rs` or `control/observe.rs`, while a *scenario* is a data file needing no

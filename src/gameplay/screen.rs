@@ -10,14 +10,20 @@
 //! lines:
 //!
 //! ```text
-//!   scene -> height ramp -> sun light -> cloud shadow -> rain -> cloud
+//!   scene -> height ramp -> ground cover -> sun light -> cloud shadow
+//!         -> rain or snowfall -> cloud
 //! ```
 //!
+//! Two things fall out of that ordering for nothing. The cover composites *before*
+//! the light, so snow is lit by the same sun as the ground it lies on and shadowed by
+//! the same ridge; and the clouds come after, so a shadow crossing a snowfield is a
+//! later line rather than a coupling.
+//!
 //! **Ownership did not move, only the drawing did.** [`crate::gameplay::tint`] still
-//! owns the ramp, [`crate::gameplay::weather`] the sky and its bakes,
-//! [`crate::gameplay::sun`] the light; each writes its own slice of [`ScreenOverlay`]
-//! through a setter, so the uniform's field order stays private in here beside the
-//! shader that reads it.
+//! owns the ramp and the dither, [`crate::gameplay::weather`] the sky and its bakes,
+//! [`crate::gameplay::sun`] the light, [`crate::gameplay::ground`] the wetness and
+//! the snow; each writes its own slice of [`ScreenOverlay`] through a setter, so the
+//! uniform's field order stays private in here beside the shader that reads it.
 //!
 //! What this module owns outright is everything the GPU needs: the heightmap texture,
 //! the pipeline, the specializer, the two ping-pong bind groups and the pass.
@@ -51,8 +57,9 @@ use bevy::{
             RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler,
             SamplerBindingType, SamplerDescriptor, ShaderStages, ShaderType, Specializer,
             SpecializerKey, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-            TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-            TextureView, TextureViewDescriptor, TextureViewId, Variants,
+            TextureDataOrder, TextureDescriptor, TextureDimension, TextureFormat,
+            TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewId,
+            Variants,
             binding_types::{sampler, texture_2d, uniform_buffer},
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
@@ -65,9 +72,14 @@ use bevy::{
 use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
+        ground::{
+            CLIMATE_FALLBACK_CELSIUS, CLIMATE_MAX_AMPLITUDE_CELSIUS, CLIMATE_MAX_CELSIUS,
+            CLIMATE_MIN_CELSIUS, ClimateTexture, GroundConfig, GroundCoverTexture,
+            TemperatureOffset,
+        },
         sun::{PlanetConfig, Sun},
         terrain::TerrainConfig,
-        tint::TerrainTintConfig,
+        tint::{GroundDither, TerrainTintConfig},
         weather::{WeatherConfig, WeatherMaps},
         world::{
             CHUNK_SIZE, ChunkHeights, HeightUploadQueue, TILE_DISPLAY_SIZE, WORLD_CHUNKS,
@@ -127,6 +139,24 @@ pub(super) struct ScreenUniform {
     rain_softness: f32,
     rain_strength: f32,
     streak_phase: f32,
+    dither_period_tiles: f32,
+    wet_darkening: f32,
+    wet_desaturation: f32,
+    snow_lightening: f32,
+    snow_dither_softness: f32,
+    /// This step's temperature offset from the climate normal. Two scalars rather
+    /// than a map, because when it is has nothing to do with where you are — all the
+    /// place-dependence is already baked into the climate map.
+    temperature_swing: f32,
+    temperature_seasonal_celsius: f32,
+    freezing_celsius: f32,
+    freezing_softness_celsius: f32,
+    /// How to read a temperature back out of the climate map's two bytes. Taken from
+    /// the constants [`crate::gameplay::ground`] quantized it with, so the encoder
+    /// and the decoder cannot drift.
+    climate_min_celsius: f32,
+    climate_span_celsius: f32,
+    climate_amplitude_span_celsius: f32,
 }
 
 /// Lives on the one world camera while [`Screen::Gameplay`] is up, and is the only
@@ -149,6 +179,30 @@ impl ScreenOverlay {
         self.0.tint_low = config.tint_low;
         self.0.tint_high = config.tint_high;
         self.0.strength = config.strength;
+        // The dither's period comes over with the ramp rather than with the ground,
+        // because it is a property of the *map* — how much world one repeat covers —
+        // and the map is the tint's.
+        self.0.dither_period_tiles = config.dither_period_tiles.max(1) as f32;
+    }
+
+    /// What the weather has left on the ground, and what the day is doing to it.
+    ///
+    /// The knobs and the temperature offset arrive together because they are one
+    /// question — how to draw the cover this step — and the three quantization
+    /// constants ride along so that the shader can decode the climate map without
+    /// restating numbers `ground.rs` owns.
+    pub(super) fn set_ground(&mut self, config: &GroundConfig, offset: TemperatureOffset) {
+        self.0.wet_darkening = config.wet_darkening;
+        self.0.wet_desaturation = config.wet_desaturation;
+        self.0.snow_lightening = config.snow_lightening;
+        self.0.snow_dither_softness = config.snow_dither_softness;
+        self.0.freezing_celsius = config.freezing_celsius;
+        self.0.freezing_softness_celsius = config.freezing_softness_celsius;
+        self.0.temperature_swing = offset.swing;
+        self.0.temperature_seasonal_celsius = offset.seasonal_celsius;
+        self.0.climate_min_celsius = CLIMATE_MIN_CELSIUS;
+        self.0.climate_span_celsius = CLIMATE_MAX_CELSIUS - CLIMATE_MIN_CELSIUS;
+        self.0.climate_amplitude_span_celsius = CLIMATE_MAX_AMPLITUDE_CELSIUS;
     }
 
     /// Where the sun reaches the screen. Everything about the light and the shadow
@@ -418,11 +472,48 @@ struct ScreenEffectPipeline {
     /// For the scene texture and for the blank stand-ins. The weather's maps bring
     /// their own, baked with the filtering and address mode each one needs.
     scene_sampler: Sampler,
-    /// A 1x1 R8 texture reading zero, standing in for any map that has not landed.
-    /// Zero is a height below the water line and a cloud probability of nothing, so
-    /// every absence is the fallback the module in question already documents.
+    /// A 1x1 texture reading zero, standing in for any map that has not landed. Zero
+    /// is a height below the water line, a cloud probability of nothing and dry
+    /// ground, so every absence is the fallback the module in question documents.
     blank: TextureView,
+    /// And the one map whose zero would be wrong — see [`CLIMATE_FALLBACK_CELSIUS`].
+    blank_climate: TextureView,
     variants: Variants<RenderPipeline, ScreenEffectSpecializer>,
+}
+
+/// One texel of a two-channel texture, written once and read wherever a real map has
+/// not landed.
+///
+/// `Rg8` for all of them: the binding layout only asks that a texture be filterable
+/// and two-dimensional, so the same shape stands in for the R8 heightmap, the R8
+/// cloud maps and the Rg8 cover alike.
+fn blank_texture(
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    label: &str,
+    texel: [u8; 2],
+) -> TextureView {
+    render_device
+        .create_texture_with_data(
+            render_queue,
+            &TextureDescriptor {
+                label: Some(label),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rg8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            &texel,
+        )
+        .create_view(&TextureViewDescriptor::default())
 }
 
 struct ScreenEffectSpecializer;
@@ -455,6 +546,7 @@ impl Specializer<RenderPipeline> for ScreenEffectSpecializer {
 fn init_screen_pipeline(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     asset_server: Res<AssetServer>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
@@ -472,33 +564,55 @@ fn init_screen_pipeline(
                 sampler(SamplerBindingType::Filtering),
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
+                // The ground's cover, the dither it is thresholded against and the
+                // climate that says whether what falls is rain or snow.
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
                 uniform_buffer::<ScreenUniform>(true),
             ),
         ),
     );
 
-    // wgpu zero-initializes, which is the whole of what this is for.
-    let blank = render_device
-        .create_texture(&TextureDescriptor {
-            label: Some("screen_effect_blank_texture"),
-            size: Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::R8Unorm,
-            usage: TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        })
-        .create_view(&TextureViewDescriptor::default());
+    // Two stand-ins for maps that have not landed. Both are one texel: the binding
+    // layout only cares that a texture is filterable and two-dimensional, so a single
+    // `Rg8` reads correctly wherever the shader takes `.r` or `.rg`.
+    //
+    // wgpu zero-initializes, which is the whole of what the first one is for — zero
+    // height is below any water line, zero cloud probability is a clear sky and zero
+    // cover is dry ground, so every absence is the fallback its own module already
+    // documents.
+    let blank = blank_texture(
+        &render_device,
+        &render_queue,
+        "screen_effect_blank_texture",
+        [0, 0],
+    );
+    // The climate is the exception, because *its* zero is -40 C and would put the
+    // whole world under snow before the bake landed. Mild and unvarying instead: an
+    // unbaked climate rains, which is the behaviour that was there before this
+    // feature existed.
+    let blank_climate = blank_texture(
+        &render_device,
+        &render_queue,
+        "screen_effect_blank_climate_texture",
+        [
+            (((CLIMATE_FALLBACK_CELSIUS - CLIMATE_MIN_CELSIUS)
+                / (CLIMATE_MAX_CELSIUS - CLIMATE_MIN_CELSIUS))
+                * 255.0)
+                .round() as u8,
+            0,
+        ],
+    );
 
     commands.insert_resource(ScreenEffectPipeline {
         layout: layout.clone(),
         scene_sampler: render_device.create_sampler(&SamplerDescriptor::default()),
         blank,
+        blank_climate,
         variants: Variants::new(
             ScreenEffectSpecializer,
             RenderPipelineDescriptor {
@@ -568,6 +682,9 @@ fn prepare_screen_bind_groups(
     uniforms: Res<ComponentUniforms<ScreenUniform>>,
     heights: Option<Res<TerrainHeightTexture>>,
     maps: Option<Res<WeatherMaps>>,
+    cover: Option<Res<GroundCoverTexture>>,
+    dither: Option<Res<GroundDither>>,
+    climate: Option<Res<ClimateTexture>>,
     images: Res<RenderAssets<GpuImage>>,
     render_device: Res<RenderDevice>,
 ) {
@@ -579,30 +696,49 @@ fn prepare_screen_bind_groups(
     };
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
 
-    // Each map falls back to the blank independently, so the pass draws from the
-    // first frame of a session: the ramp works before the sky has baked, and the sky
-    // works over terrain still arriving.
+    // Each map falls back independently, so one that has not landed cannot take the
+    // others down with it: the ramp works before the sky has baked, the sky works
+    // over terrain still arriving, and both work before the climate is up.
     let height_view = match &heights {
         Some(heights) => &heights.view,
         None => &pipeline.blank,
     };
-    let sky = maps
-        .as_ref()
-        .and_then(|maps| Some((images.get(&maps.probability)?, images.get(&maps.shape)?)));
-    let (probability_view, probability_sampler, shape_view, shape_sampler) = match sky {
-        Some((probability, shape)) => (
-            &probability.texture_view,
-            &probability.sampler,
-            &shape.texture_view,
-            &shape.sampler,
-        ),
-        None => (
-            &pipeline.blank,
-            &pipeline.scene_sampler,
-            &pipeline.blank,
-            &pipeline.scene_sampler,
-        ),
-    };
+    fn map<'a>(
+        image: Option<&'a GpuImage>,
+        blank: &'a TextureView,
+        blank_sampler: &'a Sampler,
+    ) -> (&'a TextureView, &'a Sampler) {
+        match image {
+            Some(image) => (&image.texture_view, &image.sampler),
+            None => (blank, blank_sampler),
+        }
+    }
+    let fallback = &pipeline.scene_sampler;
+    let (probability_view, probability_sampler) = map(
+        maps.as_ref().and_then(|maps| images.get(&maps.probability)),
+        &pipeline.blank,
+        fallback,
+    );
+    let (shape_view, shape_sampler) = map(
+        maps.as_ref().and_then(|maps| images.get(&maps.shape)),
+        &pipeline.blank,
+        fallback,
+    );
+    let (cover_view, cover_sampler) = map(
+        cover.as_ref().and_then(|cover| images.get(&cover.0)),
+        &pipeline.blank,
+        fallback,
+    );
+    let (dither_view, dither_sampler) = map(
+        dither.as_ref().and_then(|dither| images.get(&dither.0)),
+        &pipeline.blank,
+        fallback,
+    );
+    let (climate_view, climate_sampler) = map(
+        climate.as_ref().and_then(|climate| images.get(&climate.0)),
+        &pipeline.blank_climate,
+        fallback,
+    );
 
     for (entity, target) in &views {
         let bind_group = |scene: &_| {
@@ -617,6 +753,12 @@ fn prepare_screen_bind_groups(
                     probability_sampler,
                     shape_view,
                     shape_sampler,
+                    cover_view,
+                    cover_sampler,
+                    dither_view,
+                    dither_sampler,
+                    climate_view,
+                    climate_sampler,
                     uniform_binding.clone(),
                 )),
             )

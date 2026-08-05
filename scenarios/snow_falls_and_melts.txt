@@ -1,0 +1,106 @@
+# Watch a night's snow lie on the high ground and be gone by the afternoon.
+#
+# Run with:  just drive run scenarios/snow_falls_and_melts.txt
+#
+# What this proves that a unit test cannot: the cover the step computes actually
+# reaches the screen. `advance` is checked without an app in gameplay/ground.rs; the
+# only way to know the pass draws what it holds is a capture beside an `observe`, and
+# the only way to know the shader compiled at all is `observe log` — a shader that
+# fails to compile draws nothing rather than drawing wrong, so every other check here
+# would still pass.
+#
+# **The clock never stops, and that is the thing to hold on to when editing this.**
+# `sun <r>` sets where the planet is *now*; every `step` after it turns the planet on.
+# So the hour a capture is taken at is the hour it was set to plus the stepping since,
+# and the comments below say which is which. Getting that wrong labels a dusk frame
+# "noon" and it still passes.
+
+# **A zero delta first, and it is not a formality.** Every clock in the game is driven
+# by `Time::delta`, so this freezes the sun, the weather and the ground while the four
+# waits below run. Those land on wall-clock time and so take a different number of
+# frames on every machine — without this the sky would have drifted a different
+# distance by the time the first capture is taken, and two runs of this file would not
+# be comparable. Generation, the plan and the bakes are polled per frame rather than
+# driven by time, so they still land.
+fixed-delta 0
+
+# The orbit is a *knob*, so it outlives a session and whatever the last scenario left
+# it at is what this one would open with. Stating it is the difference between a
+# reproducible run and one that quietly measures somebody else's winter.
+season 0
+
+enter gameplay
+
+# The world, the plan, the sky, and the climate map the ground's first step waits on.
+# All four land on wall-clock time, which is exactly why they are waits and not frame
+# counts.
+wait terrain
+wait plan
+wait sky
+wait ground
+
+# And now let it run, 15x. One frame is one ground step at the default `step_seconds`,
+# a whole 300-second day is 1200 frames rather than 18000, and everything from here on
+# is a pure function of the seed.
+fixed-delta 1/4
+
+# Before anything else is asked: did the run complain? `observe log` *drains*, so this
+# has to come first or the startup errors are already gone — and a wgsl error is the
+# one failure no capture below could show.
+observe log
+
+# East and north to 2864,2944, where 99 of 144 sampled tiles sit in the transient
+# snow band — elevation 0.60 to 0.82, which is the ground that freezes overnight and
+# thaws by afternoon. The world centre is lowland at 11 C and it only ever rains
+# there, so a capture taken from the opening view would show this feature doing
+# nothing. 128 world units a frame at 1/4 s, so 51 frames is 816 tiles.
+hold D 50
+hold W 55
+# The streamer spawns a bounded number of chunk entities a frame, so give it a moment
+# to catch up with a pan that outran it.
+step 30
+observe camera
+
+# One whole turn from a bone-dry world, so everything below is the cycle rather than
+# the world filling in. 1200 frames at 1/4 s is exactly `rotation_period_seconds`, so
+# this also lands the sun back where it started.
+step 1200
+
+# --- the peak, an hour before dawn ---------------------------------------------
+#
+# 0.854 plus the 0.333 of a turn the 400 frames below add lands at rotation 0.1875,
+# which is 04:30 — where `the_default_config_measures_a_day_of_weather` puts the most
+# snow the world ever carries. A night of it has accumulated on the way there.
+sun 0.854
+step 400
+observe sun
+observe ground
+capture /tmp/wusel-scenario/snow-before-dawn.png
+
+# --- and the trough, late in the afternoon -------------------------------------
+#
+# 635 more frames is 0.529 of a turn: 17:12, the other end of the same measurement.
+# Nothing is set here — the planet simply turns, and the morning melts what the night
+# laid down.
+step 635
+observe sun
+observe ground
+capture /tmp/wusel-scenario/thawed-in-the-afternoon.png
+
+# What should have moved between those two `observe ground` calls: `snowed_fraction`
+# down by better than half, and `wet_fraction` up — because melted snow becomes
+# wetness rather than vanishing.
+
+# --- a winter, which is one moving knob ----------------------------------------
+#
+# The seasonal term is identically zero at an equinox, so this is also the check that
+# it is a knob at all rather than dead arithmetic waiting for an orbit to exist.
+season 0.75
+sun 0.854
+step 400
+observe sun
+observe ground
+capture /tmp/wusel-scenario/snow-in-deep-winter.png
+
+# And again at the end, for anything the stepping and capturing provoked.
+observe log

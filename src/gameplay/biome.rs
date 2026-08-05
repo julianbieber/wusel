@@ -77,6 +77,15 @@ pub struct HeightRecipe {
     pub soil_bias: f32,
     pub vegetation_bias: f32,
     pub humidity_bias: f32,
+    /// Degrees Celsius on top of what the lapse rate already takes off for height.
+    /// It is therefore the part of a region's climate that is *not* derivable from
+    /// how high it is: a desert is hot because the sky over it is clear, not because
+    /// it is low.
+    ///
+    /// Nothing in generation reads it — `classify` may not, on the terms
+    /// [`crate::gameplay::terrain::TerrainSampler::temperature`] states — so the
+    /// coverage figures are unmoved by this column existing.
+    pub temperature_bias: f32,
     /// How far above the water line the sand band reaches, in elevation units.
     /// Zero means no beach: a `Highland` coast drops into the sea as rock.
     pub beach_width: f32,
@@ -118,6 +127,10 @@ impl Biome {
                 soil_bias: 0.0,
                 vegetation_bias: -0.12,
                 humidity_bias: 0.04,
+                // Maritime: the sea is a heat store, so a coast is mild. Its *swing*
+                // is damped too, and that falls out of the humidity bias rather
+                // than being said twice.
+                temperature_bias: 1.0,
                 beach_width: 0.06,
             },
             Biome::Plains => HeightRecipe {
@@ -128,6 +141,8 @@ impl Biome {
                 soil_bias: 0.05,
                 vegetation_bias: -0.18,
                 humidity_bias: 0.0,
+                // The reference the other five are read against.
+                temperature_bias: 0.0,
                 beach_width: 0.04,
             },
             // The same triple as Plains, and the bias is the whole difference: a
@@ -143,6 +158,8 @@ impl Biome {
                 soil_bias: 0.04,
                 vegetation_bias: -0.04,
                 humidity_bias: 0.06,
+                // Canopy shade and what the leaves transpire.
+                temperature_bias: -1.0,
                 beach_width: 0.03,
             },
             // The only recipe that leans on the ridged layer, and the reason it
@@ -158,6 +175,10 @@ impl Biome {
                 soil_bias: -0.15,
                 vegetation_bias: -0.09,
                 humidity_bias: 0.03,
+                // On top of the lapse rate, which has already taken a great deal off
+                // for the height: thin exposed air loses what it gains. Small,
+                // because the height is doing most of this work already.
+                temperature_bias: -2.0,
                 beach_width: 0.0,
             },
             // The one recipe that weighs the dune layer. The biases are what make
@@ -173,6 +194,12 @@ impl Biome {
                 soil_bias: 0.0,
                 vegetation_bias: -0.24,
                 humidity_bias: -0.26,
+                // The biggest entry in the column, and it buys two things at once: a
+                // desert is hot by day, and — because the same dry air is what the
+                // diurnal amplitude is damped by — it is also the place that
+                // freezes hardest at night. Neither is written down anywhere as a
+                // rule about deserts.
+                temperature_bias: 6.0,
                 beach_width: 0.08,
             },
             // Flat and just above the water line, so the lowland band is nearly all
@@ -187,6 +214,10 @@ impl Biome {
                 soil_bias: 0.0,
                 vegetation_bias: -0.20,
                 humidity_bias: 0.22,
+                // Standing water evaporating cools it as much as being low warms it,
+                // so the bias is nothing and the wet air alone makes it mild — a
+                // marsh barely swings between noon and midnight.
+                temperature_bias: 0.0,
                 beach_width: 0.0,
             },
         }
@@ -441,6 +472,7 @@ impl BiomeMap {
             soil_bias: 0.0,
             vegetation_bias: 0.0,
             humidity_bias: 0.0,
+            temperature_bias: 0.0,
             beach_width: 0.0,
             // The kind triple is not here: the cover biome owns it, since an enum
             // cannot be averaged.
@@ -460,6 +492,10 @@ impl BiomeMap {
             recipe.soil_bias += part.soil_bias * share;
             recipe.vegetation_bias += part.vegetation_bias * share;
             recipe.humidity_bias += part.humidity_bias * share;
+            // A temperature can be averaged where a kind cannot, which is the whole
+            // reason this is a number on the recipe rather than a property of a
+            // biome: a coast warms into the sea across the band.
+            recipe.temperature_bias += part.temperature_bias * share;
             recipe.beach_width += part.beach_width * share;
         }
 

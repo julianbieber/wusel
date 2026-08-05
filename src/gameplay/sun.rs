@@ -278,30 +278,27 @@ pub struct Sun {
     /// How far the star stands off the equator today. Constant while
     /// [`PlanetConfig::orbit_phase`] is, and derived rather than stored so that an
     /// orbit is the only thing a season would have to add.
-    #[allow(
-        dead_code,
-        reason = "part of the reader gh-26 exists to provide; seasons are what will read it"
-    )]
+    ///
+    /// [`crate::gameplay::ground`] is what reads it: the seasonal term of its
+    /// temperature is this over the axial tilt, which is identically zero at an
+    /// equinox and so costs nothing until an orbit exists.
     pub declination: f32,
     pub position: SunPosition,
     pub light: Insolation,
 }
 
+/// Three readings off the one piece of state, and nothing simulation-side consumes
+/// any of them yet — [`crate::control`]'s `observe sun` is the only caller, and it
+/// does not exist on wasm. The attribute goes when something in the world reads them,
+/// which is what the seam is for.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 impl Sun {
     /// Local solar time, on 0..24. The rotation *is* the hour; this only scales it.
-    #[allow(
-        dead_code,
-        reason = "the reader gh-26 exists to provide; nothing simulation-side consumes it yet"
-    )]
     pub fn hour(&self) -> f32 {
         self.rotation * 24.0
     }
 
     /// Whether there is a beam at all. The only definition of day in the crate.
-    #[allow(
-        dead_code,
-        reason = "the reader gh-26 exists to provide; nothing simulation-side consumes it yet"
-    )]
     pub fn is_up(&self) -> bool {
         self.position.altitude > 0.0
     }
@@ -313,10 +310,6 @@ impl Sun {
     /// the weather composited over a world the tint had already lit. With one pass the
     /// shader takes the same weighted sum off the uniform itself — so this is now the
     /// CPU's copy of that arithmetic, kept for the readers the sun exists to serve.
-    #[allow(
-        dead_code,
-        reason = "the reader gh-26 exists to provide; the shader has its own copy"
-    )]
     pub fn light_level(&self) -> f32 {
         (self.light.sky + self.light.direct).dot(LUMINANCE)
     }
@@ -395,6 +388,49 @@ fn sun_at(config: &PlanetConfig, rotation: f32) -> Sun {
 /// orbit has got to. Zero at an equinox, the full tilt at a solstice.
 fn declination(config: &PlanetConfig) -> f32 {
     (config.axial_tilt_degrees.to_radians().sin() * (TAU * config.orbit_phase).sin()).asin()
+}
+
+/// How hard the star is heating the ground, on -1..1, at a given rotation.
+///
+/// The one thing this module tells [`crate::gameplay::ground`], and the reason the
+/// world has a day's temperature swing at all. Like everything else here it is
+/// geometry rather than a curve someone drew:
+///
+/// `sin(altitude) = sin φ sin δ + cos φ cos δ cos H` is already a clean sinusoid in
+/// the hour angle, peaking at solar noon and troughing at midnight, so the heating
+/// *is* that expression scaled to fit the interval. At an equinox that reduces to
+/// exactly `cos H` — a symmetric day. Away from one the whole curve shifts with the
+/// declination, so a summer night is less cold and a winter noon less warm, and a
+/// midnight sun never reaches -1 at all. **None of that is written down**; it is what
+/// the same three angles the altitude uses already say.
+///
+/// It is deliberately the *insolation* and not the ground's temperature. The lag
+/// between them is the caller's — `GroundConfig::thermal_lag_rotations` — because
+/// only the ground knows how much thermal mass it is pretending to have. Note what
+/// that buys and what it does not: a phase shift puts the warmest moment in the
+/// mid-afternoon, which is right, and the coldest in the small hours rather than just
+/// before dawn, which is not quite. Getting the dawn minimum needs an asymmetric
+/// response — an integrator that keeps losing heat all night — and that is state,
+/// where this is a function of the rotation alone.
+pub fn warmth_at(config: &PlanetConfig, rotation: f32) -> f32 {
+    let (sin_lat, cos_lat) = config.latitude_degrees.to_radians().sin_cos();
+    let (sin_dec, cos_dec) = declination(config).sin_cos();
+    let cos_hour = (TAU * (rotation - 0.5)).cos();
+
+    // `sin(altitude)` swings between `tilt + amplitude` and `tilt - amplitude` over a
+    // turn. Scaling by whichever of those two is furthest from zero is what keeps the
+    // result inside -1..1 at every latitude and season while leaving the *shape* —
+    // which is the whole information — alone.
+    let tilt = sin_lat * sin_dec;
+    let amplitude = cos_lat * cos_dec;
+    let extreme = (tilt + amplitude).abs().max((tilt - amplitude).abs());
+
+    // At a pole at a solstice the sun neither rises nor sets and there is no swing to
+    // normalise; a flat zero is the honest answer rather than a division blowing up.
+    if extreme < f32::EPSILON {
+        return 0.0;
+    }
+    (tilt + amplitude * cos_hour) / extreme
 }
 
 /// Latitude, declination and hour angle into an altitude and a ground bearing.
@@ -882,6 +918,95 @@ mod tests {
 
         let night = sun_at(&config, 0.0);
         assert!(!night.is_up() && night.position.ray_slope == 0.0);
+    }
+
+    /// The heating peaks at solar noon and troughs at midnight, and stays inside the
+    /// interval it claims at every latitude and season — which is what lets the
+    /// ground scale it by an amplitude in degrees and get degrees back.
+    #[test]
+    fn the_warmth_peaks_at_noon_and_troughs_at_midnight() {
+        for orbit_phase in [0.0, 0.25, 0.5, 0.75] {
+            for latitude_degrees in [0.0, 35.0, 55.0, -20.0, 89.0] {
+                let config = PlanetConfig {
+                    orbit_phase,
+                    latitude_degrees,
+                    ..default()
+                };
+
+                let mut hottest = (0.0f32, f32::MIN);
+                let mut coldest = (0.0f32, f32::MAX);
+                for step in 0..2000 {
+                    let rotation = step as f32 / 2000.0;
+                    let warmth = warmth_at(&config, rotation);
+                    assert!(
+                        (-1.0..=1.0).contains(&warmth),
+                        "warmth {warmth} at latitude {latitude_degrees}, orbit {orbit_phase}",
+                    );
+                    if warmth > hottest.1 {
+                        hottest = (rotation, warmth);
+                    }
+                    if warmth < coldest.1 {
+                        coldest = (rotation, warmth);
+                    }
+                }
+
+                assert!(
+                    (hottest.0 - 0.5).abs() < 0.01,
+                    "the heating peaked at rotation {} rather than at noon",
+                    hottest.0,
+                );
+                assert!(
+                    coldest.0 < 0.01 || coldest.0 > 0.99,
+                    "the heating troughed at rotation {} rather than at midnight",
+                    coldest.0,
+                );
+            }
+        }
+    }
+
+    /// At an equinox the day is symmetric, so the swing has to reach both ends: this
+    /// is what makes the default world freeze at night and thaw by day at all.
+    #[test]
+    fn an_equinox_day_swings_the_whole_way() {
+        let config = PlanetConfig::default();
+        assert!(
+            (warmth_at(&config, 0.5) - 1.0).abs() < 1.0e-4,
+            "noon is the top"
+        );
+        assert!(
+            (warmth_at(&config, 0.0) + 1.0).abs() < 1.0e-4,
+            "midnight is the bottom"
+        );
+        // And exactly `cos H`: at an equinox the declination term vanishes, so the
+        // heating is the hour angle and nothing else. Sunrise and sunset sit at zero.
+        assert!(warmth_at(&config, 0.25).abs() < 1.0e-4);
+        assert!(warmth_at(&config, 0.75).abs() < 1.0e-4);
+    }
+
+    /// The seasons are in here for nothing, on the same terms the day length is: a
+    /// summer night is milder than a winter one because the declination lifts the
+    /// whole curve, not because anything says "summer".
+    #[test]
+    fn a_summer_night_is_milder_than_a_winter_one() {
+        let summer = PlanetConfig {
+            orbit_phase: 0.25,
+            ..default()
+        };
+        let winter = PlanetConfig {
+            orbit_phase: 0.75,
+            ..default()
+        };
+
+        assert!(
+            warmth_at(&summer, 0.0) > warmth_at(&winter, 0.0) + 0.1,
+            "midnight in summer ({}) should be milder than in winter ({})",
+            warmth_at(&summer, 0.0),
+            warmth_at(&winter, 0.0),
+        );
+        assert!(
+            warmth_at(&summer, 0.5) > warmth_at(&winter, 0.5) + 0.1,
+            "and so should noon",
+        );
     }
 
     /// The rotation is the only state, and it wraps rather than growing — a session

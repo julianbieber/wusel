@@ -51,6 +51,18 @@ struct ScreenUniform {
     rain_softness: f32,
     rain_strength: f32,
     streak_phase: f32,
+    dither_period_tiles: f32,
+    wet_darkening: f32,
+    wet_desaturation: f32,
+    snow_lightening: f32,
+    snow_dither_softness: f32,
+    temperature_swing: f32,
+    temperature_seasonal_celsius: f32,
+    freezing_celsius: f32,
+    freezing_softness_celsius: f32,
+    climate_min_celsius: f32,
+    climate_span_celsius: f32,
+    climate_amplitude_span_celsius: f32,
 }
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -60,7 +72,13 @@ struct ScreenUniform {
 @group(0) @binding(4) var probability_sampler: sampler;
 @group(0) @binding(5) var shape_texture: texture_2d<f32>;
 @group(0) @binding(6) var shape_sampler: sampler;
-@group(0) @binding(7) var<uniform> screen: ScreenUniform;
+@group(0) @binding(7) var cover_texture: texture_2d<f32>;
+@group(0) @binding(8) var cover_sampler: sampler;
+@group(0) @binding(9) var dither_texture: texture_2d<f32>;
+@group(0) @binding(10) var dither_sampler: sampler;
+@group(0) @binding(11) var climate_texture: texture_2d<f32>;
+@group(0) @binding(12) var climate_sampler: sampler;
+@group(0) @binding(13) var<uniform> screen: ScreenUniform;
 
 /// How a colour is weighed into one number. Matches `LUMINANCE` in gameplay/sun.rs,
 /// which is where the same weighting decides what the simulation reads.
@@ -153,6 +171,69 @@ fn rain_streaks(position: vec2<f32>, phase: f32) -> f32 {
     return smoothstep(0.55, 1.0, band) * smoothstep(0.02, 0.35, fract(position.x / 7.0));
 }
 
+/// One lattice of falling dots, in screen space. `thin` is how much of the lattice
+/// carries a flake at all — the rest is empty, which is what stops it reading as a
+/// grid marching down the window.
+///
+/// The scattering is a golden-ratio walk over the integer cell rather than a hash: a
+/// hash is a second noise implementation to keep, and the pattern only has to be
+/// irregular over one screen. `0.618` and `0.381` are the two low-discrepancy
+/// constants, so the sequence never lands back where it started.
+fn flake_layer(p: vec2<f32>, phase: f32, thin: f32) -> f32 {
+    let column = floor(p.x);
+    // A column-dependent head start, so neighbouring columns are not falling in rank.
+    let fall = p.y + phase + fract(column * 0.618) * 3.0;
+    let across = fract(p.x) - 0.5;
+    let along = fract(fall) - 0.5;
+    let dot_shape = 1.0 - smoothstep(0.10, 0.26, length(vec2(across, along)));
+    let carries = step(thin, fract(column * 0.618 + floor(fall) * 0.381));
+    return dot_shape * carries;
+}
+
+/// Snow falling: two lattices at different scales and speeds, so the fall reads as
+/// depth rather than as one sheet sliding past. In screen space, for the same reason
+/// the rain streaks are.
+fn snow_flakes(position: vec2<f32>, phase: f32) -> f32 {
+    let near = flake_layer(position * 0.085, phase * 0.55, 0.62);
+    let far = flake_layer(position * 0.045 + vec2(11.0, 4.0), phase * 0.30, 0.74);
+    return clamp(near + far * 0.7, 0.0, 1.0);
+}
+
+/// The temperature over a tile: the baked climate normal there, plus this step's
+/// swing scaled by that place's own amplitude, plus the season.
+///
+/// The same arithmetic `ClimateCell::temperature` does in gameplay/ground.rs, which
+/// is why what falls out of the sky always agrees with what is lying on the ground —
+/// they are one model read at two resolutions, not two models.
+fn temperature_at(tile: vec2<f32>) -> f32 {
+    let climate = textureSample(climate_texture, climate_sampler, tile / screen.world_tiles).rg;
+    let normal = screen.climate_min_celsius + climate.r * screen.climate_span_celsius;
+    let amplitude = climate.g * screen.climate_amplitude_span_celsius;
+    return normal + amplitude * screen.temperature_swing + screen.temperature_seasonal_celsius;
+}
+
+/// How much of what is falling is frozen, on 0..1. Ramped rather than switched, so
+/// sleet exists and no frame flips a whole region from rain to snow.
+fn frozen(temperature: f32) -> f32 {
+    return 1.0 - smoothstep(
+        screen.freezing_celsius - screen.freezing_softness_celsius,
+        screen.freezing_celsius + screen.freezing_softness_celsius,
+        temperature,
+    );
+}
+
+/// How much of a tile's snow is drawn, given its own value from the dither map.
+///
+/// Transcribed in `gameplay/tint.rs`'s tests, which is where the property that
+/// matters is checked without a GPU — the same arrangement `sun.rs` has for the
+/// occlusion test. The threshold is squeezed into `softness..1 - softness`
+/// rather than being the dither value itself, and that is what makes the endpoints
+/// exact: full coverage snows every tile, no coverage snows none.
+fn snow_lying(coverage: f32, dither: f32, softness: f32) -> f32 {
+    let threshold = softness + dither * (1.0 - 2.0 * softness);
+    return smoothstep(threshold - softness, threshold + softness, coverage);
+}
+
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(scene_texture, scene_sampler, in.uv);
@@ -172,7 +253,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // — a texel nobody has written reads zero, which is below any water line, so
         // the absence of a heightmap leaves the ramp flat rather than wrong. The sun
         // still applies: the ramp is about the ground, the light is about the sky.
-        var relief = 1.0;
         if height > screen.water_line {
             // One ramp over the whole height range rather than one per band: a
             // per-band ramp reverses at every band edge, which would draw a contour
@@ -182,8 +262,45 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 0.0,
                 1.0,
             );
-            relief = 1.0 + screen.strength * (ramp * 2.0 - 1.0);
+            let relief = 1.0 + screen.strength * (ramp * 2.0 - 1.0);
+            colour = colour * relief;
+
+            // What the weather has left here. Read at the tile's own *centre*, so a
+            // whole tile shares one value however far the view is zoomed out — the
+            // grid is coarse and smooth, and everything per-tile about the look comes
+            // from the dither below rather than from the state.
+            //
+            // This whole block sits inside the water-line branch, which is what keeps
+            // the state grid from ever having to learn where the lakes are: snow can
+            // accumulate over one and simply is not drawn.
+            let cover = textureSample(
+                cover_texture,
+                cover_sampler,
+                (tile + vec2(0.5)) / screen.world_tiles,
+            ).rg;
+
+            // Wet ground goes darker and a little duller. A full desaturation would
+            // read as fog rather than as rain.
+            let grey = vec3(dot(colour, LUMINANCE));
+            let soaked = mix(colour, grey, screen.wet_desaturation) * (1.0 - screen.wet_darkening);
+            colour = mix(colour, soaked, cover.r);
+
+            // And snow over the top of it, because snow lies *on* wet ground and
+            // hides it. Thresholded per tile against a small tiling map, so it
+            // arrives tile by tile and a melting field shrinks from its edges.
+            let dither = textureSample(
+                dither_texture,
+                dither_sampler,
+                tile / screen.dither_period_tiles,
+            ).r;
+            let lying = snow_lying(cover.g, dither, screen.snow_dither_softness);
+            // Keeping the relief factor is what makes a snowed slope still read as a
+            // slope — a flat white would erase the landscape it settled on.
+            colour = mix(colour, vec3(relief * screen.snow_lightening), lying);
         }
+        // else: water passes through the whole ground half untouched — the ramp does
+        // not shade it, and there is no ground under it to wet or to cover. That one
+        // branch is why the state grid never has to know where the lakes are.
 
         // How much of the beam reaches this tile. Three samples are the whole ray
         // march, and the strongest occluder wins — a nearer ridge does not add to a
@@ -202,7 +319,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // keeps the sky and a lit one gets both. There is no shadow-strength knob to
         // fall out of step with the light.
         let light = screen.sun_sky.rgb + screen.sun_direct.rgb * lit;
-        colour = colour * relief * light;
+        colour = colour * light;
     }
     // else: off the edge of the world there is no height to read, and nothing drawn
     // to shade or to light either — but the weather below still falls on it, exactly
@@ -219,15 +336,38 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
     colour = colour * (1.0 - screen.shadow_strength * shadow);
 
-    // Rain falls where the shadow is, not where the cloud is: under the cloud, which
-    // is also where it is not immediately painted over by it.
-    let rain = rain_amount(shadow_field, shadow);
-    if rain > 0.0 {
+    // Precipitation falls where the shadow is, not where the cloud is: under the
+    // cloud, which is also where it is not immediately painted over by it.
+    let falling = rain_amount(shadow_field, shadow);
+    if falling > 0.0 {
+        // How much of it is frozen, from the same climate map the ground's cover is
+        // decided by — so what is coming down always agrees with what is lying.
+        //
+        // At `at`, not at the cloud: the offset above says which cloud is raining on
+        // this fragment, and the rain lands *here*. Reading the temperature at the
+        // cloud instead would decide rain against snow ten tiles away, which is
+        // invisible in the middle of a shower and wrong exactly at a snow line —
+        // where it would put falling snow over thawed ground and rain over a
+        // snowfield.
+        let snowing = frozen(temperature_at(at));
+
+        // Only the liquid share greys the world under it. What *snow* does to the
+        // ground is the cover above, which is a state that outlasts the cloud rather
+        // than a look that goes with it.
+        let rain = falling * (1.0 - snowing);
         let grey = vec3(dot(colour, vec3(0.299, 0.587, 0.114)));
         let wet = mix(colour, grey * 0.75, 0.6);
         colour = mix(colour, wet, rain * screen.rain_strength);
-        colour += vec3(rain_streaks(in.position.xy, screen.streak_phase))
-            * rain * screen.rain_strength * 0.09;
+
+        // And the veil itself, ramped from streaks to flakes across the freezing
+        // point. Flakes are drawn harder than streaks because a flake is an object
+        // catching the light where a streak is a smear of one.
+        let veil = mix(
+            rain_streaks(in.position.xy, screen.streak_phase),
+            snow_flakes(in.position.xy, screen.streak_phase),
+            snowing,
+        );
+        colour += vec3(veil) * falling * screen.rain_strength * mix(0.09, 0.34, snowing);
     }
 
     // The cloud itself, last, so it sits over the world and over its own rain — but
