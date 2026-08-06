@@ -1,0 +1,107 @@
+# Traders moving goods and money between cities.
+#
+# Run with:  just drive run scenarios/traders_move_goods.txt
+#
+# **What this proves that a unit test cannot.** The market arithmetic is all ordinary
+# unit tests and the whole-world run in `growth.rs` measures the economy — but neither
+# can say that a wagon exists in the running game, that it is drawn, or that it is on
+# the road rather than beside it. The reading that settles it is `observe traders`,
+# which reports every wagon's tile *and the kind of ground under it*: a travelling
+# caravan must be standing on `Road` and a resting one on `Town`, and that is a
+# sentence about the real world rather than about the model of it.
+#
+# The capture is the other half and deliberately the weaker one. A caravan is a
+# coloured dot; a PNG can show you it is there and cannot tell you what it carries or
+# whether it meant to go where it is going.
+
+# Clocks frozen through the waits, so two runs of this file are comparable. Generation,
+# the plan and the bakes are polled per frame and so still land — see the comment in
+# snow_falls_and_melts.txt for why that is not a formality.
+fixed-delta 0
+
+enter gameplay
+wait terrain
+wait plan
+
+# **`wait plan` is one frame short of the traders and that is the whole reason this
+# condition exists.** The wagons go out on the first frame after the plan is done *and*
+# the cities have been seeded, so a scenario that read `observe traders` here would get
+# an empty list and assert nothing at all.
+wait traders
+
+# A wgsl error draws nothing rather than drawing wrong, and every capture below would
+# still be written. `observe log` drains, so this has to come first — it is the only
+# read that can see startup.
+observe log
+
+# The opening state. Every wagon is resting in a city with an empty hold, every trader
+# has its opening purse, and every city has a treasury sized on its town.
+observe traders
+
+# And the market before anyone has traded in it: the `prices` column is what a caravan
+# compares, so a later diff of this is a diff of the numbers the decisions were taken
+# on rather than of their consequences.
+observe cities
+
+# Let the world run. 800 frames at a whole second of delta is 1600 economy steps at
+# `step_seconds` 0.5 — the budget gh-7 needed after it divided `growth_rate` and
+# `claims_per_step` by eight, and eight harvests at `harvest_interval_steps` 200. Two
+# steps a frame is well under `max_steps_per_frame`, so nothing is dropped.
+fixed-delta 1
+step 800
+
+# **The measurement.** Every wagon reports its tile, the ground under it, what it is
+# carrying and what it paid. The assertions this file exists for:
+#
+#   - every caravan whose errand is `travelling` has `"on": "Road"`;
+#   - every caravan whose errand is `resting` has `"on": "Town"`;
+#   - some caravan is carrying something it paid for, which is what says the market
+#     found a margin rather than that the wagons are simply driving about.
+observe traders
+
+# The consequence, in the cities. Treasuries have moved in both directions — a city
+# that sold has more than it opened with and one that bought has less — and the stocks
+# of the seam goods are no longer confined to the fifth of cities that can mine them.
+observe cities
+
+# Now go and look. Midday first, because the clock never stops and 1600 steps of
+# stepping lands wherever it lands — the first cut of this file captured a midnight
+# frame and showed nothing at all. `sun` sets where the planet is *now*, so it has to
+# come after the stepping and not before it.
+sun 0.5
+
+# The camera opens at the world centre; this is city 46, a borough with roads leaving
+# it in three directions. The pan is frame-counted, which is exact under a fixed delta:
+# `hold` moves 1.0667 tiles a frame at 1/60.
+fixed-delta 1/60
+hold a 275
+hold s 159
+observe camera
+
+# **Read the wagons again immediately before each capture**, because the clock never
+# stops: the pan above takes 434 frames, which is seven seconds, in which a wagon covers
+# eighty tiles. Whatever was near this city when the numbers above were taken has long
+# since left. This reading is what says which wagons were actually in frame — without
+# it the capture is a lucky photograph and the file cannot tell you whether it caught
+# anything.
+observe traders
+
+# Zoomed in two steps, because a wagon is `caravan_sprite_tiles` across — 16 world
+# pixels, two tiles — and at gameplay zoom that is a dot rather than a cart. The town,
+# the road running into it and the fields around both are in frame at this scale, and a
+# wagon resting in the city sits exactly on its centre.
+zoom 2
+step 2
+capture /tmp/wusel-traders/city.png
+
+# And the wide shot, two steps the other way from gameplay zoom, where the point is the
+# *network* rather than the wagon: half a dozen cities, the roads between them and
+# whatever traffic is on them. A wagon is `caravan_min_screen_px` here — the floor that
+# stops it vanishing as the world shrinks, the same trick `city_panel.rs` plays with its
+# pick target — so it reads as a coloured speck on a road and not as a cart.
+zoom -2
+observe traders
+step 2
+capture /tmp/wusel-traders/roads.png
+
+observe log

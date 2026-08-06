@@ -49,6 +49,14 @@ pub struct GrowthConfig {
     /// Seconds of play per step. The frame's delta is accumulated into this, so the
     /// *rate* of growth is the same on every machine even though its outcome is not
     /// reproducible.
+    ///
+    /// **gh-7 wanted the world slower and this is deliberately not what moved.** Raising
+    /// it does slow everything below in lockstep, and it was the first thing tried —
+    /// but a step is the simulation's *resolution*, not its pace, and at 4 seconds the
+    /// panel's numbers lurch once every four seconds instead of twice a second. What
+    /// lengthens the time to raise a house or bring in a crop is `growth_rate`,
+    /// `claims_per_step` and `IndustryConfig::harvest_interval_steps`, all of which are
+    /// per step and none of which touches the clock the sun and the weather run on.
     pub step_seconds: f32,
     /// Steps one frame may run. The accumulator is clamped to this afterwards, so a
     /// stall's backlog is **discarded rather than owed** — without the clamp a
@@ -57,6 +65,12 @@ pub struct GrowthConfig {
     pub max_steps_per_frame: u32,
     /// Logistic rate per step. This and `step_seconds` are not independent: the
     /// real-time rate is `growth_rate / step_seconds`.
+    ///
+    /// **Eight times slower since gh-7**, which is one half of "a house should take
+    /// longer to build" — this is how fast a city fills toward the ceiling its food
+    /// sets, and the ceiling itself is untouched. Every steady state gh-24 measured is
+    /// exactly where it was; the world takes eight times as many steps to reach it,
+    /// which is the point.
     pub growth_rate: f32,
     /// Food one head eats per step. With the yields below this is what sets how much
     /// land a city of a given size needs.
@@ -165,6 +179,11 @@ pub struct GrowthConfig {
     /// humidity under every habitable tile in its reach. Only the one city whose turn
     /// it is pays it, so the cost is flat in the number of cities; a step where nobody
     /// rescans is free, because an exhausted cursor claims nothing.
+    /// **The other half of gh-7's slowdown.** It caps both the fields claimed and the
+    /// town tiles raised in one step, so at 1 a city breaks one field or builds one
+    /// house per step against the eight it used to. Nothing about the *outcome* moves —
+    /// a city still ends up holding the land its yield justifies — only how long the
+    /// building takes.
     pub claims_per_step: u32,
     /// A city never falls below this. Without it the logistic drags a starving city
     /// to zero and leaves a town with nobody in it and no rule for what happens next.
@@ -176,7 +195,7 @@ impl Default for GrowthConfig {
         Self {
             step_seconds: 0.5,
             max_steps_per_frame: 4,
-            growth_rate: 0.02,
+            growth_rate: 0.0025,
             food_per_person: 1.0,
             town_people_per_tile: 40.0,
             farm_yield_grass: 12.0,
@@ -189,7 +208,7 @@ impl Default for GrowthConfig {
             growth_headroom: 0.25,
             farm_hysteresis: 0.20,
             farm_max_reach_tiles: 28,
-            claims_per_step: 8,
+            claims_per_step: 1,
             min_population: 20.0,
         }
     }
@@ -201,6 +220,19 @@ impl Default for GrowthConfig {
 pub struct GrowthClock {
     step: u64,
     carry_seconds: f32,
+}
+
+impl GrowthClock {
+    /// How many steps the world has taken.
+    ///
+    /// Exposed for [`crate::gameplay::trade`], which mints a city's income per
+    /// *step* and so has to know how many have passed since it last ran. Paying it
+    /// per frame instead would hand a fast machine more money than a slow one, and
+    /// the frame's elapsed time is no better — the loop below runs whole steps and
+    /// drops the remainder of a stall, so time and steps are not proportional.
+    pub fn step(&self) -> u64 {
+        self.step
+    }
 }
 
 /// The terrain sampler, built once for the session.
@@ -602,6 +634,12 @@ fn simulate_cities(
                 estate.offsets(),
                 Sky { rain },
                 swept,
+                // One step in `harvest_interval_steps` brings the crop in, world-wide
+                // and on the same step for every city. A staggered harvest would need a
+                // per-city phase and would buy nothing but a smoother total.
+                clock
+                    .step
+                    .is_multiple_of(u64::from(industry_config.harvest_interval_steps.max(1))),
                 &city,
                 &growth,
                 &mut industry,
@@ -619,7 +657,6 @@ fn simulate_cities(
                 &map,
                 &fields.0,
                 &offsets.0,
-                Sky { rain },
                 labour,
                 swept,
                 entity,
@@ -657,7 +694,6 @@ fn step_city(
     map: &WorldMap,
     sampler: &TerrainSampler,
     offsets: &[IVec2],
-    sky: Sky,
     labour: Labour,
     swept: bool,
     entity: Entity,
@@ -668,7 +704,16 @@ fn step_city(
 ) {
     // Reported as itself, so the panel's Harvest row keeps meaning what it meant: the
     // food off the fields, with the hands that worked them and the sky over them.
-    growth.food = growth.static_yield * labour.farmer_share * harvest_multiplier(config, sky);
+    // What the fields delivered per step at the last cut, which is `industry.rs`'s to
+    // know since gh-7: a crop depends on a season that is over and on whether the barn
+    // had room for it, neither of which is recomputable from three current numbers.
+    //
+    // Without an industry there is no season and no barn, and the fields feed the city
+    // as they yield — gh-6's loop, and the reason every property below can still be
+    // stated without one.
+    growth.food = labour
+        .food_rate
+        .unwrap_or(growth.static_yield * labour.farmer_share);
     growth.demand = growth.population * config.food_per_person;
     // The granary's release enters here and nowhere else. It is capped at what demand
     // is short of the harvest, so a full store can only ever stop the ceiling falling
@@ -1234,13 +1279,25 @@ mod tests {
             // The sweep is what `simulate_cities` hoisted out, so the harness has to
             // do it too — and in the same place, before anything is stamped.
             self.growth.resum(&self.map);
+            // Since gh-7 the weather reaches this step only through what the fields
+            // *delivered*, so the harness has to put it there: `step_city` cannot see a
+            // sky any more, which makes "rain never costs a city a field" a structural
+            // property rather than an arithmetic one. The harvest still has to move with
+            // the rain, or the test asserting it would be asserting nothing.
+            let labour = Labour {
+                food_rate: Some(
+                    self.growth.static_yield
+                        * self.labour.farmer_share
+                        * harvest_multiplier(&self.config, Sky { rain }),
+                ),
+                ..self.labour
+            };
             step_city(
                 &self.config,
                 &self.map,
                 &self.sampler,
                 &self.offsets,
-                Sky { rain },
-                self.labour,
+                labour,
                 true,
                 Entity::PLACEHOLDER,
                 &mut self.city,
@@ -1266,7 +1323,9 @@ mod tests {
     fn a_city_with_no_fields_falls_to_the_floor_rather_than_to_nan() {
         let config = GrowthConfig::default();
         let mut population = 5000.0;
-        for _ in 0..200 {
+        // Eight times gh-24's 200, because gh-7 divided `growth_rate` by eight. The
+        // decay is the same shape and takes eight times as many steps to get there.
+        for _ in 0..1600 {
             population = grow(&config, population, 0.0, config.growth_rate);
             assert!(population.is_finite(), "population went to {population}");
             assert!(population >= config.min_population);
@@ -1286,7 +1345,8 @@ mod tests {
 
         let mut from_below = config.min_population;
         let mut from_above = capacity * 3.0;
-        for _ in 0..4000 {
+        // Eight times gh-24's 4000, for gh-7's eight-times-slower rate.
+        for _ in 0..32_000 {
             from_below = grow(&config, from_below, capacity, config.growth_rate);
             from_above = grow(&config, from_above, capacity, config.growth_rate);
         }
@@ -1675,7 +1735,6 @@ mod tests {
                     &map,
                     &sampler,
                     &offsets,
-                    Sky { rain: 0.0 },
                     Labour::default(),
                     true,
                     Entity::PLACEHOLDER,
@@ -1893,7 +1952,9 @@ mod measurements {
         assert!(!state.is_empty(), "the world has no cities at all");
         assert!(founding_fields > 0, "not one city was founded with a field");
 
-        const STEPS: usize = 2000;
+        // Eight times gh-24's 2000: gh-7 divided `growth_rate` and `claims_per_step`
+        // by eight, so the same steady state is eight times as many steps away.
+        const STEPS: usize = 16_000;
         let started = std::time::Instant::now();
         for step in 0..STEPS {
             let sweep = step % state.len();
@@ -1909,6 +1970,7 @@ mod measurements {
                     estate.offsets(),
                     Sky { rain: 0.0 },
                     index == sweep,
+                    step.is_multiple_of(industry_config.harvest_interval_steps.max(1) as usize),
                     city,
                     growth,
                     industry,
@@ -1919,7 +1981,6 @@ mod measurements {
                     &map,
                     &sampler,
                     &offsets,
-                    Sky { rain: 0.0 },
                     labour,
                     index == sweep,
                     Entity::PLACEHOLDER,
@@ -2169,5 +2230,548 @@ mod measurements {
             .count();
         println!("  {grew} cities grew, {shrank} shrank");
         assert!(grew > 0 && shrank > 0, "{grew} grew and {shrank} shrank");
+    }
+}
+
+/// The whole-world run behind [`crate::gameplay::market::MarketConfig`]'s and
+/// [`crate::gameplay::trade::TradeConfig`]'s figures.
+///
+/// **It lives here rather than in `trade.rs`, and the reason is assembly rather than
+/// ownership.** A trade measurement needs a planned world, seeded cities, a seeded
+/// industry *and* a routed road network, and this module is the one place all of that
+/// is already stood up — `seed_city`, `step_city` and `ClaimOffsets` are private to
+/// this file, and widening them so a sibling could run the same loop would trade a
+/// module boundary for a test's convenience. The trade half calls nothing but
+/// `trade.rs`'s public pure functions, which is the seam that made the split possible.
+#[cfg(test)]
+mod trade_measurements {
+    use super::*;
+    use crate::gameplay::{
+        city::plan_cities,
+        deposit::{RESOURCE_COUNT, Resource, plan_deposits},
+        drainage::plan_drainage,
+        industry::EstateOffsets,
+        market::MarketConfig,
+        plan::WorldPlanConfig,
+        river::plan_rivers,
+        road::{RoadLink, choose_pairs, route_road},
+        trade::{Caravan, Stall, TradeConfig, buy, choose, sell},
+        world::{WorldSnapshot, chunk_index_of_tile},
+    };
+    use bevy::platform::collections::HashMap;
+
+    /// Eight times gh-24's 2000, because gh-7 divided `growth_rate` and
+    /// `claims_per_step` by eight: the same world, reached in eight times as many
+    /// steps. The loop is about a second a run, so this is still cheap.
+    const STEPS: usize = 16_000;
+
+    /// What one run of the world came out at.
+    #[derive(Default)]
+    struct Readings {
+        /// Units of each resource that changed hands into a city, over the whole run.
+        delivered: [f64; RESOURCE_COUNT],
+        /// Cities that took delivery of something their own hands never produce — the
+        /// number the whole feature exists to move.
+        supplied: usize,
+        /// Journeys begun, and wagons that never took one.
+        journeys: u64,
+        stuck_wagons: usize,
+        /// The median city treasury every hundred steps. A track that climbs without
+        /// bound is the signal that the minted income wants a sink after all.
+        treasury_track: Vec<f64>,
+        purses: Vec<f32>,
+        /// What share of the world's stock of each resource is held by cities whose own
+        /// hands produce none of it.
+        ///
+        /// **The metric the first two runs were missing**, and the correction is worth
+        /// keeping. The obvious reading is "how many cities are short of iron", and it
+        /// cannot move: the world *produces* about 50 iron a step against ten thousand
+        /// of demand, so every city is short whatever the caravans do, and the total
+        /// stock is fixed by the seams rather than by the roads. What trade can change
+        /// is not how much iron exists but **where it sits** — and that is exactly what
+        /// a trade system is for.
+        held_by_the_helpless: [f64; RESOURCE_COUNT],
+        /// Units sold *into* a city whose own hands produce none of that resource —
+        /// the flow, which is what a consumable in famine can show and a snapshot of
+        /// its stock cannot.
+        delivered_to_the_helpless: [f64; RESOURCE_COUNT],
+        stocks: [f64; RESOURCE_COUNT],
+        /// The end of the chain, and the reason any of this matters to the game: the
+        /// upkeep basket feeds happiness, happiness scales the growth rate, and the
+        /// growth rate sizes the city. Reported for both runs.
+        median_population: f32,
+        mean_happiness: f32,
+    }
+
+    /// Where the figures in `MarketConfig` and `TradeConfig` come from, and the only
+    /// thing that can say whether the economy does anything at all.
+    ///
+    /// **The comparison is against the same world with the caravans switched off**,
+    /// which is the shape `the_bends_come_from_the_scoring_and_not_from_the_lattice`
+    /// uses and for the same reason: "how many cities are short of iron" is a number
+    /// about the *terrain* — four cities in five can make none — so asserting it
+    /// against a constant would measure gh-24 rather than gh-7. Against the counterfactual
+    /// it measures exactly what the traders did. The economy loop is a second a run, so
+    /// running it twice is free.
+    ///
+    /// Ignored because it generates all 4096 chunks and routes every road:
+    /// `cargo test --release -- --ignored --nocapture`, and run it *alone*.
+    #[test]
+    #[ignore = "generates the whole 4096x4096 world and routes every road"]
+    fn the_default_config_moves_goods_between_cities() {
+        let terrain = TerrainConfig::default();
+        let plan_config = WorldPlanConfig::default();
+        let config = GrowthConfig::default();
+        let industry_config = IndustryConfig::default();
+        let market_config = MarketConfig::default();
+        let trade_config = TradeConfig::default();
+
+        let base = WorldSnapshot::generated(&terrain);
+        let river_edits: Vec<TileEdit> = plan_rivers(&terrain, &plan_config, &base)
+            .by_chunk
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let watered = base.with_edits(&river_edits);
+        let drain_edits: Vec<TileEdit> = plan_drainage(&terrain, &plan_config, &watered)
+            .by_chunk
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let planned_world = watered.with_edits(&drain_edits);
+        let sites = plan_deposits(&terrain, &plan_config, &planned_world);
+        let planned = plan_cities(&terrain, &plan_config, &planned_world);
+
+        let mut road_world = planned_world.clone();
+        for city in &planned {
+            road_world = road_world.with_edits(&city.edits);
+        }
+
+        // The roads, longest first, each routed against the world the last one left —
+        // the order decides where they run, and this is `drive_road_plan`'s loop with
+        // the frame spreading taken out.
+        let cities_by_index: Vec<City> = planned.iter().map(|p| p.city).collect();
+        let pairs = choose_pairs(&cities_by_index, &plan_config);
+        let mut links = Vec::new();
+        for &(a, b) in pairs.iter().rev() {
+            let Some(road) = route_road(
+                &terrain,
+                &plan_config,
+                &road_world,
+                &cities_by_index[a],
+                &cities_by_index[b],
+            ) else {
+                continue;
+            };
+            road_world = road_world.with_edits(&road.edits);
+            links.push(road.link);
+        }
+        println!(
+            "\n{} roads laid between {} cities",
+            links.len(),
+            planned.len()
+        );
+        assert!(!links.is_empty(), "no road was laid, so nothing can trade");
+
+        let traded = run(
+            &terrain,
+            &config,
+            &industry_config,
+            &market_config,
+            &trade_config,
+            &road_world,
+            &planned,
+            &sites,
+            &links,
+            true,
+        );
+        let alone = run(
+            &terrain,
+            &config,
+            &industry_config,
+            &market_config,
+            &trade_config,
+            &road_world,
+            &planned,
+            &sites,
+            &links,
+            false,
+        );
+
+        let cities = planned.len();
+        let wagons = (trade_config.trader_count * trade_config.caravans_per_trader) as usize;
+        println!("{STEPS} steps, {cities} cities, {wagons} wagons");
+        println!(
+            "  {} journeys, {} of {wagons} wagons never moved",
+            traded.journeys, traded.stuck_wagons
+        );
+        for resource in Resource::ALL {
+            let index = resource.index();
+            let share = |readings: &Readings| {
+                readings.held_by_the_helpless[index] / readings.stocks[index].max(1.0) * 100.0
+            };
+            println!(
+                "  {:8} delivered {:>10.0}, {:>5.1}% of it into cities that make none   \
+                 (they end holding {:>4.1}% of the world's stock, against {:>4.1}% alone)",
+                resource.label(),
+                traded.delivered[index],
+                traded.delivered_to_the_helpless[index] / traded.delivered[index].max(1.0) * 100.0,
+                share(&traded),
+                share(&alone),
+            );
+        }
+        println!(
+            "  {} of {cities} cities took delivery of something they cannot make ({:.0}%)",
+            traded.supplied,
+            traded.supplied as f64 / cities as f64 * 100.0
+        );
+        println!(
+            "  median treasury  {:.0} -> {:.0}   (every 500 steps: {:?})",
+            traded.treasury_track.first().copied().unwrap_or_default(),
+            traded.treasury_track.last().copied().unwrap_or_default(),
+            traded
+                .treasury_track
+                .iter()
+                .step_by(5)
+                .map(|money| money.round() as i64)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  median population {:.0} traded vs {:.0} alone;  mean happiness {:.3} vs {:.3}",
+            traded.median_population,
+            alone.median_population,
+            traded.mean_happiness,
+            alone.mean_happiness
+        );
+        let mut purses = traded.purses.clone();
+        purses.sort_by(f32::total_cmp);
+        println!(
+            "  trader purse     min {:.0}  median {:.0}  max {:.0}  (opened at {:.0})\n",
+            purses[0],
+            purses[purses.len() / 2],
+            purses[purses.len() - 1],
+            trade_config.trader_start_money
+        );
+
+        // The five ways this can be dead while every unit test above passes.
+        assert!(
+            traded.delivered.iter().sum::<f64>() > 0.0,
+            "not one unit of anything changed hands in {STEPS} steps"
+        );
+        assert!(
+            traded.journeys > 0 && traded.stuck_wagons * 4 < wagons,
+            "{} journeys and {} stuck wagons — the price range does not pay for a trip",
+            traded.journeys,
+            traded.stuck_wagons
+        );
+        assert!(
+            traded.supplied > cities / 10,
+            "only {} cities were supplied with something they cannot make",
+            traded.supplied
+        );
+        assert!(
+            purses[purses.len() / 2] > 0.0,
+            "the median trader is broke, so nobody can buy anything"
+        );
+        // The point of the whole thing, and the counterfactual is what makes it a
+        // statement about gh-7 rather than about the map: the goods only a fifth of the
+        // world can produce end up held by cities that can produce none of them.
+        let scarce = [Resource::Iron, Resource::Copper, Resource::Salt];
+        let into_the_helpless: f64 = scarce
+            .iter()
+            .map(|r| traded.delivered_to_the_helpless[r.index()])
+            .sum();
+        let scarce_delivered: f64 = scarce.iter().map(|r| traded.delivered[r.index()]).sum();
+        assert!(
+            into_the_helpless > scarce_delivered * 0.25,
+            "only {:.0} of {:.0} units of iron, copper and salt reached a city that can \
+             make none — the caravans are shuffling goods between the cities that \
+             already had them",
+            into_the_helpless,
+            scarce_delivered
+        );
+    }
+
+    /// One run of the world: seed every city, then step the economy — with the caravans
+    /// running or without them.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        terrain: &TerrainConfig,
+        config: &GrowthConfig,
+        industry_config: &IndustryConfig,
+        market_config: &MarketConfig,
+        trade_config: &TradeConfig,
+        world: &WorldSnapshot,
+        planned: &[crate::gameplay::city::PlannedCity],
+        sites: &[Deposit],
+        links: &[RoadLink],
+        with_traders: bool,
+    ) -> Readings {
+        let mut map = WorldMap::from_fn(|tile| world.tile(tile).expect("inside the world"));
+        let mut dirty = DirtyChunks::default();
+
+        let sampler = terrain.sampler();
+        let offsets = ClaimOffsets::build(config.farm_max_reach_tiles).0;
+        let mut city_map = CityMap::default();
+        let mut taken = HashSet::new();
+        let mut seam_map = DepositMap::default();
+        let mut seam_index: HashMap<Entity, usize> = HashMap::new();
+        for (index, site) in sites.iter().enumerate() {
+            let entity = Entity::from_raw_u32(index as u32 + 1).expect("nonzero");
+            seam_map.insert(chunk_index_of_tile(site.tile), entity);
+            seam_index.insert(entity, index);
+        }
+        let mut seam_owner: Vec<Option<usize>> = vec![None; sites.len()];
+        let of_seam = |entity: Entity| seam_index.get(&entity).map(|&index| (index, sites[index]));
+        let estate = EstateOffsets::build(industry_config.estate_reach_tiles);
+
+        // Purse alongside the three components, since a `CityTreasury` is a component in
+        // the app and there is no app here.
+        let mut state: Vec<(City, CityGrowth, CityIndustry, f32)> = Vec::new();
+        for (order, planned_city) in planned.iter().enumerate() {
+            let city = planned_city.city;
+            let mut edits = Vec::new();
+            let growth = seed_city(
+                config,
+                &map,
+                &offsets,
+                &city,
+                Entity::PLACEHOLDER,
+                &sampler,
+                &mut taken,
+                &mut city_map,
+                &mut edits,
+            );
+            map.apply_edits(&edits, &mut dirty);
+            let industry = seed_industry(
+                industry_config,
+                &map,
+                estate.offsets(),
+                &city,
+                &growth,
+                &seam_map,
+                |entity| {
+                    of_seam(entity)
+                        .and_then(|(index, site)| seam_owner[index].is_none().then_some(site.tile))
+                },
+            );
+            for &seam in industry.seam_entities() {
+                if let Some((index, _)) = of_seam(seam) {
+                    seam_owner[index] = Some(order);
+                }
+            }
+            let purse = growth.town() as f32 * market_config.city_start_money_per_town_tile;
+            state.push((city, growth, industry, purse));
+        }
+
+        // `RoadGraph` written against a `Vec` rather than a query — the same shape,
+        // since a caravan only ever asks "where can I go from here, and how far".
+        let index_of: HashMap<u32, usize> = state
+            .iter()
+            .enumerate()
+            .map(|(index, (city, ..))| (city.id, index))
+            .collect();
+        let mut edges: Vec<Vec<(usize, f32)>> = vec![Vec::new(); state.len()];
+        for link in links {
+            if link.path.len() < 2 {
+                continue;
+            }
+            let (Some(&from), Some(&to)) = (index_of.get(&link.from), index_of.get(&link.to))
+            else {
+                continue;
+            };
+            edges[from].push((to, link.length_tiles()));
+            edges[to].push((from, link.length_tiles()));
+        }
+
+        /// Where a wagon stands, what it carries, and how much longer it is on the road.
+        /// Travel is counted in *steps* here rather than seconds, which is the one thing
+        /// this run does differently from the game: a journey of L tiles takes
+        /// `L / (speed * step_seconds)` steps, and that conversion is done once.
+        struct Wagon {
+            trader: usize,
+            at: usize,
+            travelling_to: Option<usize>,
+            steps_left: f32,
+            journeys: u64,
+            caravan: Caravan,
+        }
+        let tiles_per_step = trade_config.caravan_speed_tiles * config.step_seconds;
+        let connected: Vec<usize> = (0..state.len()).filter(|i| !edges[*i].is_empty()).collect();
+        assert!(!connected.is_empty(), "no city has a road");
+
+        let mut purses = vec![trade_config.trader_start_money; trade_config.trader_count as usize];
+        let mut wagons: Vec<Wagon> = Vec::new();
+        for trader in 0..trade_config.trader_count as usize {
+            for wagon in 0..trade_config.caravans_per_trader as usize {
+                wagons.push(Wagon {
+                    trader,
+                    at: connected[(trader * 31 + wagon * 17) % connected.len()],
+                    travelling_to: None,
+                    steps_left: 0.0,
+                    journeys: 0,
+                    caravan: Caravan::empty(),
+                });
+            }
+        }
+
+        let mut readings = Readings::default();
+        let mut got_what_it_cannot_make = vec![false; state.len()];
+
+        for step in 0..STEPS {
+            let sweep = step % state.len();
+            for (index, (city, growth, industry, purse)) in state.iter_mut().enumerate() {
+                let mut edits = Vec::new();
+                if index == sweep {
+                    growth.resum(&map);
+                }
+                let labour = step_industry(
+                    industry_config,
+                    config,
+                    &map,
+                    estate.offsets(),
+                    Sky { rain: 0.0 },
+                    index == sweep,
+                    step.is_multiple_of(industry_config.harvest_interval_steps.max(1) as usize),
+                    city,
+                    growth,
+                    industry,
+                    |entity| of_seam(entity).map(|(_, site)| (site.resource, site.richness)),
+                );
+                step_city(
+                    config,
+                    &map,
+                    &sampler,
+                    &offsets,
+                    labour,
+                    index == sweep,
+                    Entity::PLACEHOLDER,
+                    city,
+                    growth,
+                    &mut city_map,
+                    &mut edits,
+                );
+                map.apply_edits(&edits, &mut dirty);
+                *purse += growth.population * market_config.city_income_per_person;
+            }
+
+            if with_traders {
+                for wagon in &mut wagons {
+                    if wagon.travelling_to.is_some() {
+                        wagon.steps_left -= 1.0;
+                        if wagon.steps_left > 0.0 {
+                            continue;
+                        }
+                        wagon.at = wagon.travelling_to.take().expect("was travelling");
+                    }
+
+                    let stall_at = |state: &[(City, CityGrowth, CityIndustry, f32)], at: usize| {
+                        let (_, growth, industry, purse) = &state[at];
+                        Stall::of(industry_config, config, industry, growth, *purse)
+                    };
+
+                    let mut stall = stall_at(&state, wagon.at);
+                    let opening = stall.stocks;
+                    let sold = sell(trade_config, market_config, &mut wagon.caravan, &mut stall);
+                    for resource in Resource::ALL {
+                        let delta = stall.stocks[resource.index()] - opening[resource.index()];
+                        if delta <= 0.0 {
+                            continue;
+                        }
+                        readings.delivered[resource.index()] += delta as f64;
+                        if state[wagon.at].2.hands(resource) <= 0.0 {
+                            readings.delivered_to_the_helpless[resource.index()] += delta as f64;
+                        }
+                        // Hands are zero for a resource with no land and no seam behind
+                        // it, which is exactly the four-in-five case gh-24 measured.
+                        if state[wagon.at].2.hands(resource) <= 0.0 {
+                            got_what_it_cannot_make[wagon.at] = true;
+                        }
+                    }
+                    write_back(&mut state[wagon.at], &stall);
+                    purses[wagon.trader] += sold.earned;
+
+                    let neighbours: Vec<(f32, Stall)> = edges[wagon.at]
+                        .iter()
+                        .map(|(to, length)| (*length, stall_at(&state, *to)))
+                        .collect();
+                    let here = stall_at(&state, wagon.at);
+                    let Some(journey) = choose(
+                        trade_config,
+                        market_config,
+                        &wagon.caravan,
+                        purses[wagon.trader],
+                        &here,
+                        &neighbours,
+                        &sold.resources,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(resource) = journey.buy {
+                        let mut stall = here;
+                        let spent = buy(
+                            trade_config,
+                            market_config,
+                            &mut wagon.caravan,
+                            &mut stall,
+                            purses[wagon.trader],
+                            resource,
+                        );
+                        write_back(&mut state[wagon.at], &stall);
+                        purses[wagon.trader] -= spent;
+                    }
+                    let (to, length) = edges[wagon.at][journey.edge];
+                    wagon.travelling_to = Some(to);
+                    wagon.steps_left = (length / tiles_per_step).max(1.0);
+                    wagon.journeys += 1;
+                    readings.journeys += 1;
+                }
+            }
+
+            if step % 100 == 0 {
+                let mut money: Vec<f64> = state.iter().map(|(.., purse)| *purse as f64).collect();
+                money.sort_by(f64::total_cmp);
+                readings.treasury_track.push(money[money.len() / 2]);
+            }
+        }
+
+        let mut populations: Vec<f32> = state
+            .iter()
+            .map(|(_, growth, ..)| growth.population)
+            .collect();
+        populations.sort_by(f32::total_cmp);
+        readings.median_population = populations[populations.len() / 2];
+        readings.mean_happiness = state
+            .iter()
+            .map(|(_, _, industry, _)| industry.happiness())
+            .sum::<f32>()
+            / state.len() as f32;
+        readings.stuck_wagons = wagons.iter().filter(|wagon| wagon.journeys == 0).count();
+        readings.purses = purses;
+        readings.supplied = got_what_it_cannot_make.iter().filter(|got| **got).count();
+        for (_, _growth, industry, _) in &state {
+            for resource in Resource::ALL {
+                let index = resource.index();
+                readings.stocks[index] += industry.stock(resource) as f64;
+                // Hands are zero for a resource with no land and no seam behind it,
+                // which is the four-in-five case gh-24 measured.
+                if industry.hands(resource) <= 0.0 {
+                    readings.held_by_the_helpless[index] += industry.stock(resource) as f64;
+                }
+            }
+        }
+        readings
+    }
+
+    /// Applies a stall's numbers back onto the city they were read from — the same
+    /// write-back the system does, against a tuple instead of components.
+    fn write_back(city: &mut (City, CityGrowth, CityIndustry, f32), stall: &Stall) {
+        for resource in Resource::ALL {
+            let delta = stall.stocks[resource.index()] - city.2.stock(resource);
+            city.2.move_stock(resource, delta);
+        }
+        city.3 = stall.money;
     }
 }

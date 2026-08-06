@@ -17,13 +17,33 @@ use crate::gameplay::{
     world::{TileEdit, WorldSnapshot},
 };
 
-/// Two cities with a road between them. The link is all that is kept — where the
-/// road runs is already readable off the `Road` tiles, so storing the path as
-/// well would be two copies of the same thing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Two cities with a road between them, and every tile the road runs over.
+///
+/// The path used to be dropped, on the argument that it was already readable off
+/// the `Road` tiles. That argument is wrong and the reason is the merge: a `Road`
+/// tile does not say which link laid it, routes share tiles deliberately, and a
+/// route's own `edits` *exclude* every tile it reused — so the ground is not a
+/// second copy of the path, it is a union of all of them with the seams gone.
+/// gh-7's caravans need to know which road they are on, so the tile list the
+/// router already builds is kept rather than thrown away. 87 links of a few
+/// hundred tiles is ~300 KB, against `WorldMap`'s 32 MB.
+///
+/// The path runs from `from` to `to` and includes both cities' hops onto the
+/// lattice, so its ends are the two centres and not two lattice nodes.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RoadLink {
     pub from: u32,
     pub to: u32,
+    pub path: Vec<IVec2>,
+}
+
+impl RoadLink {
+    /// How far a caravan walks along this road, in tiles. Path length rather than
+    /// the distance between the two cities: a road that goes round a lake is
+    /// longer than the crow's flight and a trader pays for every tile of it.
+    pub fn length_tiles(&self) -> f32 {
+        self.path.len().saturating_sub(1) as f32
+    }
 }
 
 /// Which cities ended up connected.
@@ -33,6 +53,11 @@ pub struct RoadNetwork {
 }
 
 /// A finished route: the link it realises and the tiles it paves.
+///
+/// The two are different lists and neither is derivable from the other. `link`
+/// carries every tile the route walks; `edits` carries only the ones that were
+/// not already road or town, because re-stamping a reused tile would dirty a
+/// chunk for no visible change.
 pub struct RoutedRoad {
     pub link: RoadLink,
     pub edits: Vec<TileEdit>,
@@ -204,7 +229,8 @@ pub fn route_road(
     tiles.extend(approach);
 
     let edits = tiles
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|&tile| match world.tile(tile) {
             // A road meets a city rather than cutting through it.
             Some(TerrainKind::Town) => false,
@@ -223,6 +249,7 @@ pub fn route_road(
         link: RoadLink {
             from: from.id,
             to: to.id,
+            path: tiles,
         },
         edits,
     })

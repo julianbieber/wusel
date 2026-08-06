@@ -29,6 +29,7 @@ use crate::{
         plan::WorldPlan,
         prospect::ProspectMaps,
         sun::{PlanetConfig, Sun},
+        trade::RoadGraph,
         weather::WeatherMaps,
         world::{BackgroundGeneration, tile_translation},
     },
@@ -89,6 +90,7 @@ pub(super) enum Condition {
     Sky,
     Ground,
     Prospect,
+    Traders,
     Screen(Screen),
 }
 
@@ -401,10 +403,11 @@ impl Condition {
             "sky" => Ok(Self::Sky),
             "ground" => Ok(Self::Ground),
             "prospect" => Ok(Self::Prospect),
+            "traders" => Ok(Self::Traders),
             "main" | "help" | "gameplay" => Ok(Self::Screen(screen(word)?)),
             other => Err(format!(
                 "unknown wait condition: {other} \
-                 (terrain, plan, sky, ground, prospect, main, help, gameplay)"
+                 (terrain, plan, sky, ground, prospect, traders, main, help, gameplay)"
             )),
         }
     }
@@ -416,6 +419,7 @@ impl Condition {
             Self::Sky => "sky",
             Self::Ground => "ground",
             Self::Prospect => "prospect",
+            Self::Traders => "traders",
             Self::Screen(_) => "screen",
         }
     }
@@ -436,6 +440,12 @@ impl Condition {
             // construction. It does not gate the plan, so `wait plan` says nothing
             // about it and this is not a convenience but the standing rule.
             Self::Prospect => world.get_resource::<ProspectMaps>().is_some(),
+            // The traders go out on the first frame after the plan is done *and* the
+            // cities have been seeded, so `wait plan` is one frame short of them — and
+            // a scenario that read `observe traders` on that frame would see an empty
+            // list and assert nothing. The graph's presence is what says the seeding
+            // ran, exactly as it is what stops it running twice.
+            Self::Traders => world.get_resource::<RoadGraph>().is_some(),
             Self::Screen(target) => world
                 .get_resource::<State<Screen>>()
                 .is_some_and(|screen| screen.get() == target),
@@ -457,6 +467,11 @@ impl Condition {
             Self::Sky => "the weather maps have not been baked".into(),
             Self::Ground => "the climate map has not been baked".into(),
             Self::Prospect => "the prospectivity map has not been baked".into(),
+            Self::Traders => match world.get_resource::<WorldPlan>() {
+                Some(WorldPlan::Done) => "the cities have not been seeded yet".into(),
+                Some(plan) => format!("the plan is still at {}", observe::plan_stage(plan)),
+                None => "no plan is running".into(),
+            },
             Self::Screen(_) => match world.get_resource::<State<Screen>>() {
                 Some(screen) => format!("screen is {:?}", screen.get()),
                 None => "no screen state".into(),

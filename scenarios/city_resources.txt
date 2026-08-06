@@ -38,8 +38,19 @@ observe deposits
 # Let the simulation run. Cities are seeded in the first step after the plan reaches
 # `Done` — which is where each one claims the unowned seams in its estate reach, in id
 # order, once and for the session.
-fixed-delta 1/4
-step 400
+#
+# **The budget is eight times what it was, and the arithmetic is not optional.** `step N`
+# advances N *frames*, so what a run buys is `N * fixed-delta / step_seconds` steps —
+# and gh-7 divided `growth_rate` and `claims_per_step` by eight, so the world gh-24
+# reached in 200 steps now needs 1600. The old `fixed-delta 1/4; step 400` would go on
+# measuring a world an eighth of the age this file was written to measure, and nothing
+# would say so.
+#
+# A whole second of delta rather than four times the frames, because the wall clock is
+# frames: 800 of them is thirteen seconds at 60 fps where 3200 would be fifty. Two steps
+# a frame is well under `max_steps_per_frame`, so nothing is dropped.
+fixed-delta 1
+step 800
 
 # The same list again, now with owners: every row whose `owner` is no longer null is a
 # seam some city is working, and the id is the same key `observe cities` is sorted by.

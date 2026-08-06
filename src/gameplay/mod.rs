@@ -9,6 +9,7 @@ pub(crate) mod ground;
 pub(crate) mod growth;
 pub(crate) mod industry;
 pub(crate) mod inspect;
+pub(crate) mod market;
 mod noise;
 pub(crate) mod plan;
 pub(crate) mod prospect;
@@ -18,6 +19,7 @@ mod screen;
 pub(crate) mod sun;
 pub(crate) mod terrain;
 mod tint;
+pub(crate) mod trade;
 pub(crate) mod weather;
 pub(crate) mod world;
 
@@ -56,6 +58,12 @@ impl Plugin for GameplayPlugin {
             prospect::ProspectPlugin,
             city_panel::CityPanelPlugin,
             sun::SunPlugin,
+            // A sibling by the same rule as the panel, and for the same reason it is
+            // not obvious: the traders edit no tile — a caravan is an entity, exactly
+            // as a seam is — but they *read and write* the cities the world's plugin
+            // grew. The ordering that needs is a set on the world's spine, not
+            // membership of its plugin.
+            trade::TradePlugin,
         ));
     }
 }

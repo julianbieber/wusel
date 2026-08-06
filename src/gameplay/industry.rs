@@ -54,12 +54,38 @@
 //! properties are unchanged: a seam still costs a city its harvest, and the split is
 //! still a pure function of the estate — more literally so than before.
 //!
+//! **The crop is cut, not trickled** (gh-7). gh-6 and gh-24 had food appear a mouthful
+//! a step, which is a flow wearing a harvest's name: there was no season to survive,
+//! the granary only ever smoothed one dry step, and no wagon of grain could arrive in
+//! time to matter. The yield now accumulates in the ground all season — so the weather
+//! of the whole season is in the crop rather than that instant's dinner — and one step
+//! in `harvest_interval_steps` brings the lot in. The population eats from the barn and
+//! never from the field, which is what makes a season something to survive.
+//!
+//! **The granary is flat, and that gives the world a food ceiling.** Every other store
+//! scales with the town; a barn does not. So a crop bigger than the barn is left in the
+//! field and a city is fed exactly while
+//! `population <= granary_max / harvest_interval_steps`, which at the shipped values is
+//! 5000 — just under the median gh-24 measured, so the larger half of the world is now
+//! held back by its storage and has to import to grow.
+//!
+//! Two traps in that, both found by falling into them. **The crop must be truncated by
+//! the barn's whole size and not by the room left in it**: against the headroom, what
+//! lands equals what was eaten, so the delivered rate equals consumption, so K equals
+//! p and every population is a fixed point — the world came out pinned at a median of
+//! 1200 wherever it started, which is gh-24's K-proportional-to-p collapse arriving by
+//! a new road. And **`Labour::food_rate` is an `Option`**: a crop is history, so
+//! `growth.rs` cannot recompute it, and `None` means the degenerate no-season model in
+//! which the fields feed the city as they yield — gh-6's loop, which is what keeps
+//! every property test there statable without an industry.
+//!
 //! Defaults carry their measurements, from the `#[ignore]`d
 //! `the_default_config_grows_the_world_into_a_steady_state` in
-//! [`crate::gameplay::growth`]. At the shipped values the world settles at a median
-//! population of **5640** against gh-6's 6940 — the fifth of every city's effort that
-//! is no longer farming — with 74132 tiles of farmland, 12889 of town, and a step
-//! costing **0.678 ms** for 92 cities against gh-6's 0.53.
+//! [`crate::gameplay::growth`]. gh-24 settled the world at a median population of
+//! **5640** against gh-6's 6940 — the fifth of every city's effort that is no longer
+//! farming — with 74132 tiles of farmland, 12889 of town, and a step costing
+//! **0.678 ms** for 92 cities. gh-7 leaves the step cost alone and puts the median at
+//! **5000**, which is the flat barn and not the land.
 
 use bevy::prelude::*;
 
@@ -133,14 +159,33 @@ pub struct IndustryConfig {
     /// How much of each resource one tile of town can store. The whole cap, so a
     /// hamlet cannot hold a metropolis's hoard and the overflow is simply lost.
     pub store_per_town_tile: f32,
-    /// Food's own cap, because grain is bulk and a granary is not a strongroom.
+    /// What one granary holds, for every city in the world.
     ///
-    /// It is also the knob that says how long a bad spell a city can eat through,
-    /// which is `granary_per_town_tile / (town_people_per_tile * food_per_person)`
-    /// steps of a *total* crop failure — 10 at the defaults. That is the visible
-    /// difference the store exists to make: a city with a full granary shrugs off a
-    /// dry spell and one with an empty granary collapses in the same step.
-    pub granary_per_town_tile: f32,
+    /// **Flat, and that is the design rather than a simplification that got left in.**
+    /// Every other store scales with the town, because a warehouse is part of the town;
+    /// a granary is one barn. Holding it fixed gives the world a **food ceiling** —
+    /// a crop bigger than the barn is left in the field, so `harvest_rate` tops out at
+    /// `granary_max / harvest_interval_steps` and with it the population, at
+    /// `granary_max / (harvest_interval_steps * food_per_person)`. At the shipped values
+    /// that is 5000 people, which sits just under the median city gh-24 measured — so
+    /// roughly the larger half of the world is held back by its storage and has to
+    /// import to grow, which is exactly the pressure gh-7 exists to make interesting.
+    ///
+    /// It is also how long a bad spell a city can eat through: a city at the ceiling
+    /// empties a full barn in exactly one harvest interval, and one below it has slack.
+    pub granary_max: f32,
+    /// Steps between harvests.
+    ///
+    /// The fields ripen every step and are cut on one step in this many, so this is
+    /// both the length of a season and — against `granary_max` above — the food
+    /// ceiling. Longer seasons mean bigger crops, a smaller share of them fitting in
+    /// the barn, and a longer hungry gap to survive at the end of one.
+    ///
+    /// At `step_seconds` 0.5 this is 100 seconds, about a third of a 300-second game
+    /// day. Deliberately in *steps* rather than days: nothing in this module reads the
+    /// planet, and tying the harvest to `sun.rs` would need an orbit, which does not
+    /// exist yet — `orbit_phase` is a knob nothing advances.
+    pub harvest_interval_steps: u32,
     /// How far happiness moves toward the step's satisfaction. Smoothed because a
     /// single dry step must not swing the growth rate.
     pub happiness_inertia: f32,
@@ -181,7 +226,8 @@ impl Default for IndustryConfig {
             build_cost_wood: 12.0,
             build_cost_stone: 8.0,
             store_per_town_tile: 40.0,
-            granary_per_town_tile: 400.0,
+            granary_max: 1_000_000.0,
+            harvest_interval_steps: 200,
             happiness_inertia: 0.05,
             happiness_swing: 3.5,
             happiness_neutral: 0.35,
@@ -257,11 +303,34 @@ pub struct CityIndustry {
     deposits: Vec<Entity>,
     wood_tiles: u32,
     stone_tiles: u32,
+    /// What is standing in the fields, waiting to be cut. The season's integral of the
+    /// yield, so the whole season's weather and labour are in the crop rather than only
+    /// the instant it happens to be brought in.
+    ripening: f32,
+    /// What the last cut works out to per step, which is what sizes the population.
+    ///
+    /// Kept rather than recomputed because a crop is *history*: it depends on the
+    /// weather of a season that is over and on whether the barn had room when it came
+    /// in. Recomputing it from `static_yield` would silently discard the granary
+    /// ceiling, which is the whole of what the flat barn does.
+    harvest_rate: f32,
 }
 
 impl CityIndustry {
     pub fn stock(&self, resource: Resource) -> f32 {
         self.stocks[resource.index()]
+    }
+
+    /// Moves a resource into or out of the store, floored at empty.
+    ///
+    /// The one way anything outside this module changes a stock, and it is
+    /// deliberately not clamped at the *top*: the cap belongs to the caller's
+    /// arithmetic, because [`crate::gameplay::market`] has to know how much room
+    /// there is *before* it agrees a price. Silently swallowing an overfill here
+    /// would let a trader be paid for goods that were discarded on arrival.
+    pub fn move_stock(&mut self, resource: Resource, units: f32) {
+        let stock = &mut self.stocks[resource.index()];
+        *stock = (*stock + units).max(0.0);
     }
 
     pub fn hands(&self, resource: Resource) -> f32 {
@@ -274,6 +343,26 @@ impl CityIndustry {
 
     pub fn happiness(&self) -> f32 {
         self.happiness
+    }
+
+    /// What the fields delivered per step at the last cut, and what is standing in
+    /// them now — the two halves of "how is the harvest going", for the panel and the
+    /// ctl.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn harvest_rate(&self) -> f32 {
+        self.harvest_rate
+    }
+
+    /// Stands in for "a crop came in at this rate last season", which a test wants
+    /// without running a whole interval of ripening first.
+    #[cfg(test)]
+    pub(crate) fn set_harvest_rate(&mut self, rate: f32) {
+        self.harvest_rate = rate;
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn ripening(&self) -> f32 {
+        self.ripening
     }
 
     /// What the city's whole estate asks for in hands. Above the population, the
@@ -322,6 +411,21 @@ pub struct Labour {
     /// Zero in a good step, and it enters the capacity and nothing else — in
     /// particular it never reaches the comparison the fields are sized by.
     pub granary_release: f32,
+    /// What the fields actually deliver per step — the last cut spread over the
+    /// interval it was grown in — or `None` for a world with no harvest cycle at all.
+    ///
+    /// It has to come from here rather than be recomputed in `growth.rs`, and that is
+    /// the change explicit harvesting forces: the Harvest row and the logistic's K used
+    /// to be `static_yield * farmer_share * weather`, three numbers both modules could
+    /// see. A cut crop is *history* — it depends on the whole season's weather and on
+    /// whether the barn was full when it came in — so there is now exactly one place
+    /// that knows it.
+    ///
+    /// `None` is not "no food": it is the degenerate model in which the fields feed the
+    /// city as they yield, with no season and no barn, which is exactly gh-6's loop.
+    /// That is what keeps [`Labour::default`] meaning what it has always meant, and
+    /// with it every property test in `growth.rs` that runs without an industry.
+    pub food_rate: Option<f32>,
     /// How many tiles of town the building spend paid for this step.
     ///
     /// Not in the spec's field list, and it has to be: "the town may only grow by as
@@ -340,6 +444,7 @@ impl Default for Labour {
             farmer_share: 1.0,
             growth_scale: 1.0,
             granary_release: 0.0,
+            food_rate: None,
             build_allowance: usize::MAX,
         }
     }
@@ -414,6 +519,8 @@ pub fn seed_industry(
         deposits: Vec::new(),
         wood_tiles: 0,
         stone_tiles: 0,
+        ripening: 0.0,
+        harvest_rate: 0.0,
     };
 
     // First come, in id order, and a claim is for the session: a city never gives a
@@ -436,10 +543,14 @@ pub fn seed_industry(
 
     count_ground(&mut industry, map, offsets, city.centre);
 
-    let town = growth.town() as f32;
     for resource in Resource::ALL {
-        industry.stocks[resource.index()] = town * store_cap_per_tile(config, resource);
+        industry.stocks[resource.index()] = store_cap(config, growth, resource);
     }
+    // A city that has stood for years has just brought a harvest in, so it opens with a
+    // full barn *and* with a season's worth of yield behind it — otherwise every city in
+    // the world would show a harvest rate of zero until its first cut and shrink toward
+    // the floor on the way there.
+    industry.harvest_rate = growth.static_yield();
 
     industry
 }
@@ -456,6 +567,10 @@ pub fn step_industry(
     offsets: &[IVec2],
     sky: Sky,
     swept: bool,
+    // Whether this is the step the fields are cut on. An argument rather than a clock
+    // read, on exactly the terms `sky` and `swept` are: it keeps the step a pure
+    // function and lets a test harvest whenever it likes.
+    harvest: bool,
     city: &City,
     growth: &CityGrowth,
     industry: &mut CityIndustry,
@@ -477,22 +592,48 @@ pub fn step_industry(
     let output = extraction(industry, growth.population);
     let farmer_share = effort(industry, growth.population, Resource::Food);
 
-    // The harvest is the real one, sky and all — the growth step recomputes exactly
-    // this from the same three numbers so its Harvest row keeps meaning what it meant.
-    // Computing the granary release against a rain-free harvest instead would have the
-    // store make up a shortfall that the rain had already covered.
-    let harvest = growth.static_yield() * farmer_share * harvest_multiplier(growth_config, sky);
-    let demand = growth.population * growth_config.food_per_person;
+    // **The fields ripen every step and are cut on one of them.** gh-6 and gh-24 had
+    // the crop appear a mouthful at a time, which is a flow with a harvest's name on
+    // it: there was no season to survive, the granary only ever smoothed a dry step,
+    // and no wagon of grain could arrive in time to matter. Now the yield accumulates
+    // in the ground all season, sky and labour and all — so a wet spring is in the
+    // crop rather than in that instant's dinner — and one step in
+    // `harvest_interval_steps` cuts the lot.
+    industry.ripening +=
+        growth.static_yield() * farmer_share * harvest_multiplier(growth_config, sky);
+    if harvest {
+        let granary = &mut industry.stocks[Resource::Food.index()];
+        // Truncated by the barn's **whole size**, and emphatically not by the room left
+        // in it. Against the headroom, the crop that lands equals what was eaten since
+        // the last cut, so `harvest_rate` equals consumption, so `capacity` equals the
+        // population and *every* population is a fixed point — the same K-proportional-
+        // to-p collapse gh-24 documents under `effort`, arriving by a new road. It
+        // measured out as a world pinned at a median of 1200 wherever it started.
+        //
+        // Against the whole barn the ceiling is a property of the store alone, so a city
+        // is fed exactly while `population <= granary_max / harvest_interval_steps`. The
+        // overflow is still lost — a full barn keeps nothing more — but what the *land
+        // delivered* no longer depends on how full it happened to be.
+        let landed = industry.ripening.min(config.granary_max);
+        *granary = (*granary + landed).min(config.granary_max);
+        industry.ripening = 0.0;
+        // What the last cut works out to per step. This — not the ripening rate — is
+        // what sizes the population, and the difference is the whole of the flat
+        // granary's bite: a crop too big to store never reaches the city at all.
+        industry.harvest_rate = landed / config.harvest_interval_steps.max(1) as f32;
+    }
 
+    let demand = growth.population * growth_config.food_per_person;
     let granary = &mut industry.stocks[Resource::Food.index()];
-    let available = *granary + harvest;
-    let eaten = demand.min(available);
-    // Whatever of that the harvest could not cover, which is zero in any step where
-    // the fields fed the city on their own. Capped at the shortfall by construction,
-    // so a full store cannot push K above the land and no boom-bust cycle exists.
-    let granary_release = (eaten - harvest).max(0.0);
-    let granary_cap = growth.town() as f32 * config.granary_per_town_tile;
-    *granary = (available - eaten).clamp(0.0, granary_cap);
+    // **The population eats from the store and never from the field**, which is what
+    // makes the season real: between cuts the only food in the city is what was put by.
+    let eaten = demand.min(*granary);
+    // What the store made up beyond what the land delivers per step — gh-24's rule
+    // unchanged, and it is deliberately *not* the same number as `eaten`. Capped at the
+    // shortfall by construction, so a full store can only stop the ceiling falling and
+    // can never push K above the land: `capacity <= population` whenever it binds.
+    let granary_release = (demand - industry.harvest_rate).max(0.0).min(*granary);
+    *granary = (*granary - eaten).max(0.0);
 
     // Everything but food, which the granary block above has already settled.
     for resource in Resource::ALL {
@@ -526,9 +667,8 @@ pub fn step_industry(
 
     // The overflow is lost rather than owed, so a town that shrinks loses stores it
     // was holding.
-    let town = growth.town() as f32;
     for resource in Resource::ALL {
-        let cap = town * store_cap_per_tile(config, resource);
+        let cap = store_cap(config, growth, resource);
         industry.stocks[resource.index()] = industry.stocks[resource.index()].clamp(0.0, cap);
     }
 
@@ -536,17 +676,73 @@ pub fn step_industry(
         farmer_share,
         growth_scale: growth_scale(config, growth_config, industry.happiness),
         granary_release,
+        food_rate: Some(industry.harvest_rate),
         build_allowance,
     }
 }
 
-/// What one tile of town can hold of a given resource. Food has its own cap because
-/// grain is bulk and a granary is not a strongroom.
-fn store_cap_per_tile(config: &IndustryConfig, resource: Resource) -> f32 {
+/// The whole of what a city can hold of one resource — what it produces past this is
+/// discarded, and so is anything a trader sells it past this.
+///
+/// Public because that discard is exactly what gh-7's market has to refuse to trade
+/// into: a city that buys into its own overflow pays for goods that evaporate.
+///
+/// **Food's cap is flat and every other resource's is per tile of town**, which is the
+/// one asymmetry in the model and it is deliberate. A warehouse is part of the town and
+/// grows with it; a granary is one barn, and holding it fixed is what puts a ceiling on
+/// how big a city can get — see `granary_max`.
+pub fn store_cap(config: &IndustryConfig, growth: &CityGrowth, resource: Resource) -> f32 {
     match resource {
-        Resource::Food => config.granary_per_town_tile,
-        _ => config.store_per_town_tile,
+        Resource::Food => config.granary_max,
+        _ => growth.town() as f32 * config.store_per_town_tile,
     }
+}
+
+/// What a city consumes of each resource per step, in the ordinary course.
+///
+/// This exists so that [`crate::gameplay::market`] can price a resource against the
+/// city's *need* for it without keeping a second table of who eats what. The baskets
+/// and the per-head rates are read from the same two constants and the same config
+/// the spending below uses, so the two lists cannot drift — the failure mode
+/// `TERRAIN_KIND_COUNT` documents, where a second copy of a number is silently one
+/// behind.
+///
+/// **The building term is notional, and that is the one liberty taken.** What a city
+/// actually spends on stone is lumpy — nothing at all in a settled step, a burst when
+/// it grows — and pricing against the lumps would have stone worthless in most cities
+/// most of the time and then briefly precious. What is used instead is what the city
+/// *would* spend building if it grew at the base rate, which is a standing figure
+/// proportional to the population, like every other term here. A price is what a city
+/// habitually wants, not what it happened to draw this step.
+///
+/// The consequence, and it is intended: stone's standing demand is far below its store
+/// cap, so a city with rock in reach reads as glutted for the whole session and stone
+/// is a cheap bulk good. It becomes worth carrying only towards the cities that have
+/// no rock at all and drain to nothing — which is the same shape as wood in a desert,
+/// and is the geography paying out rather than a knob.
+pub fn consumption(
+    config: &IndustryConfig,
+    growth_config: &GrowthConfig,
+    population: f32,
+) -> [f32; RESOURCE_COUNT] {
+    let mut demand = [0.0; RESOURCE_COUNT];
+    demand[Resource::Food.index()] = population * growth_config.food_per_person;
+    for resource in UPKEEP_BASKET {
+        demand[resource.index()] += population * config.upkeep_per_person;
+    }
+    for resource in COMFORT_BASKET {
+        demand[resource.index()] += population * config.comfort_per_person;
+    }
+
+    // Town tiles per step at the base growth rate, which is the notional building
+    // above. `town_people_per_tile` is what turns people into tiles, so this is the
+    // same conversion `town_target` makes and not a second one.
+    let tiles_per_step = population * growth_config.growth_rate
+        / growth_config.town_people_per_tile.max(f32::EPSILON);
+    demand[Resource::Wood.index()] += tiles_per_step * config.build_cost_wood;
+    demand[Resource::Stone.index()] += tiles_per_step * config.build_cost_stone;
+
+    demand
 }
 
 /// Counts the wood and stone ground inside the city's reach.
@@ -818,14 +1014,20 @@ mod tests {
             deposits: seams.iter().map(|seam| seam.entity).collect(),
             wood_tiles: wood,
             stone_tiles: stone,
+            ripening: 0.0,
+            // As if a crop had just come in at the rate the fields yield, which is what
+            // `seed_industry` opens a real city with.
+            harvest_rate: 0.0,
         };
+        let growth = CityGrowth::for_test(0.0, 0.0, 0, town);
         for resource in Resource::ALL {
-            industry.stocks[resource.index()] = town as f32 * store_cap_per_tile(config, resource);
+            industry.stocks[resource.index()] = store_cap(config, &growth, resource);
         }
         industry
     }
 
-    /// Runs one industry step against a fixed ledger.
+    /// Runs one industry step against a fixed ledger, with no harvest — the ordinary
+    /// step, in which the fields ripen and the city eats out of the barn.
     fn step(
         config: &IndustryConfig,
         growth_config: &GrowthConfig,
@@ -834,6 +1036,31 @@ mod tests {
         growth: &CityGrowth,
         rain: f32,
     ) -> Labour {
+        step_with(config, growth_config, industry, seams, growth, rain, false)
+    }
+
+    /// The same, on the step the crop is cut.
+    fn harvest_step(
+        config: &IndustryConfig,
+        growth_config: &GrowthConfig,
+        industry: &mut CityIndustry,
+        seams: &[Seam],
+        growth: &CityGrowth,
+        rain: f32,
+    ) -> Labour {
+        step_with(config, growth_config, industry, seams, growth, rain, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_with(
+        config: &IndustryConfig,
+        growth_config: &GrowthConfig,
+        industry: &mut CityIndustry,
+        seams: &[Seam],
+        growth: &CityGrowth,
+        rain: f32,
+        harvest: bool,
+    ) -> Labour {
         step_industry(
             config,
             growth_config,
@@ -841,6 +1068,7 @@ mod tests {
             &[],
             Sky { rain },
             false,
+            harvest,
             &city(),
             growth,
             industry,
@@ -951,7 +1179,7 @@ mod tests {
             for _ in 0..50 {
                 step(&config, &growth_config, &mut industry, &seam, &growth, 0.0);
                 for resource in Resource::ALL {
-                    let cap = town as f32 * store_cap_per_tile(&config, resource);
+                    let cap = store_cap(&config, &growth, resource);
                     let stock = industry.stock(resource);
                     assert!(
                         (0.0..=cap + 1e-2).contains(&stock),
@@ -972,6 +1200,9 @@ mod tests {
         // nothing on the table.
         let fed = CityGrowth::for_test(1000.0, 100_000.0, 500, 100);
         let mut industry = holding(&config, 0, 0, &[], 100);
+        // As if last season's crop came in at what the fields yield, which is what
+        // `seed_industry` opens a city with.
+        industry.set_harvest_rate(fed.static_yield());
         let labour = step(&config, &growth_config, &mut industry, &[], &fed, 0.0);
         assert_eq!(
             labour.granary_release, 0.0,
@@ -991,6 +1222,117 @@ mod tests {
         );
     }
 
+    /// A field that is being cut every step is a flow with a harvest's name on it. The
+    /// crop has to *stand* — nothing reaches the barn until it is brought in, and then
+    /// the whole season arrives at once.
+    #[test]
+    fn nothing_reaches_the_barn_until_the_crop_is_cut() {
+        let config = IndustryConfig::default();
+        let growth_config = GrowthConfig::default();
+        let growth = CityGrowth::for_test(1000.0, 100_000.0, 500, 100);
+        let mut industry = holding(&config, 0, 0, &[], 100);
+        // An empty barn, so anything in it came out of this season.
+        industry.move_stock(Resource::Food, -f32::MAX);
+
+        for step_index in 0..20 {
+            step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+            assert_eq!(
+                industry.stock(Resource::Food),
+                0.0,
+                "the barn filled on step {step_index} without a harvest"
+            );
+            assert!(
+                industry.ripening() > 0.0,
+                "nothing is standing in the fields"
+            );
+        }
+
+        let standing = industry.ripening();
+        harvest_step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+        assert_eq!(industry.ripening(), 0.0, "the fields were not cleared");
+        assert!(
+            industry.stock(Resource::Food) > standing * 0.9,
+            "the season's crop did not reach the barn: {} against {standing} standing",
+            industry.stock(Resource::Food)
+        );
+    }
+
+    /// The city eats out of the barn and never out of the field, which is what makes a
+    /// season something to survive rather than a label.
+    #[test]
+    fn the_city_eats_out_of_the_barn_between_harvests() {
+        let config = IndustryConfig::default();
+        let growth_config = GrowthConfig::default();
+        let growth = CityGrowth::for_test(1000.0, 100_000.0, 500, 100);
+        let mut industry = holding(&config, 0, 0, &[], 100);
+
+        let before = industry.stock(Resource::Food);
+        step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+        let eaten = before - industry.stock(Resource::Food);
+        let demand = growth.population * growth_config.food_per_person;
+        assert!(
+            (eaten - demand).abs() < 1e-2,
+            "the city ate {eaten} against a demand of {demand}"
+        );
+    }
+
+    /// The flat barn's whole point: a crop bigger than the store is left in the field,
+    /// so no city can be fed by more land than it can keep the produce of.
+    #[test]
+    fn a_crop_too_big_for_the_barn_is_left_in_the_field() {
+        let config = IndustryConfig::default();
+        let growth_config = GrowthConfig::default();
+        // Land far richer than one barn can hold a season of.
+        let growth = CityGrowth::for_test(1000.0, 1.0e9, 500, 100);
+        let mut industry = holding(&config, 0, 0, &[], 100);
+        industry.move_stock(Resource::Food, -f32::MAX);
+
+        for _ in 0..config.harvest_interval_steps - 1 {
+            step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+        }
+        let labour = harvest_step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+
+        assert!(
+            industry.stock(Resource::Food) <= config.granary_max + 1e-2,
+            "the barn holds {} against a cap of {}",
+            industry.stock(Resource::Food),
+            config.granary_max
+        );
+        let ceiling = config.granary_max / config.harvest_interval_steps as f32;
+        assert!(
+            (labour.food_rate.expect("an industry always reports one") - ceiling).abs()
+                < ceiling * 0.01,
+            "the delivered rate was {:?} against a ceiling of {ceiling}",
+            labour.food_rate
+        );
+    }
+
+    /// And the consequence, which is the number to reach for when the world's cities
+    /// look the wrong size: a flat barn is a flat ceiling on population.
+    #[test]
+    fn the_flat_barn_is_a_ceiling_on_how_many_people_the_land_can_feed() {
+        let config = IndustryConfig::default();
+        let growth_config = GrowthConfig::default();
+        let ceiling = config.granary_max
+            / (config.harvest_interval_steps as f32 * growth_config.food_per_person);
+
+        for yield_per_step in [1.0e6, 1.0e9, 1.0e12] {
+            let growth = CityGrowth::for_test(1000.0, yield_per_step, 500, 100);
+            let mut industry = holding(&config, 0, 0, &[], 100);
+            industry.move_stock(Resource::Food, -f32::MAX);
+            for _ in 0..config.harvest_interval_steps - 1 {
+                step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+            }
+            let labour = harvest_step(&config, &growth_config, &mut industry, &[], &growth, 0.0);
+            let supported = labour.food_rate.expect("an industry always reports one")
+                / growth_config.food_per_person;
+            assert!(
+                supported <= ceiling * 1.01,
+                "land yielding {yield_per_step} fed {supported} people past a ceiling of {ceiling}"
+            );
+        }
+    }
+
     /// A city can outlive a total crop failure for as many steps as its store holds
     /// and not one more, and that number is a knob rather than an accident.
     #[test]
@@ -1004,9 +1346,11 @@ mod tests {
         let growth = CityGrowth::for_test(population, 0.0, 0, town);
         let mut industry = holding(&config, 0, 0, &[], town);
 
-        let expected = (config.granary_per_town_tile
-            / (growth_config.town_people_per_tile * growth_config.food_per_person))
-            .round() as usize;
+        // The granary is flat since gh-7, so what it buys is a whole barn divided by
+        // what the city eats — no longer a per-tile figure, and so no longer the same
+        // number of steps for every city.
+        let expected =
+            (config.granary_max / (population * growth_config.food_per_person)).round() as usize;
 
         let mut fed = 0;
         for _ in 0..expected * 4 {

@@ -36,6 +36,7 @@ use crate::{
         deposit::Resource,
         growth::CityGrowth,
         industry::CityIndustry,
+        market::CityTreasury,
         road::RoadNetwork,
         world::{
             CHUNK_SIZE, TILE_DISPLAY_SIZE, WORLD_CHUNKS, WorldSystems, chunk_index_of_tile,
@@ -115,6 +116,10 @@ pub enum CityStat {
     /// column instead of the resource one beside it.
     Happiness,
     Idle,
+    /// gh-7. The one number on the panel that no city can produce for itself: it comes
+    /// in on a caravan, or it is minted per head, and either way it is what says
+    /// whether the next wagon through will find a buyer.
+    Treasury,
     Roads,
     Centre,
 }
@@ -123,7 +128,7 @@ impl CityStat {
     /// Every stat, in the order they are laid out. The spawn loop and the readout both
     /// walk this, so adding a tenth stat is one variant and one match arm rather than
     /// three lists that have to agree.
-    const ALL: [CityStat; 11] = [
+    const ALL: [CityStat; 12] = [
         CityStat::Tier,
         CityStat::Population,
         CityStat::Harvest,
@@ -133,6 +138,7 @@ impl CityStat {
         CityStat::FieldTiles,
         CityStat::Happiness,
         CityStat::Idle,
+        CityStat::Treasury,
         CityStat::Roads,
         CityStat::Centre,
     ];
@@ -148,6 +154,7 @@ impl CityStat {
             CityStat::FieldTiles => "Fields",
             CityStat::Happiness => "Content",
             CityStat::Idle => "Idle",
+            CityStat::Treasury => "Money",
             CityStat::Roads => "Roads",
             CityStat::Centre => "At",
         }
@@ -167,6 +174,7 @@ impl CityStat {
         city: &City,
         growth: Option<&CityGrowth>,
         industry: Option<&CityIndustry>,
+        treasury: Option<&CityTreasury>,
         roads: Option<usize>,
     ) -> String {
         const UNKNOWN: &str = "—";
@@ -188,6 +196,12 @@ impl CityStat {
             CityStat::FieldTiles => of_growth(&|g| g.fields().to_string()),
             CityStat::Happiness => of_industry(&|i| format!("{:.0}%", i.happiness() * 100.0)),
             CityStat::Idle => of_industry(&|i| format!("{:.0}", i.idle())),
+            // Absent for the same reason `growth` is — the purse is handed out with the
+            // road graph, one frame after the cities are seeded — and for one frame
+            // longer, which is exactly what the shared unknown is for.
+            CityStat::Treasury => {
+                treasury.map_or_else(|| UNKNOWN.to_string(), |t| format!("{:.0}", t.money()))
+            }
             CityStat::Roads => roads.map_or_else(|| UNKNOWN.to_string(), |n| n.to_string()),
         }
     }
@@ -808,7 +822,7 @@ fn spawn_panel(
                                 column,
                                 config,
                                 stat.label().to_string(),
-                                stat.format(city, None, None, None),
+                                stat.format(city, None, None, None, None),
                                 CityStatValue(stat),
                             );
                         }
@@ -887,7 +901,12 @@ fn spawn_row(
 fn refresh_city_panel(
     mut commands: Commands,
     panel: Option<Single<(Entity, &CityStatsPanel)>>,
-    cities: Query<(&City, Option<&CityGrowth>, Option<&CityIndustry>)>,
+    cities: Query<(
+        &City,
+        Option<&CityGrowth>,
+        Option<&CityIndustry>,
+        Option<&CityTreasury>,
+    )>,
     roads: Res<RoadNetwork>,
     config: Res<CityPanelConfig>,
     mut values: Query<(&CityStatValue, &mut Text)>,
@@ -900,7 +919,7 @@ fn refresh_city_panel(
     };
     let (panel_entity, panel_state) = *panel;
 
-    let Ok((city, growth, industry)) = cities.get(panel_state.city) else {
+    let Ok((city, growth, industry, treasury)) = cities.get(panel_state.city) else {
         // Nothing despawns a city mid-session — the cities and this panel go together on
         // leaving gameplay — so this is the shape of the guard rather than a live path.
         // It is not a substitute for the state gate on the set.
@@ -915,7 +934,13 @@ fn refresh_city_panel(
         .count();
 
     for (value, mut text) in &mut values {
-        text.set_if_neq(Text(value.0.format(city, growth, industry, Some(links))));
+        text.set_if_neq(Text(value.0.format(
+            city,
+            growth,
+            industry,
+            treasury,
+            Some(links),
+        )));
     }
     for (value, mut text) in &mut resources {
         text.set_if_neq(Text(resource_row(industry, value.0)));
@@ -1165,18 +1190,33 @@ mod tests {
     #[test]
     fn a_city_without_growth_shows_dashes_rather_than_nothing() {
         let city = city(7, IVec2::new(-12, 40), 8);
-        assert_eq!(CityStat::Population.format(&city, None, None, None), "—");
-        assert_eq!(CityStat::Tier.format(&city, None, None, None), "Borough");
-        assert_eq!(CityStat::Centre.format(&city, None, None, None), "-12, 40");
+        assert_eq!(
+            CityStat::Population.format(&city, None, None, None, None),
+            "—"
+        );
+        assert_eq!(
+            CityStat::Tier.format(&city, None, None, None, None),
+            "Borough"
+        );
+        assert_eq!(
+            CityStat::Centre.format(&city, None, None, None, None),
+            "-12, 40"
+        );
         // Roads are known before the growth is, and each is missing on its own terms.
-        assert_eq!(CityStat::Roads.format(&city, None, None, Some(3)), "3");
+        assert_eq!(
+            CityStat::Roads.format(&city, None, None, None, Some(3)),
+            "3"
+        );
         // The industry half reads unknown on exactly the same terms, and a city is
         // clickable through the whole road-planning stage during which it is.
-        assert_eq!(CityStat::Happiness.format(&city, None, None, None), "—");
-        assert_eq!(CityStat::Idle.format(&city, None, None, None), "—");
+        assert_eq!(
+            CityStat::Happiness.format(&city, None, None, None, None),
+            "—"
+        );
+        assert_eq!(CityStat::Idle.format(&city, None, None, None, None), "—");
         for resource in Resource::ALL {
             assert_eq!(resource_row(None, resource), "—");
         }
-        assert_eq!(CityStat::Roads.format(&city, None, None, None), "—");
+        assert_eq!(CityStat::Roads.format(&city, None, None, None, None), "—");
     }
 }

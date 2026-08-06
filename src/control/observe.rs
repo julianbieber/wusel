@@ -6,7 +6,7 @@
 //! Adding a topic is a Rust change; adding a *scenario* is a data file. That asymmetry
 //! is deliberate — it is what keeps writing a scenario per feature cheap.
 
-use bevy::prelude::*;
+use bevy::{platform::collections::HashMap, prelude::*};
 use serde_json::{Value, json};
 
 use super::log::LogBuffer;
@@ -16,14 +16,16 @@ use crate::{
         city::{City, CitySize},
         deposit::{Deposit, Resource},
         ground::{ClimateMaps, GroundConfig, GroundCover, temperature_offset},
-        growth::CityGrowth,
-        industry::CityIndustry,
+        growth::{CityGrowth, GrowthConfig},
+        industry::{CityIndustry, IndustryConfig},
         inspect::{ActiveOverlay, FieldSources},
+        market::{CityTreasury, MarketConfig, prices},
         plan::WorldPlan,
         prospect::ProspectMaps,
         road::RoadNetwork,
         sun::{PlanetConfig, Sun},
         terrain::TerrainKind,
+        trade::{Caravan, Errand, Trader},
         weather::SkySampler,
         world::{BackgroundGeneration, ChunkCoord, WORLD_CHUNKS, WorldMap, tile_position_at},
     },
@@ -45,6 +47,7 @@ pub(super) enum Topic {
     Sun,
     Overlay,
     Screen,
+    Traders,
     Log,
 }
 
@@ -60,11 +63,12 @@ impl Topic {
             "sun" => Ok(Self::Sun),
             "overlay" => Ok(Self::Overlay),
             "screen" => Ok(Self::Screen),
+            "traders" => Ok(Self::Traders),
             "log" => Ok(Self::Log),
             other => Err(format!(
                 "unknown observation: {other} \
                  (terrain, plan, camera, cities, deposits, ground, sun, overlay, \
-                 screen, log)"
+                 screen, traders, log)"
             )),
         }
     }
@@ -81,6 +85,7 @@ pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
         Topic::Sun => sun(world),
         Topic::Overlay => overlay(world),
         Topic::Screen => screen(world),
+        Topic::Traders => traders(world),
         Topic::Log => log(world),
     }
 }
@@ -302,10 +307,22 @@ fn camera(world: &mut World) -> Value {
 }
 
 fn cities(world: &mut World) -> Value {
-    let mut query = world.query::<(&City, Option<&CityGrowth>, Option<&CityIndustry>)>();
+    // The three configs a price is quoted against, taken before the query borrows the
+    // world. Cloned rather than held, because a `&World` and a `QueryState` cannot both
+    // be live — and they are knobs, so a clone is a handful of floats.
+    let market = world.get_resource::<MarketConfig>().cloned();
+    let industry_config = world.get_resource::<IndustryConfig>().cloned();
+    let growth_config = world.get_resource::<GrowthConfig>().cloned();
+
+    let mut query = world.query::<(
+        &City,
+        Option<&CityGrowth>,
+        Option<&CityIndustry>,
+        Option<&CityTreasury>,
+    )>();
     let mut list: Vec<Value> = query
         .iter(world)
-        .map(|(city, growth, industry)| {
+        .map(|(city, growth, industry, treasury)| {
             // Both maps are built by walking `Resource::ALL`, never by a hand-written
             // list of six — so a seventh resource reaches this topic as a table row in
             // `deposit.rs` and nothing here.
@@ -357,6 +374,32 @@ fn cities(world: &mut World) -> Value {
                 "hands_wanted": industry.map(|industry| industry.total_hands_wanted()),
                 "happiness": industry.map(|industry| industry.happiness()),
                 "seams": industry.map(|industry| industry.seams()),
+                // gh-7's harvest, as its two halves: what the last cut works out to per
+                // step — which is what sizes the population — and what is standing in
+                // the fields waiting for the next one. Neither is derivable from the
+                // other or from `static_yield`, since a crop depends on a season that is
+                // over and on whether the barn had room for it.
+                "harvest_rate": industry.map(CityIndustry::harvest_rate),
+                "ripening": industry.map(CityIndustry::ripening),
+                // gh-7. The purse and what this city will pay for one unit of each
+                // resource *right now* — which is the number a caravan compares, so a
+                // scenario asserting that goods moved the right way reads the same
+                // figure the decision was taken on.
+                "treasury": treasury.map(CityTreasury::money),
+                "prices": match (&market, &industry_config, &growth_config, industry, growth) {
+                    (Some(market), Some(config), Some(growth_config), Some(industry), Some(growth)) => {
+                        let quoted = prices(market, config, growth_config, industry, growth);
+                        Some(Value::Object(
+                            Resource::ALL
+                                .iter()
+                                .map(|resource| {
+                                    (resource.label().to_string(), json!(quoted[resource.index()]))
+                                })
+                                .collect(),
+                        ))
+                    }
+                    _ => None,
+                },
             })
         })
         .collect();
@@ -365,6 +408,129 @@ fn cities(world: &mut World) -> Value {
     // iteration order is an ECS implementation detail and would make a diff noise.
     list.sort_by_key(|city| city["id"].as_u64().unwrap_or_default());
     json!({ "count": list.len(), "cities": list })
+}
+
+/// Every trader's purse, and every wagon's errand and load.
+///
+/// The one observation gh-7 cannot do without, because a caravan is a coloured dot: a
+/// capture proves it is *on* a road and says nothing about what it is carrying, what
+/// it paid, or whether it is going anywhere on purpose. Cities are reported by
+/// `City.id` here for the same reason `observe deposits` reports its owners that way —
+/// an id is stable across runs and an `Entity` is not, so nothing in a scenario may
+/// key on one.
+fn traders(world: &mut World) -> Value {
+    let ids: Vec<(Entity, u32)> = world
+        .query::<(Entity, &City)>()
+        .iter(world)
+        .map(|(entity, city)| (entity, city.id))
+        .collect();
+    let city_id = |entity: Entity| {
+        ids.iter()
+            .find(|(candidate, _)| *candidate == entity)
+            .map(|(_, id)| *id)
+    };
+
+    let purses: Vec<(Entity, u32, f32)> = world
+        .query::<(Entity, &Trader)>()
+        .iter(world)
+        .map(|(entity, trader)| (entity, trader.id, trader.money()))
+        .collect();
+
+    // What each wagon is standing on, read before the query below borrows the world.
+    // "Is it on a road" is the assertion the whole feature turns on, and a capture
+    // cannot settle it — so the answer is reported rather than left to the author.
+    let ground: HashMap<IVec2, String> = {
+        let places: Vec<IVec2> = world
+            .query::<(&Caravan, &Transform)>()
+            .iter(world)
+            .map(|(_, transform)| {
+                tile_position_at(transform.translation.truncate())
+                    .floor()
+                    .as_ivec2()
+            })
+            .collect();
+        match world.get_resource::<WorldMap>() {
+            Some(map) => places
+                .into_iter()
+                .filter_map(|tile| Some((tile, format!("{:?}", map.tile(tile)?))))
+                .collect(),
+            None => HashMap::default(),
+        }
+    };
+
+    let mut wagons: Vec<Value> = world
+        .query::<(&Caravan, &Transform)>()
+        .iter(world)
+        .map(|(caravan, transform)| {
+            let trader = purses
+                .iter()
+                .find(|(entity, ..)| *entity == caravan.trader)
+                .map(|(_, id, _)| *id);
+            let errand = match caravan.errand {
+                Errand::Resting { city, .. } => json!({
+                    "state": "resting",
+                    "city": city_id(city),
+                }),
+                Errand::Travelling { leg, to } => json!({
+                    "state": "travelling",
+                    "to": city_id(to),
+                    "travelled_tiles": leg.travelled_tiles,
+                    "length_tiles": leg.length_tiles,
+                }),
+            };
+            // Where it actually is, in global tile space. The one thing a capture cannot
+            // tell you and the whole point of the feature: a scenario asserts a wagon is
+            // *on the road* by checking this tile against `WorldMap`, which no amount of
+            // looking at a coloured dot can do.
+            let tile = tile_position_at(transform.translation.truncate());
+            json!({
+                "trader": trader,
+                "errand": errand,
+                "tile": [tile.x, tile.y],
+                "on": ground.get(&tile.floor().as_ivec2()).cloned(),
+                "carried": caravan.carried(),
+                // Keyed by resource, with what the load cost beside it — the two
+                // together are what says whether a sale would be a profit, which is the
+                // rule that decides whether cargo travels on.
+                "cargo": Value::Object(
+                    caravan
+                        .cargo()
+                        .iter()
+                        .map(|lot| {
+                            (
+                                lot.resource.label().to_string(),
+                                json!({ "units": lot.units, "paid_per_unit": lot.paid_per_unit }),
+                            )
+                        })
+                        .collect(),
+                ),
+            })
+        })
+        .collect();
+
+    // Sorted for a clean diff between runs, on the trader id and then the load, since
+    // a trader's own wagons are otherwise indistinguishable in the output.
+    wagons.sort_by(|a, b| {
+        let key = |v: &Value| {
+            (
+                v["trader"].as_u64().unwrap_or_default(),
+                v["carried"].as_f64().unwrap_or_default().to_bits(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+
+    let mut list: Vec<Value> = purses
+        .iter()
+        .map(|(_, id, money)| json!({ "id": id, "money": money }))
+        .collect();
+    list.sort_by_key(|trader| trader["id"].as_u64().unwrap_or_default());
+
+    json!({
+        "running": !list.is_empty(),
+        "traders": list,
+        "caravans": wagons,
+    })
 }
 
 /// The seams, and who works each one.
