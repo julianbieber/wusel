@@ -111,6 +111,7 @@ impl Plugin for WorldPlugin {
                 WorldSystems::Streaming,
                 WorldSystems::Planning,
                 WorldSystems::Growth,
+                WorldSystems::Trade,
                 WorldSystems::Refresh,
             )
                 .chain()
@@ -141,6 +142,19 @@ pub enum WorldSystems {
     /// a world whose cities are moving, and before `Refresh` for the same reason
     /// the plan's own edits are: so an edit is visible in the frame it lands.
     Growth,
+    /// Moving the caravans and settling what they buy and sell.
+    ///
+    /// A set of its own rather than more systems inside `Growth`, and the argument is
+    /// determinism rather than staleness — the same one `city_panel.rs` makes about
+    /// its readout. The city step and the trade step both hold `&mut CityIndustry`, so
+    /// the executor has to serialize them whatever happens; without an edge between
+    /// them it is free to pick a different order each frame, and a caravan would
+    /// sometimes see the stocks before the step and sometimes after.
+    ///
+    /// It edits no tile, so it could have sat outside the spine entirely. It is here
+    /// because it reads the stocks the step above writes, and that is the whole of the
+    /// ordering it needs.
+    Trade,
     /// Rebuilding the resident entities whose tiles the plan changed.
     Refresh,
 }

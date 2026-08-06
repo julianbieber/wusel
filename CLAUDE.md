@@ -459,6 +459,16 @@ feeds; `a_town_tile_houses_more_than_the_field_it_replaces_feeds` is the guard, 
 condition rather than taste. The logistic is in closed form, not the Euler `p + r·p·(1 - p/K)`, because
 that oscillates at large rates and divides by a K that is **zero for every city on its first step**.
 
+**gh-7 made the world slower, and what moved is not the clock.** `step_seconds` stayed
+at 0.5 — a step is the simulation's *resolution*, and at four seconds the panel lurches
+once every four seconds instead of twice a second. What lengthened is `growth_rate`
+(0.02 -> 0.0025) and `claims_per_step` (8 -> 1), so a city fills toward its ceiling and
+raises its houses eight times slower while every steady state gh-24 measured stays
+exactly where it was. The world simply takes eight times as many *steps* to reach it,
+which is why every scenario that runs the economy had its frame budget raised — see the
+arithmetic in `city_resources.txt`, and note that `step N` advances N **frames**, so a
+run buys `N * fixed-delta / step_seconds` steps.
+
 Costs are per-step and permanent, where every stage above pays once — and small: **0.53 ms for the
 whole world of 92 cities**, once every `step_seconds`. A step is O(1) per city, because the field sum
 is maintained incrementally and the rain is sampled once per city rather than once per field. Nearly
@@ -494,6 +504,33 @@ populations are anti-correlated. At reach 56 a city's disc is 9852 tiles of a 16
 seams *should* give one to a quarter of them; the measured figure is 5%. The shipped 64/112 pair gives
 **one city in five working a seam, nearly all of them a single kind** — going denser buys mining cities
 and spends the differentiation.
+
+**The crop is cut, not trickled** (gh-7). gh-6 and gh-24 had food appear a mouthful a
+step, which is a flow wearing a harvest's name: there was no season to survive, the
+granary only ever smoothed one dry step, and no wagon of grain could arrive in time to
+matter. The yield now accumulates in the ground all season — so the whole season's
+weather is in the crop rather than that instant's dinner — and one step in
+`harvest_interval_steps` brings the lot in. **The population eats from the barn and never
+from the field**, which is what makes a season something to survive.
+
+**The granary is flat where every other store scales with the town, and that gives the
+world a food ceiling.** A warehouse is part of a town; a barn is not. A crop bigger than
+the barn is left in the field, so a city is fed exactly while
+`population <= granary_max / harvest_interval_steps` — 5000 at the shipped values, just
+under the median gh-24 measured, so the larger half of the world is now held back by its
+storage and has to import to grow. That is what makes food the biggest trade good in the
+measurement, and it is a storage limit rather than a knob.
+
+Two traps in that, both found by falling into them. **The crop must be truncated by the
+barn's whole size and not by the room left in it**: against the headroom, what lands
+equals what was eaten, so the delivered rate equals consumption, so K equals p and every
+population is a fixed point — the world came out pinned at a median of 1200 wherever it
+started, which is `effort`'s K-proportional-to-p collapse arriving by a new road. And
+**`Labour::food_rate` is an `Option`**: a cut crop is *history*, depending on a season
+that is over and on whether the barn had room, so `growth.rs` cannot recompute it —
+`None` means the degenerate no-season model where the fields feed the city as they
+yield, which is gh-6's loop and is what keeps every property test there statable without
+an industry.
 
 `industry.rs` splits the population across professions. **A profession *is* the resource its hands
 produce** — no `Profession` enum, so the two lists cannot drift. Food is now a stock with a granary,
@@ -535,6 +572,110 @@ copper and salt and no wood, Wetland is wet timber and salt, Plains has neither 
 correlation is the ground showing through — **nothing in `industry.rs` has ever learned what a biome
 is**.
 
+### Traders and the market (`gameplay/trade.rs`, `gameplay/market.rs`)
+
+The first thing in the crate that is a *game* rather than a world. Everything above it
+either generates terrain once or advances a city against its own land; no two cities had
+ever exchanged anything, and the road network had been decoration since it was laid.
+
+**The road network is the whole reason this is cheap.** `road.rs` already decides which
+cities are worth joining and where the road between them runs, and the Gabriel graph is
+a near-planar neighbour graph — a city has two or three links, so a one-hop choice is a
+handful of comparisons and nothing here pathfinds. What it needed was for `route_road`
+to *keep* the tile list it already builds. That falsified a comment: the path was dropped
+on the argument that it is readable off the `Road` tiles, and the merge is why that is
+wrong — a `Road` tile does not say which link laid it, routes share tiles deliberately,
+and a route's `edits` exclude every tile it reused. 87 links of a few hundred tiles is
+~300 KB against `WorldMap`'s 32 MB.
+
+**Three properties of the existing economy are the pressures, and none had to be
+invented.** A store is clamped and the overflow *discarded*, so a seam city already
+destroys iron every step. gh-24 measured 20 cities of 92 working any seam, so four in
+five hold iron, copper and salt at zero, are short on the upkeep basket, and are unhappy
+for it — and happiness scales the growth rate, so a caravan of iron is worth
+*population* through a channel that already existed. And since gh-7's flat granary, the
+larger half of the world sits on its food ceiling, which is what makes grain the biggest
+trade good.
+
+**A price is availability against need.** `base_value * lerp(scarce, glut, smoothstep(stock
+/ (consumption * horizon)))` — so a metropolis pays more for grain than a hamlet holding
+the same granary, because consumption is per head. The need comes from
+`industry::consumption` and may come from nowhere else; a second table of who eats what
+here would be the `TERRAIN_KIND_COUNT` failure mode. The curve's ends are flat on
+purpose: a trade moves the stock it is priced against, and a linear ramp makes caravans
+oscillate.
+
+**Every bargain is bounded, and the rule for which bounds get sliced is one sentence: the
+city's side is sliced, the trader's side is hard.** A city must not be sold empty,
+bankrupted or filled to its cap in one visit; a purse and a wagon are not markets, and a
+caravan may fill itself in one go. `trade_slice` is the whole of the price stability.
+
+**Three ways a journey can pay, and the third is what makes the network work.** Carry and
+deliver are obvious. The third is travelling *empty to fetch*: iron flows one way, from
+the fifth of cities with a seam to the rest, so a wagon that has delivered stands in a
+city with nothing worth buying. Leaving it out measured out as 226 journeys in 2000
+steps with six wagons of thirty-six never moving, and a traded world indistinguishable
+from one with no traders. A deadhead is not a fourth decision — it is the same round trip
+valued from the other end. A fourth fallback lets an *empty* wagon with no positive
+option wander toward the best market it can see, because standing still earns nothing
+either; it is offered only to an empty wagon, since one with a load has already been
+asked whether carrying it anywhere pays.
+
+**A caravan may not buy back what it just sold.** Selling raises the stock and lowers the
+price, so without the rule a wagon could sell high, buy the same goods back cheap from
+the market it just moved, and repeat — a pump minting money out of the price curve. The
+slice would have made it a slow leak rather than an obvious bug.
+
+**Money is the one quantity that is not conserved.** A bargain moves it and creates none;
+cities mint `city_income_per_person` per head per step, standing for trade with a wider
+world that is not modelled. Without a source the cities' purse falls monotonically as
+traders take their margin until nobody can buy. The rejected alternative was a toll paid
+back to the arriving city — exactly conservative, and rejected because a broke city
+cannot buy, so collects no toll, so stays broke. Minting's failure is gentler and
+*measured*: the median treasury climbs, and the income is sized against the **net drain**
+(~2 a step) rather than the gross trade, which is a factor of a hundred. The first cut
+sized it against the import bill and the median treasury went 6.7k -> 6.0M in 2000 steps.
+
+**The logic is written against a `Stall`, not against the ECS** — what a caravan needs to
+know about a city, as numbers. `sell`, `choose` and `buy` are pure functions over it, the
+system reads a stall out of the components and writes the difference back, and the
+whole-world measurement runs the same three functions against a `Vec`. That is the seam
+that makes any of this testable, on the terms `step_city` takes the sky as an argument.
+
+**A caravan is a `Sprite` — the crate's first.** Its translation is a linear walk along
+the road's stored tile path, so it is on the road by construction rather than by a check.
+Two things fall out and neither is a defect: sprites land in the `ViewTarget` before the
+one post-process pass, so a wagon is lit by the same sun, shadowed by the same cloud and
+snowed on like the ground it stands on, for free; and the inspection overlay hides it,
+because the overlay replaces the world and a wagon is part of the world. The sprite has a
+floor in *screen* pixels, exactly as `city_panel.rs`'s pick target does.
+
+**Speed is tiles per real second and deliberately not on the growth clock.** gh-7 slowed
+the economy eightfold precisely so a journey would span many steps; slowing the journeys
+by the same factor would buy nothing, and it is one line away from being undone.
+
+`WorldSystems::Trade` is a set of its own after `Growth`, and the argument is determinism
+rather than staleness — the same one `city_panel.rs` makes. Both hold `&mut CityIndustry`,
+so the executor serializes them anyway; without the edge it may pick a different order
+each frame and a caravan would sometimes see the stocks before the step and sometimes
+after.
+
+Defaults carry their measurements from the `#[ignore]`d
+`the_default_config_moves_goods_between_cities`, which runs the world twice — **with the
+caravans and without** — because "how many cities are short of iron" is a fact about the
+terrain and asserting it against a constant would measure gh-24. At the shipped values,
+over 16000 steps: 16861 journeys by 80 wagons with none stranded, 1.04M units of food and
+27k of iron delivered, **84-100% of every scarce good landing in a city that can produce
+none of it**, and 26 of 92 cities taking delivery of something they cannot make.
+`scenarios/traders_move_goods.txt` is the other half, and its assertion is the one a
+capture cannot make: every travelling wagon reports `"on": "Road"` and every resting one
+`"on": "Town"`.
+
+**The ceiling is iron, not money or roads.** The world *produces* about 50 iron a step
+against ten thousand of demand, so no amount of trading can change how many cities are
+short — only where the iron sits. Making trade matter to *population* is a question about
+`deposit_cell_tiles`, not about this module.
+
 ### The world (`gameplay/world.rs`)
 
 A fixed 64×64 grid of chunks — 4096×4096 tiles — centred on the world origin, so it has a hard edge
@@ -563,7 +704,7 @@ main thread, capped at `MAX_BLOCKING_GENERATIONS_PER_FRAME`, and builds at most
 Anything over either budget appears a frame or two later. `OnEnter(Screen::Gameplay)` passes unlimited
 budgets so the first frame is complete.
 
-`WorldSystems` orders the frame `Streaming → Planning → Growth → Refresh`, which is what puts the plan's tile
+`WorldSystems` orders the frame `Streaming → Planning → Growth → Trade → Refresh`, which is what puts the plan's tile
 edits between the streamer that spawns chunk entities and `refresh_edited_chunks` that rebuilds the
 stale ones — so an edit is visible in the frame it lands. The river stage leans on that: it stamps
 `river_chunks_stamped_per_frame` chunks a frame (~44 frames for the default world) rather than
@@ -1160,6 +1301,17 @@ exists while every scenario still passes. Concretely —
 - **A view mode needs a verb, and one verb per thing the player can actually do.** `overlay <field>`
   is one digit key each, and there is deliberately no cycling form — the keyboard has none either, and
   a ctl verb with no key behind it is the drift this rule exists to prevent.
+- **A feature with no player input at all is still covered by the rule, through its
+  observations.** gh-7 adds no key and no click — the traders are a simulation — so its
+  whole ctl surface is `observe traders`, a `treasury` and a `prices` column on
+  `observe cities`, and `wait traders`. That wait is not a convenience: the wagons go out
+  on the first frame after the plan is done *and* the cities are seeded, so `wait plan` is
+  one frame short of them and a scenario reading `observe traders` there would get an
+  empty list and assert nothing.
+- **Report the thing the assertion is about, not the thing the assertion is derived
+  from.** `observe traders` gives each wagon its tile *and the kind of ground under it*,
+  because "is it on the road" is what gh-7 turns on and a scenario should not need a
+  second tool — nor a human squinting at a coloured dot in a PNG — to answer it.
 
 **Two traps in driving a world with clocks in it**, both found by getting them wrong:
 
