@@ -1182,6 +1182,7 @@ fn restore_kind(map: &WorldMap, sampler: &TerrainSampler, tile: IVec2) -> Terrai
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::gameplay::biome::Biome;
 
     /// Near the middle of the world, so a city's reach is never clipped by the edge.
@@ -1823,6 +1824,7 @@ mod tests {
 #[cfg(test)]
 mod measurements {
     use super::*;
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{
         biome::Biome,
         city::plan_cities,
@@ -1857,26 +1859,33 @@ mod measurements {
 
         let industry_config = IndustryConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain);
-        let river_edits: Vec<TileEdit> = plan_rivers(&terrain, &plan_config, &base)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
+        let river_edits: Vec<TileEdit> =
+            plan_rivers(shared_test_sampler(), &terrain, &plan_config, &base)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let watered = base.with_edits(&river_edits);
         // The drainage stage is not optional now that the industry reads the ground: a
         // wadi moves tiles across the habitable line and onto the salt recipe's list,
         // so a world without it is not the world the game plans against.
-        let drain_edits: Vec<TileEdit> = plan_drainage(&terrain, &plan_config, &watered)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let drain_edits: Vec<TileEdit> =
+            plan_drainage(shared_test_sampler(), &terrain, &plan_config, &watered)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let planned_world = watered.with_edits(&drain_edits);
-        let sites = plan_deposits(&terrain, &plan_config, &planned_world);
-        let planned = plan_cities(&terrain, &plan_config, &planned_world);
+        let sites = plan_deposits(shared_test_sampler(), &plan_config, &planned_world);
+        let planned = plan_cities(
+            shared_test_sampler(),
+            &terrain,
+            &plan_config,
+            &planned_world,
+        );
 
         let mut map = WorldMap::from_fn(|tile| planned_world.tile(tile).expect("inside the world"));
         let mut dirty = DirtyChunks::default();
@@ -2246,6 +2255,7 @@ mod measurements {
 #[cfg(test)]
 mod trade_measurements {
     use super::*;
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{
         city::plan_cities,
         deposit::{RESOURCE_COUNT, Resource, plan_deposits},
@@ -2326,23 +2336,30 @@ mod trade_measurements {
         let market_config = MarketConfig::default();
         let trade_config = TradeConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain);
-        let river_edits: Vec<TileEdit> = plan_rivers(&terrain, &plan_config, &base)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
+        let river_edits: Vec<TileEdit> =
+            plan_rivers(shared_test_sampler(), &terrain, &plan_config, &base)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let watered = base.with_edits(&river_edits);
-        let drain_edits: Vec<TileEdit> = plan_drainage(&terrain, &plan_config, &watered)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let drain_edits: Vec<TileEdit> =
+            plan_drainage(shared_test_sampler(), &terrain, &plan_config, &watered)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let planned_world = watered.with_edits(&drain_edits);
-        let sites = plan_deposits(&terrain, &plan_config, &planned_world);
-        let planned = plan_cities(&terrain, &plan_config, &planned_world);
+        let sites = plan_deposits(shared_test_sampler(), &plan_config, &planned_world);
+        let planned = plan_cities(
+            shared_test_sampler(),
+            &terrain,
+            &plan_config,
+            &planned_world,
+        );
 
         let mut road_world = planned_world.clone();
         for city in &planned {
@@ -2357,6 +2374,7 @@ mod trade_measurements {
         let mut links = Vec::new();
         for &(a, b) in pairs.iter().rev() {
             let Some(road) = route_road(
+                shared_test_sampler(),
                 &terrain,
                 &plan_config,
                 &road_world,

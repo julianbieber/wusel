@@ -89,11 +89,12 @@ pub fn dampened(kind: TerrainKind) -> TerrainKind {
 /// order and each is walked to its end before the next starts, so the same seed
 /// gives the same valleys on every run and every platform.
 pub fn plan_drainage(
+    sampler: &TerrainSampler,
     terrain: &TerrainConfig,
     config: &WorldPlanConfig,
     world: &WorldSnapshot,
 ) -> DrainagePlan {
-    let mut lattice = Lattice::new(terrain, config);
+    let mut lattice = Lattice::new(sampler, terrain, config);
 
     for head in valley_heads(config, world) {
         lattice.descend(head, config, world);
@@ -163,7 +164,7 @@ struct Lattice {
 }
 
 impl Lattice {
-    fn new(terrain: &TerrainConfig, config: &WorldPlanConfig) -> Self {
+    fn new(sampler: &TerrainSampler, _terrain: &TerrainConfig, config: &WorldPlanConfig) -> Self {
         // Its own stride, and a much coarser one than the river's — see
         // `drain_step_tiles`. Still anchored on the world origin, which is the part
         // that has to be shared: it is what makes two particles crossing the same
@@ -175,7 +176,7 @@ impl Lattice {
         Self {
             stride,
             size,
-            sampler: terrain.sampler(),
+            sampler: sampler.clone(),
             elevation: vec![f32::NAN; count],
             flow: vec![0; count],
             next: vec![NONE; count],
@@ -403,6 +404,8 @@ fn paint(tiles: &mut HashMap<IVec2, TerrainKind>, tile: IVec2, world: &WorldSnap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{terrain::TERRAIN_KIND_COUNT, world::WorldSnapshot};
 
     /// Every kind, so the ladder can be checked as a total function rather than on
@@ -429,8 +432,8 @@ mod tests {
     fn plan() -> (TerrainConfig, WorldPlanConfig, WorldSnapshot, DrainagePlan) {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let world = WorldSnapshot::generated(&terrain);
-        let plan = plan_drainage(&terrain, &config, &world);
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
+        let plan = plan_drainage(shared_test_sampler(), &terrain, &config, &world);
         (terrain, config, world, plan)
     }
 
@@ -571,10 +574,20 @@ mod tests {
     fn the_plan_is_the_same_on_every_run() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let world = WorldSnapshot::generated(&terrain);
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
 
-        let first = edits(&plan_drainage(&terrain, &config, &world));
-        let second = edits(&plan_drainage(&terrain, &config, &world));
+        let first = edits(&plan_drainage(
+            shared_test_sampler(),
+            &terrain,
+            &config,
+            &world,
+        ));
+        let second = edits(&plan_drainage(
+            shared_test_sampler(),
+            &terrain,
+            &config,
+            &world,
+        ));
         assert_eq!(first.len(), second.len());
         for (a, b) in first.iter().zip(second.iter()) {
             assert_eq!((a.tile, a.kind), (b.tile, b.kind));
@@ -611,7 +624,7 @@ mod tests {
     fn the_drainage_density_against_its_two_knobs() {
         let terrain = TerrainConfig::default();
         let base = WorldPlanConfig::default();
-        let world = WorldSnapshot::generated(&terrain);
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
         println!("\n  cell  step  minflow   tiles   % of world");
         for cell in [48u32, 32, 24, 16] {
             for step in [16u32, 24] {
@@ -622,7 +635,7 @@ mod tests {
                         drain_min_flow: min_flow,
                         ..base.clone()
                     };
-                    let plan = plan_drainage(&terrain, &config, &world);
+                    let plan = plan_drainage(shared_test_sampler(), &terrain, &config, &world);
                     let n: usize = plan.by_chunk.iter().map(|b| b.len()).sum();
                     println!(
                         "  {cell:>4}  {step:>4}  {min_flow:>7}  {n:>6}  {:>9.3}%",

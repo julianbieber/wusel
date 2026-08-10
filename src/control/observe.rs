@@ -27,7 +27,9 @@ use crate::{
         terrain::TerrainKind,
         trade::{Caravan, Errand, Trader},
         weather::SkySampler,
-        world::{BackgroundGeneration, ChunkCoord, WORLD_CHUNKS, WorldMap, tile_position_at},
+        world::{
+            BackgroundGeneration, ChunkCoord, TerrainBake, WORLD_CHUNKS, WorldMap, tile_position_at,
+        },
     },
     screens::Screen,
 };
@@ -219,11 +221,26 @@ fn terrain(world: &mut World) -> Value {
         .get_resource::<BackgroundGeneration>()
         .map(BackgroundGeneration::remaining);
 
+    // The bake reported beside the chunks rather than as a topic of its own, because a
+    // scenario asking "is there a world yet" is asking one question: the fields have to
+    // be baked *and* the chunks cut from them. Reporting only the chunks would say
+    // "0 generated, 4096 pending" throughout the bake and give no clue why.
+    let bake = world.get_resource::<TerrainBake>().map(|bake| {
+        let (done, total) = bake.progress();
+        json!({
+            "complete": bake.is_complete(),
+            "fields_baked": done,
+            "fields_total": total,
+            "last_field": bake.last_field(),
+        })
+    });
+
     json!({
         "loaded": true,
         "generated_chunks": generated,
         "total_chunks": (WORLD_CHUNKS.x * WORLD_CHUNKS.y) as usize,
         "pending_chunks": remaining,
+        "bake": bake,
         "tiles": tiles,
         "kinds": kinds,
     })

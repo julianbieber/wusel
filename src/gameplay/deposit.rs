@@ -30,7 +30,7 @@ use crate::gameplay::{
     biome::Biome,
     noise::hash2,
     plan::WorldPlanConfig,
-    terrain::{TerrainConfig, TerrainKind, TerrainSampler},
+    terrain::{TerrainKind, TerrainSampler},
     world::{WORLD_TILES, WorldSnapshot, chunk_index_of_tile},
 };
 
@@ -256,11 +256,10 @@ const DEPOSIT_SITE_SALT: i32 = 0x6b21_9d4fu32 as i32;
 /// different resources sitting near each other is a mining district rather than a
 /// defect.
 pub fn plan_deposits(
-    terrain: &TerrainConfig,
+    sampler: &TerrainSampler,
     config: &WorldPlanConfig,
     world: &WorldSnapshot,
 ) -> Vec<Deposit> {
-    let sampler = terrain.sampler();
     let cell = config.deposit_cell_tiles.max(1) as i32;
     let cells = IVec2::new(WORLD_TILES.x as i32 / cell, WORLD_TILES.y as i32 / cell);
 
@@ -271,7 +270,7 @@ pub fn plan_deposits(
     // assertion on an id, only on the tile it sits at.
     for cy in 0..cells.y {
         for cx in 0..cells.x {
-            if let Some(deposit) = candidate_for_cell(&sampler, world, config, cell, cx, cy) {
+            if let Some(deposit) = candidate_for_cell(sampler, world, config, cell, cx, cy) {
                 sites.push(deposit);
             }
         }
@@ -336,6 +335,9 @@ pub fn chunk_of_deposit(deposit: &Deposit) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gameplay::terrain::TerrainConfig;
+
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::world::WorldMap;
 
     fn config() -> WorldPlanConfig {
@@ -431,7 +433,7 @@ mod tests {
     /// two neighbouring seams apart without a spacing pass.
     #[test]
     fn at_most_one_seam_per_cell_and_never_two_on_one_tile() {
-        let terrain = TerrainConfig::default();
+        let _terrain = TerrainConfig::default();
         let config = config();
         // A patch of the world rather than the whole thing: `WorldMap::from_fn` is
         // cheap, and the layout only ever reads a tile it picked itself.
@@ -445,7 +447,7 @@ mod tests {
         .snapshot()
         .expect("from_fn fills every chunk");
 
-        let sites = plan_deposits(&terrain, &config, &world);
+        let sites = plan_deposits(shared_test_sampler(), &config, &world);
         assert!(
             !sites.is_empty(),
             "no seam anywhere in a world of bare rock"
@@ -467,7 +469,7 @@ mod tests {
     /// identical across runs and platforms.
     #[test]
     fn the_same_world_lays_out_the_same_seams() {
-        let terrain = TerrainConfig::default();
+        let _terrain = TerrainConfig::default();
         let config = config();
         let world = WorldMap::from_fn(|tile| {
             if tile.x % 11 < 4 {
@@ -479,8 +481,8 @@ mod tests {
         .snapshot()
         .expect("from_fn fills every chunk");
 
-        let first = plan_deposits(&terrain, &config, &world);
-        let second = plan_deposits(&terrain, &config, &world);
+        let first = plan_deposits(shared_test_sampler(), &config, &world);
+        let second = plan_deposits(shared_test_sampler(), &config, &world);
 
         assert_eq!(first.len(), second.len());
         for (a, b) in first.iter().zip(&second) {
@@ -504,6 +506,8 @@ mod tests {
 #[cfg(test)]
 mod measurements {
     use super::*;
+    use crate::gameplay::terrain::TerrainConfig;
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{
         city::plan_cities,
         drainage::plan_drainage,
@@ -528,26 +532,28 @@ mod measurements {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain);
-        let river_edits: Vec<TileEdit> = plan_rivers(&terrain, &config, &base)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
+        let river_edits: Vec<TileEdit> =
+            plan_rivers(shared_test_sampler(), &terrain, &config, &base)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let watered = base.with_edits(&river_edits);
-        let drain_edits: Vec<TileEdit> = plan_drainage(&terrain, &config, &watered)
-            .by_chunk
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let drain_edits: Vec<TileEdit> =
+            plan_drainage(shared_test_sampler(), &terrain, &config, &watered)
+                .by_chunk
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
         let world = watered.with_edits(&drain_edits);
 
         // The cities, so the sweep can report the figure the knob is actually chosen
         // against: a seam nobody can reach is one the simulation never sees, so what
         // matters is the share of *cities* that hold one, not the share of the map.
-        let cities = plan_cities(&terrain, &config, &world);
+        let cities = plan_cities(shared_test_sampler(), &terrain, &config, &world);
         let shipped_reach = IndustryConfig::default().estate_reach_tiles as i32;
 
         // The sweep the `deposit_cell_tiles` doc comment reports. One world, many
@@ -570,7 +576,7 @@ mod measurements {
             );
             for cell in [128u32, 64, 48, 32, 24] {
                 let sites = plan_deposits(
-                    &terrain,
+                    shared_test_sampler(),
                     &WorldPlanConfig {
                         deposit_cell_tiles: cell,
                         ..config.clone()
@@ -623,7 +629,7 @@ mod measurements {
             }
         }
 
-        let sites = plan_deposits(&terrain, &config, &world);
+        let sites = plan_deposits(shared_test_sampler(), &config, &world);
         assert!(!sites.is_empty(), "the world has no seams at all");
 
         // Every resource has to exist somewhere, or a recipe's band is set past what

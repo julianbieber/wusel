@@ -4,6 +4,7 @@ mod biome;
 pub(crate) mod city;
 mod city_panel;
 pub(crate) mod deposit;
+pub(crate) mod document;
 mod drainage;
 pub(crate) mod ground;
 pub(crate) mod growth;

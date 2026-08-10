@@ -14,6 +14,7 @@
 //! next one is planned, and each takes its snapshot afterwards, so a city sees
 //! the rivers it must not pave and a road sees both.
 
+use crate::gameplay::world::WorldSampler;
 use bevy::{
     prelude::*,
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
@@ -501,6 +502,7 @@ fn start_river_plan(
     map: Res<WorldMap>,
     generation: Res<BackgroundGeneration>,
     terrain: Res<TerrainConfig>,
+    sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
 ) {
     if !matches!(*plan, WorldPlan::WaitingForTerrain) || !generation.is_complete() {
@@ -513,10 +515,17 @@ fn start_river_plan(
         .snapshot()
         .expect("the background pass reported every chunk generated");
     let terrain = terrain.clone();
+    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
+    // and no chunk can generate before the bake has published the sampler. Every later
+    // stage is gated on the plan already being past that point.
+    let sampler = sampler
+        .expect("the plan only advances once the terrain is baked")
+        .0
+        .clone();
     let config = config.clone();
 
-    let task =
-        AsyncComputeTaskPool::get().spawn(async move { plan_rivers(&terrain, &config, &world) });
+    let task = AsyncComputeTaskPool::get()
+        .spawn(async move { plan_rivers(&sampler, &terrain, &config, &world) });
     *plan = WorldPlan::Rivers(RiverStamping {
         in_flight: Some(task),
         pending: Vec::new(),
@@ -534,6 +543,7 @@ fn apply_river_plan(
     mut map: ResMut<WorldMap>,
     mut dirty: ResMut<DirtyChunks>,
     terrain: Res<TerrainConfig>,
+    sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
 ) {
     let WorldPlan::Rivers(state) = &mut *plan else {
@@ -566,9 +576,16 @@ fn apply_river_plan(
         .snapshot()
         .expect("the world was complete when the plan started");
     let terrain = terrain.clone();
+    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
+    // and no chunk can generate before the bake has published the sampler. Every later
+    // stage is gated on the plan already being past that point.
+    let sampler = sampler
+        .expect("the plan only advances once the terrain is baked")
+        .0
+        .clone();
     let config = config.clone();
-    let task =
-        AsyncComputeTaskPool::get().spawn(async move { plan_drainage(&terrain, &config, &world) });
+    let task = AsyncComputeTaskPool::get()
+        .spawn(async move { plan_drainage(&sampler, &terrain, &config, &world) });
     *plan = WorldPlan::Drainage(DrainageStamping {
         in_flight: Some(task),
         pending: Vec::new(),
@@ -589,6 +606,7 @@ fn apply_drainage_plan(
     mut map: ResMut<WorldMap>,
     mut dirty: ResMut<DirtyChunks>,
     terrain: Res<TerrainConfig>,
+    sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
 ) {
     let WorldPlan::Drainage(state) = &mut *plan else {
@@ -618,10 +636,17 @@ fn apply_drainage_plan(
     let world = map
         .snapshot()
         .expect("the world was complete when the plan started");
-    let terrain = terrain.clone();
+    let _terrain = terrain.clone();
+    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
+    // and no chunk can generate before the bake has published the sampler. Every later
+    // stage is gated on the plan already being past that point.
+    let sampler = sampler
+        .expect("the plan only advances once the terrain is baked")
+        .0
+        .clone();
     let config = config.clone();
     let task =
-        AsyncComputeTaskPool::get().spawn(async move { plan_deposits(&terrain, &config, &world) });
+        AsyncComputeTaskPool::get().spawn(async move { plan_deposits(&sampler, &config, &world) });
     *plan = WorldPlan::Deposits(task);
 }
 
@@ -637,6 +662,7 @@ fn apply_deposit_plan(
     mut deposits: ResMut<DepositMap>,
     map: Res<WorldMap>,
     terrain: Res<TerrainConfig>,
+    sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
 ) {
     let WorldPlan::Deposits(task) = &mut *plan else {
@@ -656,6 +682,14 @@ fn apply_deposit_plan(
         deposits.insert(chunk_of_deposit(deposit), entity);
     }
 
+    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
+    // and no chunk can generate before the bake has published the sampler. Every later
+    // stage is gated on the plan already being past that point.
+    let sampler = sampler
+        .expect("the plan only advances once the terrain is baked")
+        .0
+        .clone();
+
     let world = map
         .snapshot()
         .expect("the world was complete when the plan started");
@@ -665,12 +699,12 @@ fn apply_deposit_plan(
     // own: the map and the seams on it can never disagree about the world they read.
     // It does not gate the plan — the city stage opens below whatever the bake is
     // doing.
-    start_prospect_bake(&mut commands, &terrain, world.clone(), planned);
+    start_prospect_bake(&mut commands, &sampler, world.clone(), planned);
 
     let terrain = terrain.clone();
     let config = config.clone();
-    let task =
-        AsyncComputeTaskPool::get().spawn(async move { plan_cities(&terrain, &config, &world) });
+    let task = AsyncComputeTaskPool::get()
+        .spawn(async move { plan_cities(&sampler, &terrain, &config, &world) });
     *plan = WorldPlan::Cities(task);
 }
 
@@ -724,6 +758,7 @@ fn drive_road_plan(
     mut dirty: ResMut<DirtyChunks>,
     mut network: ResMut<RoadNetwork>,
     terrain: Res<TerrainConfig>,
+    sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
     cities: Query<&City>,
 ) {
@@ -766,16 +801,25 @@ fn drive_road_plan(
     let (from, to) = (queue.cities[from], queue.cities[to]);
     let world = state.world.clone();
     let terrain = terrain.clone();
+    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
+    // and no chunk can generate before the bake has published the sampler. Every later
+    // stage is gated on the plan already being past that point.
+    let sampler = sampler
+        .expect("the plan only advances once the terrain is baked")
+        .0
+        .clone();
     let config = config.clone();
     state.in_flight = Some(
         AsyncComputeTaskPool::get()
-            .spawn(async move { route_road(&terrain, &config, &world, &from, &to) }),
+            .spawn(async move { route_road(&sampler, &terrain, &config, &world, &from, &to) }),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{city::CitySize, terrain::TerrainKind};
 
     /// The whole plan, against the world the game actually generates.
@@ -789,12 +833,12 @@ mod tests {
     fn the_default_config_lays_out_cities_of_every_size_and_roads_between_them() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let base = WorldSnapshot::generated(&terrain);
+        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
 
         // The stages in the order the plan runs them: the cities are laid out
         // over a world that already has its rivers, because that is the world
         // the game plans them against.
-        let rivers = plan_rivers(&terrain, &config, &base);
+        let rivers = plan_rivers(shared_test_sampler(), &terrain, &config, &base);
         let river_edits: Vec<TileEdit> = rivers.by_chunk.iter().flatten().copied().collect();
         report_rivers(&base, &rivers, &river_edits);
         let watered = base.with_edits(&river_edits);
@@ -803,7 +847,7 @@ mod tests {
         // be here rather than skipped: it moves tiles across the habitable line, so
         // a city plan taken against `watered` would be planning a different world
         // from the one the game shows.
-        let drainage = plan_drainage(&terrain, &config, &watered);
+        let drainage = plan_drainage(shared_test_sampler(), &terrain, &config, &watered);
         let drain_edits: Vec<TileEdit> = drainage.by_chunk.iter().flatten().copied().collect();
         println!(
             "{} tiles of dry valley across {} chunks",
@@ -824,7 +868,7 @@ mod tests {
         }
         let world = watered.with_edits(&drain_edits);
 
-        let planned = plan_cities(&terrain, &config, &world);
+        let planned = plan_cities(shared_test_sampler(), &terrain, &config, &world);
         let cities: Vec<City> = planned.iter().map(|p| p.city).collect();
         println!("{} cities", cities.len());
         assert!(!cities.is_empty(), "the world has no cities at all");
@@ -983,7 +1027,14 @@ mod tests {
         // From the back, which is the longest first — the same order the queue
         // is popped in, and the order that decides which roads become trunks.
         for &(a, b) in pairs.iter().rev() {
-            let Some(road) = route_road(terrain, config, &world, &cities[a], &cities[b]) else {
+            let Some(road) = route_road(
+                shared_test_sampler(),
+                terrain,
+                config,
+                &world,
+                &cities[a],
+                &cities[b],
+            ) else {
                 continue;
             };
             for edit in &road.edits {

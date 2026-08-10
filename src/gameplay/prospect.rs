@@ -29,6 +29,7 @@
 //! `Gravel` — you can already see them, and a false-colour map of "there is a wood
 //! here" over a drawn wood is a worse picture of the same fact.
 
+use crate::gameplay::terrain::TerrainSampler;
 use bevy::{
     asset::RenderAssetUsages,
     image::ImageFilterMode,
@@ -44,7 +45,6 @@ use crate::{
     gameplay::{
         deposit::{Deposit, RECIPES, Resource},
         ground::map_image,
-        terrain::TerrainConfig,
         world::{WORLD_TILES, WorldSnapshot},
     },
     screens::Screen,
@@ -165,14 +165,14 @@ impl Plugin for ProspectPlugin {
 /// and the map lands whenever it lands.
 pub fn start_prospect_bake(
     commands: &mut Commands,
-    terrain: &TerrainConfig,
+    sampler: &TerrainSampler,
     world: WorldSnapshot,
     sites: Vec<Deposit>,
 ) {
-    let terrain = terrain.clone();
+    let sampler = sampler.clone();
     commands
         .insert_resource(ProspectBake(AsyncComputeTaskPool::get().spawn(
-            async move { bake(&terrain, &world, &sites, PROSPECT_TEXELS_PER_SIDE) },
+            async move { bake(&sampler, &world, &sites, PROSPECT_TEXELS_PER_SIDE) },
         )));
 }
 
@@ -215,8 +215,7 @@ fn tear_down_prospect(mut commands: Commands) {
 }
 
 /// Scores the whole world against the three recipes, then stamps the seams on top.
-fn bake(terrain: &TerrainConfig, world: &WorldSnapshot, sites: &[Deposit], side: u32) -> Vec<u8> {
-    let sampler = terrain.sampler();
+fn bake(sampler: &TerrainSampler, world: &WorldSnapshot, sites: &[Deposit], side: u32) -> Vec<u8> {
     let mut texels = vec![0u8; (side as usize).pow(2) * 4];
 
     for ty in 0..side {
@@ -267,6 +266,9 @@ fn bake(terrain: &TerrainConfig, world: &WorldSnapshot, sites: &[Deposit], side:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gameplay::terrain::TerrainConfig;
+
+    use crate::gameplay::terrain::shared_test_sampler;
     use crate::gameplay::{
         deposit::plan_deposits, plan::WorldPlanConfig, terrain::TerrainKind, world::WorldMap,
     };
@@ -310,7 +312,7 @@ mod tests {
     /// other.
     #[test]
     fn a_high_score_is_not_a_seam_and_a_seam_is_not_a_score() {
-        let terrain = TerrainConfig::default();
+        let _terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = WorldMap::from_fn(|tile| {
             if tile.x % 3 == 0 {
@@ -322,9 +324,9 @@ mod tests {
         .snapshot()
         .expect("from_fn fills every chunk");
 
-        let sites = plan_deposits(&terrain, &config, &world);
+        let sites = plan_deposits(shared_test_sampler(), &config, &world);
         let side = 128u32;
-        let texels = bake(&terrain, &world, &sites, side);
+        let texels = bake(shared_test_sampler(), &world, &sites, side);
 
         // Counting is no good here — a seam's mark is a disc of texels, so how it
         // compares to the scored area is a fact about the resolution rather than about
@@ -370,7 +372,7 @@ mod tests {
     /// and the layout share one snapshot without either being re-derived.
     #[test]
     fn the_same_world_bakes_the_same_map() {
-        let terrain = TerrainConfig::default();
+        let _terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = WorldMap::from_fn(|tile| {
             if tile.y % 5 < 2 {
@@ -381,11 +383,11 @@ mod tests {
         })
         .snapshot()
         .expect("from_fn fills every chunk");
-        let sites = plan_deposits(&terrain, &config, &world);
+        let sites = plan_deposits(shared_test_sampler(), &config, &world);
 
         assert_eq!(
-            bake(&terrain, &world, &sites, 48),
-            bake(&terrain, &world, &sites, 48)
+            bake(shared_test_sampler(), &world, &sites, 48),
+            bake(shared_test_sampler(), &world, &sites, 48)
         );
     }
 

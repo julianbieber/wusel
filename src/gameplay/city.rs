@@ -6,6 +6,7 @@
 //! `(TerrainConfig, WorldPlanConfig, WorldSnapshot)`, so the same seed lays out
 //! the same cities on every run and every platform.
 
+use crate::gameplay::terrain::TerrainSampler;
 use bevy::{platform::collections::HashMap, prelude::*};
 
 use crate::gameplay::{
@@ -168,6 +169,7 @@ struct Candidate {
 /// which is what bounds the city count and spreads them out; the spacing pass
 /// then drops a site that would overlap a better one next door.
 pub fn plan_cities(
+    sampler: &TerrainSampler,
     terrain: &TerrainConfig,
     config: &WorldPlanConfig,
     world: &WorldSnapshot,
@@ -179,7 +181,9 @@ pub fn plan_cities(
         Vec::with_capacity((regions.x * regions.y) as usize);
     for ry in 0..regions.y {
         for rx in 0..regions.x {
-            candidates.push(candidate_for_region(terrain, world, region, rx, ry));
+            candidates.push(candidate_for_region(
+                sampler, terrain, world, region, rx, ry,
+            ));
         }
     }
 
@@ -208,6 +212,7 @@ pub fn plan_cities(
 /// building — its jittered centre is water or mountain, or the settlement score
 /// there is too low.
 fn candidate_for_region(
+    sampler: &TerrainSampler,
     terrain: &TerrainConfig,
     world: &WorldSnapshot,
     region: i32,
@@ -230,9 +235,10 @@ fn candidate_for_region(
         return None;
     }
 
-    let mut score = terrain
-        .settlement_field()
-        .sample(centre.x as f32, centre.y as f32);
+    // The document's own field rather than a second evaluation of the same noise: the
+    // one-answer rule the sampler exists for applies here too, and this was the last
+    // field in the crate still handed out raw.
+    let mut score = sampler.settlement(centre.x as f32, centre.y as f32);
     if is_coastal(world, centre, terrain.coast_radius as i32) {
         score += terrain.town_coast_bonus;
     }

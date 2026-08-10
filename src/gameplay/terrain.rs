@@ -31,10 +31,14 @@
 //! hills. It is also why the config hands out a sampler rather than a bare
 //! `NoiseField` as it used to.
 
-use bevy::prelude::*;
+use std::sync::Arc;
 
-use crate::gameplay::biome::{Biome, BiomeMap, HeightRecipe};
-use crate::gameplay::noise::{NoiseField, RidgedNoiseField};
+use bevy::prelude::*;
+use watershed::Terrain;
+
+use crate::gameplay::biome::{BIOME_TABLE, Biome, HeightRecipe};
+use crate::gameplay::document;
+use crate::gameplay::world::WORLD_TILES;
 
 /// The fifteen tiles of `assets/textures/terrain.png`, in atlas column order — the
 /// discriminant *is* the tileset index, so the two can never drift apart.
@@ -406,66 +410,76 @@ impl Default for TerrainConfig {
 }
 
 /// Salts that give each field its own patch of the noise lattice.
-const ELEVATION_SALT: u32 = 0x0000_0001;
-const VEGETATION_SALT: u32 = 0x9e37_79b9;
-const SETTLEMENT_SALT: u32 = 0x85eb_ca6b;
-const HUMIDITY_SALT: u32 = 0xc2b2_ae35;
-const CONTINENT_SALT: u32 = 0x27d4_eb2d;
-const RIDGE_SALT: u32 = 0x1656_67b1;
-const LITHOLOGY_SALT: u32 = 0x3b9a_ca07;
-const DUNE_SALT: u32 = 0x6f4e_2b13;
-const TEMPERATURE_SALT: u32 = 0x4d2b_7f11;
+pub const ELEVATION_SALT: u32 = 0x0000_0001;
+pub const VEGETATION_SALT: u32 = 0x9e37_79b9;
+pub const SETTLEMENT_SALT: u32 = 0x85eb_ca6b;
+pub const HUMIDITY_SALT: u32 = 0xc2b2_ae35;
+pub const CONTINENT_SALT: u32 = 0x27d4_eb2d;
+pub const RIDGE_SALT: u32 = 0x1656_67b1;
+pub const LITHOLOGY_SALT: u32 = 0x3b9a_ca07;
+pub const DUNE_SALT: u32 = 0x6f4e_2b13;
+pub const TEMPERATURE_SALT: u32 = 0x4d2b_7f11;
 
 /// The continent layer is there for its longest wavelength, so octaves finer than
 /// the relief layer already provides are paid for on every tile and then buried
 /// under it.
-const CONTINENT_OCTAVES: u32 = 3;
+pub const CONTINENT_OCTAVES: u32 = 3;
 
 /// Enough to shape a range without the crease pattern turning into noise.
-const RIDGE_OCTAVES: u32 = 4;
-
-/// Below this blended ridge weight the ridged layer is not sampled at all. It is
-/// the expensive layer and only one recipe draws on it, so most of the world skips
-/// it — that is what pays for the two layers this rework added.
-const RIDGE_EPSILON: f32 = 1e-3;
-
-/// The same skip for the dune layer, which only `Desert` weighs. Five biomes out
-/// of six never sample it, which is what keeps the aeolian pass nearly free.
-const DUNE_EPSILON: f32 = 1e-3;
+pub const RIDGE_OCTAVES: u32 = 4;
 
 /// Enough octaves for a fold belt to have detail without the bands dissolving.
 /// Three, matching the continent layer's reasoning: an octave finer than the
 /// feature the layer exists to make is paid for on every tile and then buried.
-const LITHOLOGY_OCTAVES: u32 = 3;
+pub const LITHOLOGY_OCTAVES: u32 = 3;
 
 /// A dune field wants long clean crests, so fewer octaves than a mountain range.
-const DUNE_OCTAVES: u32 = 3;
+pub const DUNE_OCTAVES: u32 = 3;
 
 /// How much loose material a dune crest piles up. A working dune *is* soil depth,
 /// so a crest climbs a rung of its biome's ladder — for a desert, off the hardpan
 /// and onto sand — while the deflated trough beside it stays on the bare rung.
-const DUNE_SOIL_GAIN: f32 = 0.55;
+pub const DUNE_SOIL_GAIN: f32 = 0.55;
 
 /// How much a dune crest suppresses vegetation. Small, and deliberately smaller
 /// than the soil gain above: it is only there to stop a live sand face reaching
 /// the ladder's *lush* rung, not to drive the crest down to bedrock. Together
 /// those two are the whole of how dunes reach the tileset — no rule anywhere
 /// names `Desert`.
-const DUNE_VEGETATION_BITE: f32 = 0.12;
+pub const DUNE_VEGETATION_BITE: f32 = 0.12;
 
 impl TerrainConfig {
-    /// What makes one habitable tile a likelier city site than another.
+    /// The document this config describes, unbaked.
     ///
-    /// The one field still handed out raw: [`crate::gameplay::city`] compares
-    /// settlement scores between candidate sites and nothing biome-dependent enters
-    /// into it.
-    pub fn settlement_field(&self) -> NoiseField {
-        NoiseField::new(self.seed, SETTLEMENT_SALT, self.settlement_scale)
+    /// The numbers only — a few dozen kilobytes of noise specs and a region table, which
+    /// is the whole of what a world is before anything evaluates it.
+    pub fn document(&self, size: UVec2) -> Terrain {
+        document::build(self, size)
     }
 
-    /// The sampler every reader of the landscape has to go through.
+    /// The sampler every reader of the landscape has to go through, over a world of
+    /// `size` tiles.
+    ///
+    /// **This bakes**, where the sampler it replaced only built noise fields. That is the
+    /// whole change in cost model: the old one answered any coordinate analytically and
+    /// so was free to construct and dear to ask, this one is dear to construct and nearly
+    /// free to ask. A caller that used to make one per loop must now be handed one.
+    pub fn sampler_over(&self, size: UVec2) -> TerrainSampler {
+        let mut terrain = self.document(size);
+        terrain
+            .bake()
+            .expect("a document this module builds has to bake");
+        TerrainSampler::new(Arc::new(terrain))
+    }
+
+    /// The sampler over the whole world.
+    ///
+    /// Costs a whole-world bake — seconds and hundreds of megabytes. At run time there is
+    /// exactly one and [`crate::gameplay::world`] owns it; anything else wanting one is a
+    /// test, and a test that does not need the whole world should say so with
+    /// [`Self::sampler_over`].
     pub fn sampler(&self) -> TerrainSampler {
-        TerrainSampler::new(self)
+        self.sampler_over(WORLD_TILES)
     }
 }
 
@@ -505,213 +519,83 @@ pub struct TileSample {
 
 /// The one answer to "how high, how green, how wet is it here".
 ///
-/// Built once and sampled many times: constructing it builds six noise fields and a
-/// biome map, which is why callers hoist it out of their loops.
+/// **A reader of a baked document, and nothing else.** Every number it hands back was
+/// evaluated by `watershed` out of the specs [`crate::gameplay::document`] wrote, so this
+/// module no longer knows how a landscape is made — only how to ask. What is left here is
+/// the part that is wusel's and cannot move to a library: [`classify`], which cuts a
+/// sample into a `TerrainKind`, and the [`Biome`] table those kinds hang off.
+///
+/// The field handles are resolved once, at construction. A document holds its fields in a
+/// `Vec` and finds one by string compare, which is nothing per bake and a great deal per
+/// tile — so the ids are looked up here and the hot path indexes.
+///
+/// **A tile is read at the centre of its cell.** A document cell stands for the tile it
+/// covers, and the bake evaluates it at `i + 0.5`; asking at the integer corner would
+/// land halfway between two texels and interpolate. That is the half-tile the whole
+/// translation turns on — see `the_document_lays_down_the_world_the_sampler_used_to`.
+#[derive(Clone)]
 pub struct TerrainSampler {
-    biomes: BiomeMap,
-    continent_field: NoiseField,
-    relief_field: NoiseField,
-    ridge_field: RidgedNoiseField,
-    lithology_field: NoiseField,
-    dune_field: RidgedNoiseField,
-    vegetation_field: NoiseField,
-    humidity_field: NoiseField,
-    temperature_field: NoiseField,
-    sea_level_celsius: f32,
-    lapse_celsius: f32,
-    temperature_noise_celsius: f32,
-    continent_relief: f32,
-    /// `(cos, sin)` of the lithology strike, taken once — the rotation is per tile
-    /// and a `to_radians().cos()` on every one of 16 M tiles is not free.
-    lithology_strike: Vec2,
-    lithology_aspect: f32,
-    lithology_relief: f32,
-    dune_wind: Vec2,
-    dune_aspect: f32,
-    dune_relief: f32,
-    soil_slope_tiles: f32,
-    soil_slope_falloff: f32,
-    lithology_soil_strip: f32,
+    terrain: Arc<Terrain>,
+    height: usize,
+    soil: usize,
+    vegetation: usize,
+    humidity: usize,
+    temperature: usize,
+    hardness: usize,
+    region_id: usize,
+    cover_class: usize,
+    settlement: usize,
+    /// The blended recipe columns, in [`document::COLUMNS`] order.
+    columns: [usize; document::COLUMN_COUNT],
 }
 
 impl TerrainSampler {
-    pub fn new(config: &TerrainConfig) -> Self {
-        let (strike_sin, strike_cos) = config.lithology_strike_degrees.to_radians().sin_cos();
-        let (wind_sin, wind_cos) = config.dune_wind_degrees.to_radians().sin_cos();
-
+    /// Resolve a baked document into the handles the hot path indexes by.
+    ///
+    /// Every id here is one [`crate::gameplay::document`] declares, so a missing one is
+    /// this crate disagreeing with itself rather than a document being wrong — hence the
+    /// panic rather than a `Result` no caller could act on.
+    pub fn new(terrain: Arc<Terrain>) -> Self {
+        let index = |id: &str| {
+            terrain
+                .fields
+                .iter()
+                .position(|field| field.id.as_str() == id)
+                .unwrap_or_else(|| panic!("the document is missing the `{id}` field"))
+        };
+        let mut columns = [0usize; document::COLUMN_COUNT];
+        for (slot, column) in document::COLUMNS.iter().enumerate() {
+            columns[slot] = index(&document::column_field(column));
+        }
         Self {
-            biomes: BiomeMap::new(
-                config.seed,
-                config.biome_cell_tiles,
-                config.biome_blend_tiles,
-                config.biome_warp_tiles,
-            ),
-            continent_field: NoiseField::with_octaves(
-                config.seed,
-                CONTINENT_SALT,
-                config.continent_scale,
-                CONTINENT_OCTAVES,
-            ),
-            relief_field: NoiseField::new(config.seed, ELEVATION_SALT, config.relief_scale),
-            ridge_field: RidgedNoiseField::new(
-                config.seed,
-                RIDGE_SALT,
-                config.ridge_scale,
-                RIDGE_OCTAVES,
-            ),
-            lithology_field: NoiseField::with_octaves(
-                config.seed,
-                LITHOLOGY_SALT,
-                config.lithology_scale,
-                LITHOLOGY_OCTAVES,
-            ),
-            dune_field: RidgedNoiseField::new(
-                config.seed,
-                DUNE_SALT,
-                config.dune_scale,
-                DUNE_OCTAVES,
-            ),
-            vegetation_field: NoiseField::new(
-                config.seed,
-                VEGETATION_SALT,
-                config.vegetation_scale,
-            ),
-            humidity_field: NoiseField::new(config.seed, HUMIDITY_SALT, config.humidity_scale),
-            temperature_field: NoiseField::new(
-                config.seed,
-                TEMPERATURE_SALT,
-                config.temperature_scale,
-            ),
-            sea_level_celsius: config.sea_level_celsius,
-            lapse_celsius: config.lapse_celsius,
-            temperature_noise_celsius: config.temperature_noise_celsius,
-            continent_relief: config.continent_relief,
-            lithology_strike: Vec2::new(strike_cos, strike_sin),
-            lithology_aspect: config.lithology_aspect.max(1.0),
-            lithology_relief: config.lithology_relief,
-            dune_wind: Vec2::new(wind_cos, wind_sin),
-            dune_aspect: config.dune_aspect.max(1.0),
-            dune_relief: config.dune_relief,
-            soil_slope_tiles: config.soil_slope_tiles.max(1.0),
-            soil_slope_falloff: config.soil_slope_falloff.max(1e-6),
-            lithology_soil_strip: config.lithology_soil_strip,
+            height: index(document::HEIGHT),
+            soil: index(document::SOIL),
+            vegetation: index(document::VEGETATION),
+            humidity: index(document::HUMIDITY),
+            temperature: index(document::TEMPERATURE),
+            hardness: index(document::HARDNESS),
+            region_id: index(document::REGION_ID),
+            cover_class: index(document::COVER_CLASS),
+            settlement: index(document::SETTLEMENT),
+            columns,
+            terrain,
         }
     }
 
-    /// Rotates a position onto an axis and squashes the along-axis component, so a
-    /// field sampled at the result varies quickly across the axis and slowly along
-    /// it — which is what turns blobs into bands.
+    /// One field at a global tile position, read at the centre of the tile's cell.
+    fn at(&self, field: usize, x: f32, y: f32) -> f32 {
+        self.terrain.fields[field].sample(x + 0.5, y + 0.5)
+    }
+
+    /// The biome a categorical field names at a tile.
     ///
-    /// The division is what does the work: the caller's field applies one scale to
-    /// both components, so pre-dividing the along-axis one by `aspect` means you
-    /// must travel `aspect` times as far along the structure to see it change.
-    fn stretch(position: Vec2, axis: Vec2, aspect: f32) -> Vec2 {
-        Vec2::new(
-            position.x * axis.x + position.y * axis.y,
-            (-position.x * axis.y + position.y * axis.x) / aspect,
-        )
-    }
-
-    /// How resistant the bedrock is here, in the unit range.
-    ///
-    /// Reads nothing from the biome map, and that is the property the whole layer
-    /// exists for — see `hardness_is_uncorrelated_with_the_biome_map`.
-    pub fn hardness(&self, x: f32, y: f32) -> f32 {
-        let p = Self::stretch(
-            Vec2::new(x, y),
-            self.lithology_strike,
-            self.lithology_aspect,
-        );
-        self.lithology_field.sample(p.x, p.y)
-    }
-
-    /// How high a dune crest stands here, in the unit range, or zero where no
-    /// recipe weighs the layer — five biomes out of six never pay for the sample.
-    fn dune(&self, recipe: &HeightRecipe, x: f32, y: f32) -> f32 {
-        if recipe.dune <= DUNE_EPSILON {
-            return 0.0;
-        }
-        let p = Self::stretch(Vec2::new(x, y), self.dune_wind, self.dune_aspect);
-        self.dune_field.sample(p.x, p.y) * recipe.dune
-    }
-
-    /// Just the layers that vary at the scale a slope is measured over.
-    ///
-    /// Split out of [`Self::height`] because the gradient needs it three times per
-    /// tile and the rest of the height does not vary meaningfully over four tiles:
-    /// the continent layer's ~670-tile wavelength and the lithology layer's
-    /// ~167-tile one contribute almost nothing to a 4-tile difference, and both
-    /// would be paid for twice more per tile to say so.
-    fn relief_height(&self, recipe: &HeightRecipe, x: f32, y: f32) -> f32 {
-        let mut height = (self.relief_field.sample(x, y) - 0.5) * recipe.relief;
-        if recipe.ridge > RIDGE_EPSILON {
-            height += self.ridge_field.sample(x, y) * recipe.ridge;
-        }
-        height
-    }
-
-    /// The full height, from a relief term the caller has already paid for.
-    ///
-    /// The continent and relief layers are displacements about zero, so they can
-    /// lower the ground as well as raise it; the ridged and dune layers are
-    /// one-sided, so they only ever build up out of the terrain they sit on.
-    fn assemble(
-        &self,
-        recipe: &HeightRecipe,
-        x: f32,
-        y: f32,
-        relief: f32,
-        hardness: f32,
-        dune: f32,
-    ) -> f32 {
-        let continent = self.continent_field.sample(x, y) - 0.5;
-
-        let height = recipe.base_height
-            + continent * self.continent_relief
-            + relief
-            // Resistant rock stands proud and soft rock weathers into a vale. This
-            // is the only reason the strata read as landform rather than as paint,
-            // and it is why the layer is in the height a river descends.
-            + (hardness - 0.5) * self.lithology_relief
-            + dune * self.dune_relief;
-
-        height.clamp(0.0, 1.0)
-    }
-
-    /// The layers, combined the way this tile's recipe says to.
-    fn height(&self, recipe: &HeightRecipe, x: f32, y: f32) -> f32 {
-        let relief = self.relief_height(recipe, x, y);
-        let hardness = self.hardness(x, y);
-        let dune = self.dune(recipe, x, y);
-        self.assemble(recipe, x, y, relief, hardness, dune)
-    }
-
-    /// How much loose material sits on the bedrock, in the unit range.
-    ///
-    /// Slope is taken from `relief` alone and from *this tile's own* recipe — the
-    /// blend is continuous and constant outside a 48-tile band, so it is fixed to
-    /// far better than four tiles' worth of precision, and re-blending here would
-    /// triple the cost of the whole unit rather than doubling it.
-    fn soil(
-        &self,
-        recipe: &HeightRecipe,
-        x: f32,
-        y: f32,
-        relief: f32,
-        hardness: f32,
-        dune: f32,
-    ) -> f32 {
-        let step = self.soil_slope_tiles;
-        let along_x = (self.relief_height(recipe, x + step, y) - relief).abs();
-        let along_y = (self.relief_height(recipe, x, y + step) - relief).abs();
-        let slope = along_x.max(along_y) / step;
-
-        let stripped = (slope / self.soil_slope_falloff).min(1.0);
-        let soil = (1.0 - stripped) - hardness * self.lithology_soil_strip
-            + recipe.soil_bias
-            + dune * DUNE_SOIL_GAIN;
-
-        soil.clamp(0.0, 1.0)
+    /// The field is categorical, so the library already read it at its nearest texel and
+    /// no rounding here can land between two regions.
+    fn biome(&self, field: usize, x: f32, y: f32) -> Biome {
+        let index = self.at(field, x, y).round().max(0.0) as usize;
+        BIOME_TABLE
+            .get(index)
+            .map_or(BIOME_TABLE[0].0, |(biome, _)| *biome)
     }
 
     /// How high the terrain is at a tile. Read by [`crate::gameplay::river`], whose
@@ -719,17 +603,16 @@ impl TerrainSampler {
     /// by how much it climbs — `WorldMap` records only which band a tile fell in,
     /// not how high it is.
     pub fn elevation(&self, x: f32, y: f32) -> f32 {
-        self.height(&self.biomes.blend(x, y).recipe, x, y)
+        self.at(self.height, x, y)
     }
 
-    /// How much rain falls at a tile, biased by the biome. Read by
+    /// How much rain falls at a tile, biased by the region. Read by
     /// [`crate::gameplay::river`], to decide which mountains are wet enough for a
     /// river to rise in them, and by [`crate::gameplay::weather`], which bakes it
     /// into the map that says where the clouds are — so it rains over the country
     /// the rivers rise in, and a desert gets neither.
     pub fn humidity(&self, x: f32, y: f32) -> f32 {
-        let bias = self.biomes.blend(x, y).recipe.humidity_bias;
-        (self.humidity_field.sample(x, y) + bias).clamp(0.0, 1.0)
+        self.at(self.humidity, x, y)
     }
 
     /// The **climate normal** at a tile, in degrees Celsius: how warm it is here on
@@ -740,53 +623,73 @@ impl TerrainSampler {
     /// the day's swing to it and decides whether what falls is rain or snow.
     ///
     /// **It is deliberately not part of [`TileSample`], and `classify` may never read
-    /// it.** Putting it there would cost an extra field evaluation on all 16.7 M
-    /// tiles for a value no band is allowed to consult — and it is not allowed to, on
-    /// exactly the terms `PlanetConfig::relief_tiles` may only be read by the
-    /// lighting: a tile's *kind* must not start depending on the weather. The alpine
-    /// `Snow` kind still means the height band it always did, with a transient snow
-    /// line moving around underneath it.
-    ///
-    /// One blend and one height, not two: calling [`Self::elevation`] here would
-    /// re-do the biome lookup, which is the expensive half.
+    /// it**, on exactly the terms `PlanetConfig::relief_tiles` may only be read by the
+    /// lighting: a tile's *kind* must not start depending on the weather. That it is now
+    /// a field of the document rather than a method here does not loosen the rule — the
+    /// document offers it and `classify` still may not ask.
     pub fn temperature(&self, x: f32, y: f32) -> f32 {
-        let recipe = self.biomes.blend(x, y).recipe;
-        self.sea_level_celsius - self.lapse_celsius * self.height(&recipe, x, y)
-            + recipe.temperature_bias
-            + self.temperature_noise_celsius * (self.temperature_field.sample(x, y) - 0.5)
+        self.at(self.temperature, x, y)
+    }
+
+    /// The blended recipe at a tile.
+    ///
+    /// Nine reads where the sampler this replaced did one Voronoi blend — cheaper, since
+    /// each is a raster lookup and the blend was the expensive half of a tile.
+    fn recipe(&self, x: f32, y: f32) -> HeightRecipe {
+        let column = |slot: usize| self.at(self.columns[slot], x, y);
+        HeightRecipe {
+            base_height: column(document::COL_BASE_HEIGHT_INDEX),
+            relief: column(document::COL_RELIEF_INDEX),
+            ridge: column(document::COL_RIDGE_INDEX),
+            dune: column(document::COL_DUNE_INDEX),
+            soil_bias: column(document::COL_SOIL_BIAS_INDEX),
+            vegetation_bias: column(document::COL_VEGETATION_BIAS_INDEX),
+            humidity_bias: column(document::COL_HUMIDITY_BIAS_INDEX),
+            temperature_bias: column(document::COL_TEMPERATURE_BIAS_INDEX),
+            beach_width: column(document::COL_BEACH_WIDTH_INDEX),
+        }
+    }
+
+    /// What makes one habitable tile a likelier city site than another.
+    ///
+    /// Nothing biome-dependent enters into it — [`crate::gameplay::city`] only compares
+    /// scores between candidate sites — which is why it was the last field in the crate
+    /// handed out as raw noise rather than through the sampler. Now that the document
+    /// carries it there is no reason for a second evaluation to exist.
+    pub fn settlement(&self, x: f32, y: f32) -> f32 {
+        self.at(self.settlement, x, y)
     }
 
     /// Everything about a tile, for the one caller that needs all of it.
-    ///
-    /// The shared terms are bound once and threaded through: the relief term feeds
-    /// both the height and the slope, and the dune term feeds the height, the soil
-    /// and the vegetation. Calling [`Self::height`] and then [`Self::soil`] would
-    /// sample relief, lithology and dune twice over for the same answer.
     pub fn sample(&self, x: f32, y: f32) -> TileSample {
-        let blended = self.biomes.blend(x, y);
-        let recipe = blended.recipe;
-
-        let relief = self.relief_height(&recipe, x, y);
-        let hardness = self.hardness(x, y);
-        let dune = self.dune(&recipe, x, y);
-
         TileSample {
-            elevation: self.assemble(&recipe, x, y, relief, hardness, dune),
-            // A live sand face carries nothing. With the soil gain above, this is
-            // the whole of how a dune reaches the tileset: a crest is deep loose
-            // material with no vegetation, which lands on the triple's `mid` (Sand
-            // for a desert), and the deflated trough beside it falls through to the
-            // bedrock branch and comes out Gravel. No rule names `Desert`.
-            vegetation: (self.vegetation_field.sample(x, y) + recipe.vegetation_bias
-                - dune * DUNE_VEGETATION_BITE)
-                .clamp(0.0, 1.0),
-            soil: self.soil(&recipe, x, y, relief, hardness, dune),
-            hardness,
-            dominant: blended.dominant,
-            cover: blended.cover,
-            recipe,
+            elevation: self.at(self.height, x, y),
+            vegetation: self.at(self.vegetation, x, y),
+            soil: self.at(self.soil, x, y),
+            hardness: self.at(self.hardness, x, y),
+            dominant: self.biome(self.region_id, x, y),
+            cover: self.biome(self.cover_class, x, y),
+            recipe: self.recipe(x, y),
         }
     }
+}
+
+/// The one baked world the tests share.
+///
+/// **A test cannot afford its own.** The sampler used to be analytic, so `config.sampler()`
+/// was free and every test made one; it now bakes, and a whole world is seconds and
+/// hundreds of megabytes. Baking one per test would be minutes and — since tests run in
+/// parallel in one process — many times the memory of the world it is checking.
+///
+/// So the default config gets exactly one, built on first use and shared. A test that
+/// changes the config cannot use it and must say what it needs with
+/// [`TerrainConfig::sampler_over`]: a window big enough for the coordinates it touches,
+/// which for most is a chunk or two.
+#[cfg(test)]
+pub(crate) fn shared_test_sampler() -> &'static TerrainSampler {
+    use std::sync::OnceLock;
+    static SHARED: OnceLock<TerrainSampler> = OnceLock::new();
+    SHARED.get_or_init(|| TerrainConfig::default().sampler())
 }
 
 /// Cuts a sampled tile into a kind.
@@ -886,11 +789,12 @@ pub fn height_byte(elevation: f32) -> u8 {
 /// to ~34 s. `the_default_config_produces_recognisably_different_regions` is how
 /// that is taken. It is why [`crate::gameplay::world`] keeps this off the main thread
 /// wherever it can, and why the blocking budget there had to come down.
-pub fn generate_chunk(config: &TerrainConfig, origin: IVec2, chunk_size: UVec2) -> ChunkTerrain {
-    // Hoisted: building one costs six noise fields and a biome map, and every tile
-    // in the chunk wants the same one.
-    let sampler = config.sampler();
-
+pub fn generate_chunk(
+    config: &TerrainConfig,
+    sampler: &TerrainSampler,
+    origin: IVec2,
+    chunk_size: UVec2,
+) -> ChunkTerrain {
     let (kinds, heights): (Vec<TerrainKind>, Vec<u8>) = (0..chunk_size.element_product())
         .map(|i| {
             let x = (origin.x + (i % chunk_size.x) as i32) as f32;
@@ -909,16 +813,28 @@ pub fn generate_chunk(config: &TerrainConfig, origin: IVec2, chunk_size: UVec2) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gameplay::terrain::shared_test_sampler;
 
     use crate::gameplay::world::WORLD_TILES;
 
     const CHUNK: UVec2 = UVec2::splat(64);
+    /// Big enough to hold `ORIGIN + CHUNK` and the slope reach beyond it, and no bigger.
+    /// A document is anchored on the world origin, so a window is always a corner of the
+    /// real world rather than a world of its own — the tiles it holds are the tiles the
+    /// game would generate there.
+    const WINDOW: UVec2 = UVec2::splat(2176);
     /// Somewhere in the middle of the world rather than at the origin, so the
     /// tests exercise the same coordinate magnitudes the game actually uses.
     const ORIGIN: IVec2 = IVec2::new(2048, 2048);
 
+    /// A chunk's kinds, baking a window around `ORIGIN` rather than the whole world.
+    ///
+    /// The window is what keeps this cheap: a document is anchored on the world origin,
+    /// so covering `ORIGIN + CHUNK` means baking out to there — but at a fraction of the
+    /// 4096 the game bakes, and these tests only ever read the one chunk.
     fn kinds(config: &TerrainConfig) -> Box<[TerrainKind]> {
-        generate_chunk(config, ORIGIN, CHUNK).kinds
+        let sampler = config.sampler_over(WINDOW);
+        generate_chunk(config, &sampler, ORIGIN, CHUNK).kinds
     }
 
     #[test]
@@ -959,8 +875,9 @@ mod tests {
         let config = TerrainConfig::default();
         let shift = IVec2::new(37, 11);
 
-        let base = generate_chunk(&config, ORIGIN, CHUNK);
-        let shifted = generate_chunk(&config, ORIGIN + shift, CHUNK);
+        let sampler = config.sampler_over(WINDOW);
+        let base = generate_chunk(&config, &sampler, ORIGIN, CHUNK);
+        let shifted = generate_chunk(&config, &sampler, ORIGIN + shift, CHUNK);
 
         for y in 0..CHUNK.y as i32 - shift.y {
             for x in 0..CHUNK.x as i32 - shift.x {
@@ -984,7 +901,7 @@ mod tests {
     fn every_tile_keeps_the_height_it_was_classified_from() {
         let config = TerrainConfig::default();
         let sampler = config.sampler();
-        let chunk = generate_chunk(&config, ORIGIN, CHUNK);
+        let chunk = generate_chunk(&config, &sampler, ORIGIN, CHUNK);
 
         for i in 0..chunk.kinds.len() {
             let x = (ORIGIN.x + (i as u32 % CHUNK.x) as i32) as f32;
@@ -1008,9 +925,10 @@ mod tests {
         let config = TerrainConfig::default();
         let line = height_byte(config.shallow_water_max);
 
+        let sampler = shared_test_sampler();
         for step in 0..16 {
             let origin = IVec2::new((step % 4) * 1024 + 128, (step / 4) * 1024 + 128);
-            let chunk = generate_chunk(&config, origin, CHUNK);
+            let chunk = generate_chunk(&config, sampler, origin, CHUNK);
 
             for (kind, &height) in chunk.kinds.iter().zip(chunk.heights.iter()) {
                 if height < line {
@@ -1037,13 +955,15 @@ mod tests {
     #[test]
     fn the_temperature_field_falls_with_height() {
         let config = TerrainConfig::default();
-        let sampler = config.sampler();
+        let sampler = shared_test_sampler();
 
         // The lapse rate acting alone, at one place: everything else about the tile
-        // is held fixed, so the drop is the height and only the height.
+        // is held fixed, so the drop is the height and only the height. The two
+        // constants come off the config rather than the sampler, which since the
+        // document carries fields rather than knobs is the only place they live.
         let recipe = Biome::Plains.recipe();
         let at = |height: f32| {
-            sampler.sea_level_celsius - sampler.lapse_celsius * height + recipe.temperature_bias
+            config.sea_level_celsius - config.lapse_celsius * height + recipe.temperature_bias
         };
         assert!(
             at(0.8) < at(0.5),
@@ -1088,20 +1008,22 @@ mod tests {
     #[test]
     fn temperature_is_independent_of_the_other_fields() {
         let config = TerrainConfig::default();
-        let sampler = config.sampler();
+        let sampler = shared_test_sampler();
 
         // The anomaly alone: the normal with the height and the biome taken out, so
-        // what is left is the field's own contribution.
+        // what is left is the field's own contribution. Both subtractions now come off
+        // the sampler's own published answers rather than out of its insides — the
+        // height is `elevation` and the bias is the sample's blended recipe.
         let mut anomaly = Vec::new();
         let mut humidity = Vec::new();
         for i in 0..8000u32 {
             let x = (i.wrapping_mul(2654435761) % 4000) as f32;
             let y = (i.wrapping_mul(40503) % 4000) as f32;
-            let blended = sampler.biomes.blend(x, y);
+            let sample = sampler.sample(x, y);
             anomaly.push(
-                sampler.temperature(x, y) - sampler.sea_level_celsius
-                    + sampler.lapse_celsius * sampler.height(&blended.recipe, x, y)
-                    - blended.recipe.temperature_bias,
+                sampler.temperature(x, y) - config.sea_level_celsius
+                    + config.lapse_celsius * sample.elevation
+                    - sample.recipe.temperature_bias,
             );
             humidity.push(sampler.humidity(x, y));
         }
@@ -1284,7 +1206,7 @@ mod tests {
             let centre = origin + IVec2::splat(32);
             let here = sampler.sample(centre.x as f32, centre.y as f32).dominant;
 
-            let tiles = generate_chunk(&config, origin, CHUNK).kinds;
+            let tiles = generate_chunk(&config, &sampler, origin, CHUNK).kinds;
             let mut agreeing = 0;
             for i in 0..tiles.len() {
                 let tile =
@@ -1913,7 +1835,7 @@ mod tests {
         let mut checksum = 0u64;
         for i in 0..chunks {
             let origin = IVec2::new((i % 8) * 512, (i / 8) * 512);
-            let chunk = generate_chunk(&config, origin, CHUNK);
+            let chunk = generate_chunk(&config, &sampler, origin, CHUNK);
             for (kind, height) in chunk.kinds.iter().zip(chunk.heights.iter()) {
                 checksum += kind.tileset_index() as u64 + *height as u64;
             }

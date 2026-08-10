@@ -104,13 +104,17 @@ pub struct RiverPlan {
 /// scan order and each is walked to its end before the next starts, so the same
 /// seed gives the same rivers on every run and every platform.
 pub fn plan_rivers(
+    sampler: &TerrainSampler,
     terrain: &TerrainConfig,
     config: &WorldPlanConfig,
     world: &WorldSnapshot,
 ) -> RiverPlan {
-    let mut lattice = Lattice::new(terrain, config);
+    let mut lattice = Lattice::new(sampler, terrain, config);
 
-    for (index, spring) in springs(terrain, config, world).into_iter().enumerate() {
+    for (index, spring) in springs(sampler, terrain, config, world)
+        .into_iter()
+        .enumerate()
+    {
         // Particle ids start at 1, so that 0 can mean "no particle has been
         // here" in the visited marks.
         lattice.descend(spring, index as u32 + 1, config, world);
@@ -124,10 +128,14 @@ pub fn plan_rivers(
 ///
 /// The cell is what bounds the count and spreads the springs out; humidity is
 /// what decides which mountains are the wet ones.
-fn springs(terrain: &TerrainConfig, config: &WorldPlanConfig, world: &WorldSnapshot) -> Vec<IVec2> {
+fn springs(
+    sampler: &TerrainSampler,
+    terrain: &TerrainConfig,
+    config: &WorldPlanConfig,
+    world: &WorldSnapshot,
+) -> Vec<IVec2> {
     let cell = config.river_source_cell_tiles.max(1) as i32;
     let cells = WORLD_TILES.as_ivec2() / cell;
-    let sampler = terrain.sampler();
 
     let mut springs = Vec::new();
     for cy in 0..cells.y {
@@ -208,7 +216,7 @@ struct Lattice {
 }
 
 impl Lattice {
-    fn new(terrain: &TerrainConfig, config: &WorldPlanConfig) -> Self {
+    fn new(sampler: &TerrainSampler, terrain: &TerrainConfig, config: &WorldPlanConfig) -> Self {
         let stride = config.river_step_tiles.max(1) as i32;
         let size = WORLD_TILES.x as i32 / stride;
         let count = (size * size) as usize;
@@ -216,7 +224,7 @@ impl Lattice {
         Self {
             stride,
             size,
-            sampler: terrain.sampler(),
+            sampler: sampler.clone(),
             meander: SignedNoiseField::new(
                 terrain.seed,
                 RIVER_MEANDER_SALT,
@@ -786,6 +794,8 @@ impl Eq for Rise {}
 mod tests {
     use super::*;
 
+    use crate::gameplay::terrain::shared_test_sampler;
+
     /// A world sloping steadily down to the west, with a band of sea at the far
     /// end and mountains in the east — so a particle started anywhere in the
     /// mountains has somewhere to go and something to reach.
@@ -811,8 +821,11 @@ mod tests {
         config: &WorldPlanConfig,
         world: &WorldSnapshot,
     ) -> Lattice {
-        let mut lattice = Lattice::new(terrain, config);
-        for (index, spring) in springs(terrain, config, world).into_iter().enumerate() {
+        let mut lattice = Lattice::new(shared_test_sampler(), terrain, config);
+        for (index, spring) in springs(shared_test_sampler(), terrain, config, world)
+            .into_iter()
+            .enumerate()
+        {
             lattice.descend(spring, index as u32 + 1, config, world);
         }
         lattice
@@ -887,8 +900,8 @@ mod tests {
         let config = WorldPlanConfig::default();
         let world = sloping_world();
 
-        let once = plan_rivers(&terrain, &config, &world);
-        let twice = plan_rivers(&terrain, &config, &world);
+        let once = plan_rivers(shared_test_sampler(), &terrain, &config, &world);
+        let twice = plan_rivers(shared_test_sampler(), &terrain, &config, &world);
 
         let (once, twice) = (edits(&once), edits(&twice));
         assert_eq!(once.len(), twice.len());
@@ -904,7 +917,7 @@ mod tests {
         let world = sloping_world();
         let sampler = terrain.sampler();
 
-        let springs = springs(&terrain, &config, &world);
+        let springs = springs(shared_test_sampler(), &terrain, &config, &world);
         assert!(!springs.is_empty(), "the world has no rivers at all");
         for spring in springs {
             assert_eq!(world.tile(spring), Some(TerrainKind::Mountain));
@@ -923,7 +936,12 @@ mod tests {
         let config = WorldPlanConfig::default();
         let world = sloping_world();
 
-        for edit in edits(&plan_rivers(&terrain, &config, &world)) {
+        for edit in edits(&plan_rivers(
+            shared_test_sampler(),
+            &terrain,
+            &config,
+            &world,
+        )) {
             assert!(
                 !world.tile(edit.tile).expect("inside the world").is_water(),
                 "{} was already water",
@@ -956,7 +974,7 @@ mod tests {
     fn a_segment_is_painted_exactly_as_wide_as_its_flow() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let lattice = Lattice::new(&terrain, &config);
+        let lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
         let world = WorldSnapshot::from_fn(|_| TerrainKind::Grass);
         let stride = config.river_step_tiles as i32;
         let origin = IVec2::splat(2048);
@@ -998,9 +1016,12 @@ mod tests {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = sloping_world();
-        let mut lattice = Lattice::new(&terrain, &config);
+        let mut lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
 
-        for (index, spring) in springs(&terrain, &config, &world).into_iter().enumerate() {
+        for (index, spring) in springs(shared_test_sampler(), &terrain, &config, &world)
+            .into_iter()
+            .enumerate()
+        {
             lattice.descend(spring, index as u32 + 1, &config, &world);
         }
 
@@ -1036,10 +1057,13 @@ mod tests {
     fn only_basins_holding_real_water_become_lakes() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let mut lattice = Lattice::new(&terrain, &config);
+        let mut lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
         let world = sloping_world();
 
-        for (index, spring) in springs(&terrain, &config, &world).into_iter().enumerate() {
+        for (index, spring) in springs(shared_test_sampler(), &terrain, &config, &world)
+            .into_iter()
+            .enumerate()
+        {
             lattice.descend(spring, index as u32 + 1, &config, &world);
         }
         assert!(!lattice.lakes.is_empty(), "no basin was ever filled");
@@ -1075,7 +1099,7 @@ mod tests {
     fn every_batch_belongs_to_exactly_one_chunk() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let plan = plan_rivers(&terrain, &config, &sloping_world());
+        let plan = plan_rivers(shared_test_sampler(), &terrain, &config, &sloping_world());
 
         assert!(!plan.by_chunk.is_empty(), "the plan is empty");
         let mut seen = Vec::new();
@@ -1101,7 +1125,7 @@ mod tests {
         of: fn(&[IVec2]) -> Option<f32>,
     ) -> f32 {
         let lattice = descended(terrain, config, world);
-        let measured: Vec<f32> = springs(terrain, config, world)
+        let measured: Vec<f32> = springs(shared_test_sampler(), terrain, config, world)
             .into_iter()
             .map(|spring| course(&lattice, spring))
             .filter(|path| path.len() >= 8)
@@ -1219,9 +1243,9 @@ mod tests {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = sloping_world();
-        let mut lattice = Lattice::new(&terrain, &config);
+        let mut lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
 
-        let springs = springs(&terrain, &config, &world);
+        let springs = springs(shared_test_sampler(), &terrain, &config, &world);
         let mut fixed: Vec<(u32, u32)> = Vec::new();
         let mut junctions = 0;
         for (index, spring) in springs.into_iter().enumerate() {
@@ -1257,7 +1281,7 @@ mod tests {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
         let world = WorldSnapshot::from_fn(|_| TerrainKind::Grass);
-        let mut lattice = Lattice::new(&terrain, &config);
+        let mut lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
         lattice.elevation.fill(0.5);
 
         lattice.descend(IVec2::splat(2048), 1, &config, &world);
@@ -1285,7 +1309,7 @@ mod tests {
     fn the_meander_field_is_uncorrelated_with_the_height_it_bends() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let lattice = Lattice::new(&terrain, &config);
+        let lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
         let sampler = terrain.sampler();
 
         let (mut lean, mut height) = (Vec::new(), Vec::new());
@@ -1324,7 +1348,7 @@ mod tests {
     #[ignore = "measurement, not a check"]
     fn the_shape_of_the_worlds_rivers() {
         let terrain = TerrainConfig::default();
-        let world = WorldSnapshot::generated(&terrain);
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
 
         // The two shape weights against the default, so what they buy can be read
         // off rather than argued about. At (0, 0) the scoring degenerates to
@@ -1345,7 +1369,7 @@ mod tests {
             };
             let lattice = descended(&terrain, &config, &world);
             let (mut bendy, mut wandered, mut lens) = (Vec::new(), Vec::new(), Vec::new());
-            for spring in springs(&terrain, &config, &world) {
+            for spring in springs(shared_test_sampler(), &terrain, &config, &world) {
                 let path = course(&lattice, spring);
                 lens.push(path.len());
                 if path.len() >= 8 {
@@ -1371,7 +1395,12 @@ mod tests {
         // how long a fragment gets to be before a lake ends it.
         let shape = |lattice: &Lattice, config: &WorldPlanConfig, world: &WorldSnapshot| {
             let (mut bendy, mut nodes, mut tiles) = (Vec::new(), Vec::new(), Vec::new());
-            for spring in springs(&TerrainConfig::default(), config, world) {
+            for spring in springs(
+                shared_test_sampler(),
+                &TerrainConfig::default(),
+                config,
+                world,
+            ) {
                 let path = course(lattice, spring);
                 nodes.push(path.len());
                 tiles.push(
@@ -1454,7 +1483,7 @@ mod tests {
             };
             let lattice = descended(&terrain, &config, &world);
             let (mut bendy, mut wandered, mut lens) = (Vec::new(), Vec::new(), Vec::new());
-            for spring in springs(&terrain, &config, &world) {
+            for spring in springs(shared_test_sampler(), &terrain, &config, &world) {
                 let path = course(&lattice, spring);
                 lens.push(path.len());
                 if path.len() >= 8 {
@@ -1480,7 +1509,7 @@ mod tests {
         let mut bendy: Vec<f32> = Vec::new();
         let mut wandered: Vec<f32> = Vec::new();
         let mut lengths: Vec<usize> = Vec::new();
-        for spring in springs(&terrain, &config, &world) {
+        for spring in springs(shared_test_sampler(), &terrain, &config, &world) {
             let path = course(&lattice, spring);
             lengths.push(path.len());
             if path.len() >= 8 {
@@ -1558,7 +1587,7 @@ mod tests {
         // A perfectly flat world is the worst case: nothing is ever downhill, so
         // the particle floods, spills, and must still run out of somewhere to go.
         let world = WorldSnapshot::from_fn(|_| TerrainKind::Mountain);
-        let mut lattice = Lattice::new(&terrain, &config);
+        let mut lattice = Lattice::new(shared_test_sampler(), &terrain, &config);
 
         lattice.descend(IVec2::splat(2048), 1, &config, &world);
 

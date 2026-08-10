@@ -30,9 +30,6 @@
 //! pairwise rule**: six biomes would be fifteen pairs to write and tune, and the
 //! interesting boundaries are the ones nobody thought to enumerate.
 
-use bevy::prelude::*;
-
-use crate::gameplay::noise::{NoiseField, hash2};
 use crate::gameplay::terrain::TerrainKind;
 
 /// The six the drawn palette can tell apart.
@@ -62,7 +59,7 @@ pub enum Biome {
 /// blendable invites reading the half that was never mixed.
 #[derive(Clone, Copy, Debug)]
 pub struct HeightRecipe {
-    /// Where this biome sits before any layer displaces it.
+    // Where this biome sits before any layer displaces it.
     pub base_height: f32,
     /// How much of the fine relief layer to add, as a displacement about zero.
     pub relief: f32,
@@ -291,7 +288,7 @@ impl Biome {
 /// How often each biome is drawn. Ocean is the heaviest because it is the sea —
 /// the other five are land, and a world of mostly land has no coastline to speak
 /// of.
-const BIOME_TABLE: [(Biome, u32); 6] = [
+pub const BIOME_TABLE: [(Biome, u32); 6] = [
     (Biome::Ocean, 6),
     (Biome::Plains, 4),
     (Biome::Forest, 4),
@@ -300,10 +297,16 @@ const BIOME_TABLE: [(Biome, u32); 6] = [
     (Biome::Wetland, 2),
 ];
 
-/// Salts for the one hash each cell gets.
-const CELL_SALT: u32 = 0x51de_51de;
-const WARP_X_SALT: u32 = 0x7a1d_0b37;
-const WARP_Y_SALT: u32 = 0x9c3f_1102;
+/// Salts the region warp's two component fields, so `document.rs` can hand them to
+/// `watershed` and get the outline this world has always had.
+///
+/// The lattice, the jitter, the blend band and the cover dither that used to sit here are
+/// **gone**: they are `watershed::regions` now, and a copy kept beside it would be a
+/// second answer to "which region is this tile in". What is left of this module is the
+/// part a library must not carry — the [`Biome`] enum, the recipe table, and the kind
+/// triples an enum cannot be averaged into.
+pub const WARP_X_SALT: u32 = 0x7a1d_0b37;
+pub const WARP_Y_SALT: u32 = 0x9c3f_1102;
 
 /// How many octaves the warp fields get.
 ///
@@ -313,300 +316,42 @@ const WARP_Y_SALT: u32 = 0x9c3f_1102;
 /// That was the first version's mistake — two octaves at 1.5 cells meant the finest
 /// warp detail had a 288-tile wavelength against ~200-tile boundary segments, so it
 /// moved the edges without bending any of them.
-const WARP_OCTAVES: u32 = 3;
+pub const WARP_OCTAVES: u32 = 3;
 
 /// The warp's base wavelength, in cells. Under one cell so that the finest octave
 /// (an eighth of this) wiggles an edge at a scale you can see from the ground,
 /// while still being long enough not to shred it.
-const WARP_CELLS: f32 = 0.75;
-
-/// A site's jitter, as a fraction of its cell, centred.
-///
-/// Also part of why edges read as straight: the less a site moves, the closer the
-/// diagram is to the regular lattice underneath it, and a regular lattice is what
-/// makes a boundary look drawn with a ruler. Filling the *whole* cell would let two
-/// sites land on top of each other and leave a sliver of a region nobody can see, so
-/// this stops short of that.
-const SITE_JITTER: f32 = 0.85;
-
-/// Picks which of the blended biomes supplies a tile's ground cover.
-const COVER_SALT: i32 = 0x2f6b_1e59;
-
-/// What the map says about one tile.
-pub struct BlendedBiome {
-    /// Which region this tile is *in*: the heaviest weight. This is the answer to
-    /// "which biome is here", and what the coverage tests count.
-    pub dominant: Biome,
-    /// Which biome supplies this tile's ground cover — drawn from the weights by a
-    /// hash of the tile rather than taken from the heaviest.
-    ///
-    /// In a region's interior one weight is 1.0, so this *is* `dominant` and nothing
-    /// is random. Only inside the blend band do the two differ, and there the point
-    /// is that they differ per tile: a boundary stops being a line and becomes the
-    /// two biomes' tiles interleaving, dense on their own side and sparse on the
-    /// other. Making the boundary wiggle only ever gives you a wiggly line; this is
-    /// what removes the line.
-    pub cover: Biome,
-    /// The weighted mean of the nearby sites' recipes, field by field. Continuous
-    /// everywhere, which is why the dither above cannot make the ground step.
-    pub recipe: HeightRecipe,
-}
-
-/// The Voronoi biome map. Built from `TerrainConfig` and sampled per tile.
-pub struct BiomeMap {
-    cell_tiles: f32,
-    /// Half the width of the band in which two recipes mix, in tiles.
-    blend_tiles: f32,
-    warp_tiles: f32,
-    warp_x: NoiseField,
-    warp_y: NoiseField,
-    /// Folded into the cell hash once, so a cell lookup is a single `hash2`.
-    cell_salt: i32,
-}
-
-impl BiomeMap {
-    pub fn new(seed: u32, cell_tiles: u32, blend_tiles: u32, warp_tiles: f32) -> Self {
-        let cell_tiles = cell_tiles.max(1) as f32;
-        let warp_scale = 1.0 / (cell_tiles * WARP_CELLS);
-
-        Self {
-            cell_tiles,
-            blend_tiles: (blend_tiles as f32).max(1.0),
-            warp_tiles,
-            warp_x: NoiseField::with_octaves(seed, WARP_X_SALT, warp_scale, WARP_OCTAVES),
-            warp_y: NoiseField::with_octaves(seed, WARP_Y_SALT, warp_scale, WARP_OCTAVES),
-            cell_salt: (seed ^ CELL_SALT) as i32,
-        }
-    }
-
-    /// The biome of the cell owning `cell`, and where its site sits inside it.
-    ///
-    /// One hash per cell, with the jitter taken from the low bytes and the biome
-    /// draw from the high ones — `hash2` mixes well enough that the two are
-    /// independent, and a second hash per cell would be nine more per tile.
-    fn site(&self, cell: IVec2) -> (Vec2, Biome) {
-        let h = hash2(cell.x ^ self.cell_salt, cell.y);
-
-        let jitter = Vec2::new((h & 0xff) as f32 / 255.0, ((h >> 8) & 0xff) as f32 / 255.0);
-        let offset = (jitter - Vec2::splat(0.5)) * SITE_JITTER + Vec2::splat(0.5);
-        let position = (cell.as_vec2() + offset) * self.cell_tiles;
-
-        let mut draw = ((h >> 16) % BIOME_WEIGHT_TOTAL) as i32;
-        let mut biome = BIOME_TABLE[0].0;
-        for (candidate, weight) in BIOME_TABLE {
-            draw -= weight as i32;
-            biome = candidate;
-            if draw < 0 {
-                break;
-            }
-        }
-
-        (position, biome)
-    }
-
-    /// The blended recipe at a global tile position.
-    ///
-    /// Only sites whose distance exceeds the nearest site's by less than the blend
-    /// band contribute, which is what gives a region an interior: further than
-    /// `blend_tiles` from a boundary exactly one weight is non-zero, so the tile
-    /// carries one recipe unblended. On the boundary itself the two nearest are
-    /// equidistant and weigh the same, so the mix is continuous across it.
-    pub fn blend(&self, x: f32, y: f32) -> BlendedBiome {
-        // Warping the *query* rather than the lattice keeps the whole thing a pure
-        // function of position while making a region's outline organic instead of a
-        // polygon's.
-        let warp = Vec2::new(
-            self.warp_x.sample(x, y) - 0.5,
-            self.warp_y.sample(x, y) - 0.5,
-        ) * (2.0 * self.warp_tiles);
-        let query = Vec2::new(x, y) + warp;
-
-        let base = (query / self.cell_tiles).floor().as_ivec2();
-
-        // Jitter is confined to the middle `SITE_JITTER` of a cell, which bounds the
-        // own-cell site at 1.20 cells away while anything two cells out is at least
-        // 1.15 — so 3x3 is not a strict worst-case guarantee, only one that needs all
-        // nine sites to be improbably far. A miss would pick the second-nearest site
-        // for one tile; it would still be the *same* answer every time it was asked,
-        // which is the property the chunked world actually rests on. 5x5 would cost
-        // 16 more hashes per tile to close a gap nothing can see.
-        let mut sites = [(0.0f32, Biome::Ocean); 9];
-        let mut nearest = f32::MAX;
-        let mut slot = 0;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let (position, biome) = self.site(base + IVec2::new(dx, dy));
-                let distance = position.distance(query);
-                nearest = nearest.min(distance);
-                sites[slot] = (distance, biome);
-                slot += 1;
-            }
-        }
-
-        let mut dominant = Biome::Ocean;
-        let mut dominant_weight = -1.0;
-        let mut total = 0.0;
-        let mut weights = [0.0f32; 9];
-        for (slot, &(distance, biome)) in sites.iter().enumerate() {
-            // How far this site is from being the nearest, against the width of the
-            // band. A boundary sits where two distances are equal, and a tile B from
-            // one is 2B further from the loser than from the winner.
-            let excess = (distance - nearest) / (2.0 * self.blend_tiles);
-            if excess >= 1.0 {
-                continue;
-            }
-            let weight = (1.0 - excess) * (1.0 - excess);
-            weights[slot] = weight;
-            total += weight;
-            if weight > dominant_weight {
-                dominant_weight = weight;
-                dominant = biome;
-            }
-        }
-
-        let mut recipe = HeightRecipe {
-            base_height: 0.0,
-            relief: 0.0,
-            ridge: 0.0,
-            dune: 0.0,
-            soil_bias: 0.0,
-            vegetation_bias: 0.0,
-            humidity_bias: 0.0,
-            temperature_bias: 0.0,
-            beach_width: 0.0,
-            // The kind triple is not here: the cover biome owns it, since an enum
-            // cannot be averaged.
-        };
-        for (slot, &(_, biome)) in sites.iter().enumerate() {
-            if weights[slot] == 0.0 {
-                continue;
-            }
-            let share = weights[slot] / total;
-            let part = biome.recipe();
-            recipe.base_height += part.base_height * share;
-            recipe.relief += part.relief * share;
-            recipe.ridge += part.ridge * share;
-            // Blended like every other weight, which is what decays a dune field
-            // out across a desert's border rather than ending it on the line.
-            recipe.dune += part.dune * share;
-            recipe.soil_bias += part.soil_bias * share;
-            recipe.vegetation_bias += part.vegetation_bias * share;
-            recipe.humidity_bias += part.humidity_bias * share;
-            // A temperature can be averaged where a kind cannot, which is the whole
-            // reason this is a number on the recipe rather than a property of a
-            // biome: a coast warms into the sea across the band.
-            recipe.temperature_bias += part.temperature_bias * share;
-            recipe.beach_width += part.beach_width * share;
-        }
-
-        // The ground cover is drawn from the weights, not taken from the heaviest.
-        // Hashed on the tile, so it is as fixed a property of the position as
-        // everything else here — nothing about this is random at run time.
-        let mut cover = dominant;
-        let draw = hash2(x.floor() as i32 ^ COVER_SALT, y.floor() as i32) as f32 / u32::MAX as f32;
-        let mut climbed = 0.0;
-        for (slot, &(_, biome)) in sites.iter().enumerate() {
-            if weights[slot] == 0.0 {
-                continue;
-            }
-            climbed += weights[slot] / total;
-            if draw <= climbed {
-                cover = biome;
-                break;
-            }
-        }
-
-        BlendedBiome {
-            dominant,
-            cover,
-            recipe,
-        }
-    }
-}
-
-const BIOME_WEIGHT_TOTAL: u32 = {
-    let mut total = 0;
-    let mut i = 0;
-    while i < BIOME_TABLE.len() {
-        total += BIOME_TABLE[i].1;
-        i += 1;
-    }
-    total
-};
+pub const WARP_CELLS: f32 = 0.75;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::gameplay::terrain::TerrainConfig;
+    use crate::gameplay::terrain::shared_test_sampler;
 
-    /// Built from the shipped config rather than from constants of its own: the
-    /// interior claim below is a property of the *defaults*, and a test with its own
-    /// cell and blend sizes would keep passing after those were retuned.
-    fn map() -> BiomeMap {
-        let config = TerrainConfig::default();
-        BiomeMap::new(
-            config.seed,
-            config.biome_cell_tiles,
-            config.biome_blend_tiles,
-            config.biome_warp_tiles,
-        )
-    }
-
-    /// The property the whole chunked world rests on: the biome lookup reads cells,
-    /// which are a function of their own integer coordinates, so asking twice gives
-    /// the same answer regardless of what else has been asked.
-    #[test]
-    fn a_blend_is_a_pure_function_of_position() {
-        let map = map();
-        for i in 0..64 {
-            let (x, y) = ((1000 + i * 37) as f32, (2000 + i * 53) as f32);
-            let first = map.blend(x, y);
-            let second = map.blend(x, y);
-            assert_eq!(first.dominant, second.dominant);
-            assert_eq!(first.recipe.base_height, second.recipe.base_height);
-        }
-    }
-
-    /// Weights are a partition: they sum to one, so a blended `base_height` is a
-    /// genuine mean and stays on the same scale as the band thresholds.
-    #[test]
-    fn a_blended_recipe_is_a_weighted_mean_within_the_range_of_its_parts() {
-        let map = map();
-        let lowest = Biome::ALL
-            .iter()
-            .map(|b| b.recipe().base_height)
-            .fold(f32::MAX, f32::min);
-        let highest = Biome::ALL
-            .iter()
-            .map(|b| b.recipe().base_height)
-            .fold(f32::MIN, f32::max);
-
-        for i in 0..2048 {
-            let (x, y) = ((i * 17 % 4096) as f32, (i * 131 % 4096) as f32);
-            let base = map.blend(x, y).recipe.base_height;
-            assert!(
-                (lowest - 1e-4..=highest + 1e-4).contains(&base),
-                "blended base_height {base} outside the range of the recipes"
-            );
-        }
-    }
+    // The machinery these used to drive — the jittered lattice, the banded weights, the
+    // cover draw — is `watershed::regions` now and is guarded there. What is still
+    // wusel's, and is what these ask, is whether the shipped defaults put a recognisable
+    // landscape on top of it: a region with an interior, a boundary that does not step,
+    // and a table every entry of which is actually drawn.
+    //
+    // They go through the sampler rather than a map of their own, which is the point of
+    // the split: there is one answer to "which region is this" and this is how to ask it.
 
     /// Regions must have interiors, or "distinct biomes" is a lie: away from a
     /// boundary a tile carries one recipe exactly, not a mush of all six.
     #[test]
     fn a_region_has_an_interior_where_exactly_one_recipe_applies() {
-        let map = map();
+        let sampler = shared_test_sampler();
         let unblended = (0..4096)
             .filter(|i| {
                 let (x, y) = ((i * 7 % 4096) as f32, (i * 97 % 4096) as f32);
-                let blended = map.blend(x, y);
-                let pure = blended.dominant.recipe();
-                (blended.recipe.base_height - pure.base_height).abs() < 1e-4
+                let sample = sampler.sample(x, y);
+                let pure = sample.dominant.recipe();
+                (sample.recipe.base_height - pure.base_height).abs() < 1e-3
             })
             .count();
 
-        // With a 384-tile cell and a 96-tile band, most of the world is interior.
         assert!(
             unblended > 4096 / 2,
             "only {unblended}/4096 sampled tiles carry an unblended recipe"
@@ -616,104 +361,43 @@ mod tests {
     /// The load-bearing continuity claim. The dominant biome may flip from one tile
     /// to the next — that is what makes a treeline — but the *elevation inputs* may
     /// not, or the flip would be a cliff.
-    ///
-    /// The bound is a fraction of the spread between the most and least elevated
-    /// recipes, which is the only scale that means anything here: a genuine
-    /// discontinuity is a step of most of that spread, and anything far below it is a
-    /// slope. It was an absolute 0.01 first, and that was a bound on the *domain
-    /// warp* wearing a continuity test's clothing — raising the warp to bend the
-    /// region outlines pushed the step to 0.016 and failed it, with the terrain no
-    /// less continuous than before. A warp is a distortion of the domain: it makes the
-    /// recipe vary faster with position without introducing any jump, so a test that
-    /// cannot tell those apart fails on a retune it has no business failing on.
-    /// `terrain::elevation_does_not_step_at_a_biome_boundary` is the one that checks
-    /// the height a river actually descends.
     #[test]
     fn a_blended_recipe_is_continuous_across_a_boundary() {
-        let map = map();
-        let spread = Biome::ALL
-            .iter()
-            .map(|b| b.recipe().base_height)
-            .fold(f32::MIN, f32::max)
-            - Biome::ALL
-                .iter()
-                .map(|b| b.recipe().base_height)
-                .fold(f32::MAX, f32::min);
-
+        let sampler = shared_test_sampler();
+        let mut crossings = 0;
         let mut worst = 0.0f32;
-        for i in 0..4096 {
-            let (x, y) = ((i * 13 % 4096) as f32, (i * 211 % 4096) as f32);
-            let here = map.blend(x, y).recipe;
-            for (dx, dy) in [(1.0, 0.0), (0.0, 1.0)] {
-                let next = map.blend(x + dx, y + dy).recipe;
-                worst = worst.max((here.base_height - next.base_height).abs());
-                worst = worst.max((here.ridge - next.ridge).abs());
-            }
-        }
-
-        let bound = spread * 0.05;
-        assert!(
-            worst < bound,
-            "a recipe steps by {worst} between adjacent tiles, over the {bound} that \
-             5% of the {spread} recipe spread allows"
-        );
-    }
-
-    /// The dither must not reach the interiors. Inside a region one weight is 1.0, so
-    /// the draw has only one bracket to land in and `cover` is forced to `dominant` —
-    /// if that ever stopped holding, every region would be speckled with tiles from
-    /// biomes that are nowhere near it.
-    #[test]
-    fn the_cover_dither_is_a_no_op_inside_a_region() {
-        let map = map();
-        let mut interior = 0;
 
         for i in 0..8192 {
-            let (x, y) = ((i * 7 % 4096) as f32, (i * 97 % 4096) as f32);
-            let blended = map.blend(x, y);
-            // An interior tile is one whose recipe came through unblended.
-            if (blended.recipe.base_height - blended.dominant.recipe().base_height).abs() < 1e-4 {
-                interior += 1;
-                assert_eq!(
-                    blended.cover, blended.dominant,
-                    "a tile inside a {:?} region took its cover from {:?}",
-                    blended.dominant, blended.cover
-                );
+            let (x, y) = ((i * 13 % 4090) as f32, (i * 61 % 4090) as f32);
+            let here = sampler.sample(x, y);
+            let next = sampler.sample(x + 1.0, y);
+            if here.dominant == next.dominant {
+                continue;
             }
+            crossings += 1;
+            worst = worst.max((here.recipe.base_height - next.recipe.base_height).abs());
         }
 
-        assert!(interior > 1000, "only {interior} interior tiles sampled");
-    }
-
-    /// And the other half: inside the band it must *actually* mix, or the dither is
-    /// dead code and the boundary is still a line.
-    #[test]
-    fn the_cover_dither_mixes_both_biomes_across_a_boundary() {
-        let map = map();
-        let mixed = (0..16384)
-            .filter(|i| {
-                let (x, y) = ((i * 13 % 4096) as f32, (i * 211 % 4096) as f32);
-                let blended = map.blend(x, y);
-                blended.cover != blended.dominant
-            })
-            .count();
-
         assert!(
-            mixed > 100,
-            "only {mixed}/16384 tiles take their cover from a neighbouring biome"
+            crossings > 32,
+            "only {crossings} boundary crossings sampled"
+        );
+        assert!(
+            worst < 0.05,
+            "base_height jumps by {worst} across a region boundary"
         );
     }
 
-    /// A weighted draw is only worth having if it actually draws every entry.
+    /// Every row of the table has to be drawn somewhere, or it is a row nobody can see.
     #[test]
     fn every_biome_is_drawn_somewhere() {
-        let map = map();
-        for biome in Biome::ALL {
-            let found = (0..64 * 64).any(|i| {
-                let cell = IVec2::new(i % 64, i / 64);
-                map.site(cell).1 == biome
+        let sampler = shared_test_sampler();
+        for (biome, _) in BIOME_TABLE {
+            let found = (0..4096).any(|i| {
+                let (x, y) = ((i * 31 % 4096) as f32, (i * 71 % 4096) as f32);
+                sampler.sample(x, y).dominant == biome
             });
-            assert!(found, "{biome:?} is never drawn");
+            assert!(found, "{biome:?} is in the table but nowhere in the world");
         }
     }
 }

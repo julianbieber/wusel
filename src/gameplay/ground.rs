@@ -37,6 +37,8 @@
 //! arithmetic — Rust and wgsl — and not three. That costs real time, and the doc
 //! comment on [`GroundConfig::cover_texels_per_side`] has the measurement.
 
+use crate::gameplay::terrain::TerrainSampler;
+use crate::gameplay::world::WorldSampler;
 use bevy::{
     asset::RenderAssetUsages,
     image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
@@ -418,6 +420,10 @@ impl Plugin for GroundPlugin {
             ExtractResourcePlugin::<ClimateTexture>::default(),
         ));
         app.add_systems(OnEnter(Screen::Gameplay), start_ground);
+        app.add_systems(
+            Update,
+            start_climate_bake.run_if(resource_added::<WorldSampler>),
+        );
         app.add_systems(OnExit(Screen::Gameplay), end_ground);
         // No `OnEnter` sync, unlike the tint's ramp: this one needs the `Sun` that
         // another plugin inserts in the same schedule, and there is no ordering
@@ -444,7 +450,7 @@ impl Plugin for GroundPlugin {
 fn start_ground(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    terrain: Res<TerrainConfig>,
+    _terrain: Res<TerrainConfig>,
     config: Res<GroundConfig>,
 ) {
     let side = config.cover_texels_per_side.max(1);
@@ -459,10 +465,22 @@ fn start_ground(
         carry_seconds: 0.0,
         step: None,
     });
+}
 
-    let terrain = terrain.clone();
+/// Starts the climate bake, the frame the terrain's own bake finishes.
+///
+/// The same wait `weather.rs` makes and for the same reason: a climate normal is the
+/// sampler's temperature over the whole world, and the sampler reads a baked document.
+/// Until it lands the cover map is the blank one `start_ground` already inserted, which
+/// is dry ground and no snow — the fallback this module documents.
+fn start_climate_bake(
+    mut commands: Commands,
+    sampler: Res<WorldSampler>,
+    config: Res<GroundConfig>,
+) {
+    let sampler = sampler.0.clone();
     let config = config.clone();
-    let task = AsyncComputeTaskPool::get().spawn(async move { bake_climate(&terrain, &config) });
+    let task = AsyncComputeTaskPool::get().spawn(async move { bake_climate(&sampler, &config) });
     commands.insert_resource(ClimateBake(task));
 }
 
@@ -624,12 +642,9 @@ fn sync_ground_overlay(
 /// On the compute pool because it is two `TerrainSampler` lookups per texel and a
 /// lookup is a biome blend — the expensive half of the terrain. It lands beside the
 /// weather's own bake, which is already doing the same thing for the same reason.
-fn bake_climate(terrain: &TerrainConfig, config: &GroundConfig) -> Vec<ClimateCell> {
+fn bake_climate(sampler: &TerrainSampler, config: &GroundConfig) -> Vec<ClimateCell> {
     let side = config.cover_texels_per_side.max(1);
     let tiles_per_texel = WORLD_TILES.x as f32 / side as f32;
-    // One sampler for the whole map: building it costs seven noise fields and a
-    // biome map.
-    let sampler = terrain.sampler();
 
     (0..(side * side) as usize)
         .map(|index| {
@@ -762,6 +777,8 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::gameplay::terrain::shared_test_sampler;
 
     use crate::gameplay::{terrain::height_byte, weather::WeatherConfig};
 
@@ -975,7 +992,7 @@ mod tests {
 
         let side = config.cover_texels_per_side;
         let tiles_per_texel = WORLD_TILES.x as f32 / side as f32;
-        let climate = bake_climate(&terrain, &config);
+        let climate = bake_climate(shared_test_sampler(), &config);
         let mut sky = SkySampler::new(&terrain, &weather);
         let mut cells = vec![GroundCell::default(); climate.len()];
 

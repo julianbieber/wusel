@@ -17,6 +17,7 @@
 //! resource from nothing and leaving it removes them, so a session can never
 //! inherit a half-generated map — or a task still in flight — from the last one.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bevy::{
@@ -27,13 +28,19 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
 
+use watershed::Terrain;
+
 use crate::{
     camera::{WorldCamera, visible_half_extent},
     gameplay::{
+        document,
         growth::CityGrowthPlugin,
         industry::IndustryPlugin,
         plan::WorldPlanPlugin,
-        terrain::{ChunkTerrain, TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, generate_chunk},
+        terrain::{
+            ChunkTerrain, TERRAIN_KIND_COUNT, TerrainConfig, TerrainKind, TerrainSampler,
+            generate_chunk,
+        },
     },
     screens::Screen,
 };
@@ -119,7 +126,14 @@ impl Plugin for WorldPlugin {
         );
         app.add_systems(
             Update,
-            (drive_background_generation, stream_chunks_around_camera)
+            (
+                // First in the spine, because nothing downstream has a world to read
+                // until it has finished: the bake is what turns a few kilobytes of specs
+                // into the fields every tile is cut from.
+                drive_terrain_bake,
+                drive_background_generation,
+                stream_chunks_around_camera,
+            )
                 .chain()
                 .in_set(WorldSystems::Streaming),
         );
@@ -161,11 +175,137 @@ pub enum WorldSystems {
 
 /// Builds every world resource from nothing. There is nothing to resume and
 /// nothing to reconcile: the previous session left none of it behind.
-fn start_world(mut commands: Commands) {
+fn start_world(mut commands: Commands, config: Res<TerrainConfig>) {
     commands.insert_resource(WorldMap::default());
     commands.insert_resource(BackgroundGeneration::default());
     commands.insert_resource(DirtyChunks::default());
     commands.insert_resource(HeightUploadQueue::default());
+    commands.insert_resource(TerrainBake::new(&config));
+}
+
+/// Baking the world's fields, one at a time, so the terrain exists before any tile does.
+///
+/// **This is the stage nothing above it can start without**, and it is the price of the
+/// document: `TerrainSampler` used to be analytic and free to build, so a chunk could be
+/// generated the moment a session began. A baked document has to be evaluated first, and
+/// at world size that is seconds — far too long for `OnEnter`, which is why this is a
+/// resource that advances rather than a call.
+///
+/// It advances **one field per frame**, which is what lets a caller watch a world being
+/// built out of its parts rather than waiting on a blank screen: after each stage the
+/// document holds one more finished field, and everything already baked is readable. The
+/// order comes from the document itself, so a field is never baked before what it reads.
+///
+/// The bake runs on [`AsyncComputeTaskPool`], for the reason every other expensive pass
+/// in the crate does: one field of a 4096-tile world is far more than a frame's work.
+#[derive(Resource)]
+pub struct TerrainBake {
+    /// The document being filled in. `None` only while a stage is in flight, which is
+    /// what lets the task own it without a lock.
+    terrain: Option<Terrain>,
+    /// What to bake and what to drop, in order. Consumed from the front.
+    remaining: VecDeque<document::Stage>,
+    /// How many stages the plan had, so progress can be reported against it.
+    total: usize,
+    in_flight: Option<Task<(Terrain, Result<(), watershed::BakeError>)>>,
+    /// The finished article. Its presence is the signal that the world can be generated,
+    /// and it is published as [`WorldSampler`] so a reader needs no knowledge of the bake.
+    sampler: Option<TerrainSampler>,
+    /// The last field to finish, for a progress report.
+    last: Option<String>,
+}
+
+impl TerrainBake {
+    fn new(config: &TerrainConfig) -> Self {
+        let terrain = config.document(WORLD_TILES);
+        // Everything `classify` reads has to survive the whole bake; the scaffolding in
+        // between is dropped as soon as the last field that reads it is done.
+        let stages = document::stages(&terrain, &document::GENERATION)
+            .expect("a document this crate builds has to plan");
+        Self {
+            total: stages.len(),
+            remaining: stages.into(),
+            terrain: Some(terrain),
+            in_flight: None,
+            sampler: None,
+            last: None,
+        }
+    }
+
+    /// The sampler, once every stage is done.
+    pub fn sampler(&self) -> Option<&TerrainSampler> {
+        self.sampler.as_ref()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.sampler.is_some()
+    }
+
+    /// Stages finished and stages planned, for a progress report.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn progress(&self) -> (usize, usize) {
+        (self.total - self.remaining.len(), self.total)
+    }
+
+    /// The field that finished most recently, for a progress report.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn last_field(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+}
+
+/// The one sampler every reader of the landscape shares.
+///
+/// A resource rather than something threaded down from [`TerrainBake`], because the
+/// readers are spread across the crate — the weather's bake, the ground's, the plan's
+/// stages, the growth loop — and none of them cares that a bake happened, only that there
+/// is a world to ask. It exists from the frame the last stage lands until the session
+/// ends, so `Option<Res<WorldSampler>>` is every reader's signature and absence means
+/// "not yet".
+#[derive(Resource)]
+pub struct WorldSampler(pub TerrainSampler);
+
+/// Advances the bake by one stage a frame, and builds the sampler when the last lands.
+fn drive_terrain_bake(mut commands: Commands, mut bake: ResMut<TerrainBake>) {
+    if bake.is_complete() {
+        return;
+    }
+
+    if let Some(task) = bake.in_flight.as_mut() {
+        let Some((terrain, result)) = block_on(poll_once(task)) else {
+            return;
+        };
+        bake.in_flight = None;
+        if let Err(error) = result {
+            // A document this crate wrote cannot fail to bake, so this is a bug rather
+            // than a condition — but taking the world down over it would leave no way to
+            // see which stage broke.
+            error!("the terrain bake failed: {error}");
+            bake.remaining.clear();
+        }
+        bake.terrain = Some(terrain);
+    }
+
+    let Some(mut terrain) = bake.terrain.take() else {
+        return;
+    };
+
+    let Some(stage) = bake.remaining.pop_front() else {
+        let sampler = TerrainSampler::new(Arc::new(terrain));
+        commands.insert_resource(WorldSampler(sampler.clone()));
+        bake.sampler = Some(sampler);
+        return;
+    };
+
+    bake.last = Some(stage.field.clone());
+    let pool = AsyncComputeTaskPool::get();
+    bake.in_flight = Some(pool.spawn(async move {
+        let result = terrain.bake_field(&stage.field);
+        for id in &stage.release {
+            terrain.release(id);
+        }
+        (terrain, result)
+    }));
 }
 
 /// Throws the world away. Removing the resources drops whatever tasks they were
@@ -176,6 +316,8 @@ fn tear_down_world(mut commands: Commands) {
     commands.remove_resource::<WorldMap>();
     commands.remove_resource::<BackgroundGeneration>();
     commands.remove_resource::<DirtyChunks>();
+    commands.remove_resource::<TerrainBake>();
+    commands.remove_resource::<WorldSampler>();
     // The queue's absence is also the signal that retires the render world's
     // heightmap, so a session can never be shown under the next one's terrain.
     commands.remove_resource::<HeightUploadQueue>();
@@ -372,10 +514,11 @@ impl WorldMap {
     fn generate_blocking(
         &mut self,
         config: &TerrainConfig,
+        sampler: &TerrainSampler,
         coord: UVec2,
         uploads: &mut HeightUploadQueue,
     ) {
-        let chunk = generate_chunk(config, chunk_origin_tiles(coord), CHUNK_SIZE);
+        let chunk = generate_chunk(config, sampler, chunk_origin_tiles(coord), CHUNK_SIZE);
         self.insert(coord, chunk, uploads);
     }
 
@@ -533,7 +676,7 @@ impl WorldSnapshot {
     /// — this is every chunk the game would ever generate, so it is split across
     /// threads to keep it to a few seconds rather than a minute.
     #[cfg(test)]
-    pub fn generated(config: &TerrainConfig) -> Self {
+    pub fn generated(config: &TerrainConfig, sampler: &TerrainSampler) -> Self {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let per_thread = chunk_count().div_ceil(threads);
 
@@ -547,6 +690,7 @@ impl WorldSnapshot {
                             .map(|index| {
                                 let chunk = generate_chunk(
                                     config,
+                                    sampler,
                                     chunk_origin_tiles(chunk_coord(index)),
                                     CHUNK_SIZE,
                                 );
@@ -713,6 +857,7 @@ fn drive_background_generation(
     mut map: ResMut<WorldMap>,
     mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
+    bake: Res<TerrainBake>,
 ) {
     generation
         .in_flight
@@ -723,6 +868,12 @@ fn drive_background_generation(
             }
             None => true,
         });
+
+    // No terrain, nothing to generate against. The bake is the stage every tile waits
+    // on, and until it lands the queue simply does not advance.
+    let Some(sampler) = bake.sampler() else {
+        return;
+    };
 
     let pool = AsyncComputeTaskPool::get();
     // One task per worker thread: the queue is thousands of chunks long, so
@@ -738,10 +889,13 @@ fn drive_background_generation(
             continue;
         }
         let config = config.clone();
+        // The sampler is a handle on the one baked document, so this is a refcount bump
+        // rather than a copy of the world.
+        let sampler = sampler.clone();
         let task = pool.spawn(async move {
             (
                 coord,
-                generate_chunk(&config, chunk_origin_tiles(coord), CHUNK_SIZE),
+                generate_chunk(&config, &sampler, chunk_origin_tiles(coord), CHUNK_SIZE),
             )
         });
         generation.in_flight.push(task);
@@ -774,6 +928,7 @@ fn spawn_initial_chunks(
     mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
     tileset: Res<TerrainTileset>,
+    bake: Res<TerrainBake>,
     resident: Query<(Entity, &ChunkCoord)>,
     camera: Single<(&Transform, &Camera, &Projection), With<WorldCamera>>,
 ) {
@@ -783,6 +938,7 @@ fn spawn_initial_chunks(
         &mut map,
         &mut uploads,
         &config,
+        bake.sampler(),
         &tileset,
         &resident,
         transform.translation.truncate(),
@@ -800,6 +956,7 @@ fn stream_chunks_around_camera(
     mut uploads: ResMut<HeightUploadQueue>,
     config: Res<TerrainConfig>,
     tileset: Res<TerrainTileset>,
+    bake: Res<TerrainBake>,
     resident: Query<(Entity, &ChunkCoord)>,
     camera: Single<(&Transform, &Camera, &Projection), With<WorldCamera>>,
 ) {
@@ -809,6 +966,7 @@ fn stream_chunks_around_camera(
         &mut map,
         &mut uploads,
         &config,
+        bake.sampler(),
         &tileset,
         &resident,
         transform.translation.truncate(),
@@ -830,6 +988,7 @@ fn refresh_resident_chunks(
     map: &mut WorldMap,
     uploads: &mut HeightUploadQueue,
     config: &TerrainConfig,
+    sampler: Option<&TerrainSampler>,
     tileset: &TerrainTileset,
     resident: &Query<(Entity, &ChunkCoord)>,
     camera: Vec2,
@@ -853,11 +1012,19 @@ fn refresh_resident_chunks(
             continue;
         }
         if map.get(coord).is_none() {
+            // Without a baked document there is nothing to generate from, so a chunk the
+            // camera has already reached simply stays empty until the bake lands. That is
+            // the one visible cost of the document: a session opens on a blank world for
+            // as long as the stages take, where an analytic sampler could fill the first
+            // screenful immediately.
+            let Some(sampler) = sampler else {
+                continue;
+            };
             if generation_budget == 0 {
                 continue;
             }
             generation_budget -= 1;
-            map.generate_blocking(config, coord, uploads);
+            map.generate_blocking(config, sampler, coord, uploads);
         }
         spawn_budget -= 1;
         let tiles = map.get(coord).expect("the chunk was just generated");
@@ -923,6 +1090,7 @@ fn tile_data(tiles: &[TerrainKind]) -> TilemapChunkTileData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gameplay::terrain::shared_test_sampler;
 
     /// The atlas is *divided* by `TERRAIN_KIND_COUNT`, so a constant that disagrees
     /// with the PNG does not fail to load — it slices the strip at the wrong offset
@@ -1096,7 +1264,7 @@ mod tests {
         let mut uploads = HeightUploadQueue::default();
         let coord = WORLD_CHUNKS / 2;
 
-        map.generate_blocking(&config, coord, &mut uploads);
+        map.generate_blocking(&config, shared_test_sampler(), coord, &mut uploads);
 
         let heights = map
             .heights(coord)
@@ -1123,7 +1291,7 @@ mod tests {
         let mut uploads = HeightUploadQueue::default();
         let coord = WORLD_CHUNKS / 2;
 
-        map.generate_blocking(&config, coord, &mut uploads);
+        map.generate_blocking(&config, shared_test_sampler(), coord, &mut uploads);
         uploads.take();
         let before = map.heights(coord).expect("generated").clone();
 

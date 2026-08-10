@@ -1,61 +1,24 @@
-//! Hand-rolled gradient noise. There is deliberately no noise crate here: the
-//! world is a pure function of tile position, and owning the hash means that
-//! stays true across platforms and dependency bumps.
+//! What is left of wusel's own noise, which is the tiling field and the lattice under
+//! it.
+//!
+//! **The terrain's noise is `watershed::noise` now.** The fbm, the ridged reading and
+//! the anisotropic stretch that used to be here are the library's, and are reached
+//! through the baked document rather than evaluated per tile. What could not go is the
+//! *tiling* field: it exists so the weather overlay can bake one period into a texture
+//! and scroll it forever, and a terrain library has no use for a world that repeats.
+//!
+//! The hash stays here because the tiling field needs it and because it is the same
+//! `hash2` the library uses — the two agree by construction, and
+//! `the_lattice_hands_back_the_numbers_it_always_has` guards the numbers on both sides.
 
 use bevy::prelude::*;
 
-const NOISE_OCTAVES: u32 = 5;
 const NOISE_PERSISTENCE: f32 = 0.5;
 const NOISE_LACUNARITY: f32 = 2.0;
 /// Normalized fbm only spans about [0.35, 0.65] in practice — the octaves rarely
 /// align and gradient noise peaks well below 1. Stretching it around the midpoint
 /// makes the terrain thresholds mean what they say on a [0, 1] scale.
 const NOISE_GAIN: f32 = 2.6;
-
-/// Spreads `|gradient_noise_2d|` over most of [0, 1] before it is inverted. Without
-/// it the creases in a ridged field are shallow, because 2D gradient noise rarely
-/// gets near its nominal range.
-const RIDGE_GAIN: f32 = 2.0;
-
-/// One fbm field with its own domain offset, so two fields sampled at the same
-/// position are independent rather than two views of the same landscape.
-pub struct NoiseField {
-    offset: Vec2,
-    scale: f32,
-    octaves: u32,
-}
-
-impl NoiseField {
-    pub fn new(seed: u32, salt: u32, scale: f32) -> Self {
-        Self::with_octaves(seed, salt, scale, NOISE_OCTAVES)
-    }
-
-    /// A field with a chosen octave count. The low-frequency layers of the terrain
-    /// want fewer: an octave finer than the feature the layer is there to make is
-    /// paid for on every tile and then buried under the layer above it.
-    pub fn with_octaves(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
-        let h = hash2(seed as i32, salt as i32);
-        // Kept well under f32's precision cliff: fbm scales the domain up by the
-        // lacunarity of the last octave, so a huge offset would quantize it.
-        Self {
-            offset: Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0),
-            scale,
-            octaves,
-        }
-    }
-
-    /// Sample the field at a global tile position, remapped to [0, 1].
-    pub fn sample(&self, x: f32, y: f32) -> f32 {
-        let n = fbm(
-            x * self.scale + self.offset.x,
-            y * self.scale + self.offset.y,
-            self.octaves,
-            NOISE_PERSISTENCE,
-            NOISE_LACUNARITY,
-        );
-        (0.5 + n * NOISE_GAIN * 0.5).clamp(0.0, 1.0)
-    }
-}
 
 /// The same fbm read as a **signed** displacement rather than as a height.
 ///
@@ -99,43 +62,6 @@ impl SignedNoiseField {
             NOISE_LACUNARITY,
         );
         (n * NOISE_GAIN).clamp(-1.0, 1.0)
-    }
-}
-
-/// The same lattice read for its creases instead of its peaks: a ridged field is
-/// large where the underlying noise crosses zero, so its maxima form connected
-/// *lines* rather than isolated blobs.
-///
-/// That is the whole reason it exists. A mountain range is a ridge line with
-/// spurs; plain fbm over the same domain gives a field of separate lumps, and no
-/// amount of thresholding turns one into the other.
-///
-/// Already in [0, 1] and one-sided — the value is a height to add, not a
-/// displacement around a midpoint, so it never lowers the terrain it is added to.
-pub struct RidgedNoiseField {
-    offset: Vec2,
-    scale: f32,
-    octaves: u32,
-}
-
-impl RidgedNoiseField {
-    pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
-        let h = hash2(seed as i32, salt as i32);
-        Self {
-            offset: Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0),
-            scale,
-            octaves,
-        }
-    }
-
-    pub fn sample(&self, x: f32, y: f32) -> f32 {
-        ridged_fbm(
-            x * self.scale + self.offset.x,
-            y * self.scale + self.offset.y,
-            self.octaves,
-            NOISE_PERSISTENCE,
-            NOISE_LACUNARITY,
-        )
     }
 }
 
@@ -282,30 +208,6 @@ pub fn fbm(
     }
 
     // Normalize so output stays roughly in [-1, 1] regardless of octave count.
-    total / max_amplitude
-}
-
-/// [`fbm`] read for its creases: each octave contributes `(1 - |n|)^2` instead of
-/// `n`, so the zero crossings of the lattice — which are curves, not points — come
-/// out as the high ground. Squaring sharpens the crest; without it a ridge is a
-/// broad welt.
-///
-/// Output is in [0, 1] with no midpoint, unlike [`fbm`].
-pub fn ridged_fbm(x: f32, y: f32, octaves: u32, persistence: f32, lacunarity: f32) -> f32 {
-    let mut total = 0.0;
-    let mut amplitude = 1.0;
-    let mut frequency = 1.0;
-    let mut max_amplitude = 0.0;
-
-    for _ in 0..octaves {
-        let crease =
-            (1.0 - (gradient_noise_2d(x * frequency, y * frequency) * RIDGE_GAIN).abs()).max(0.0);
-        total += crease * crease * amplitude;
-        max_amplitude += amplitude;
-        amplitude *= persistence;
-        frequency *= lacunarity;
-    }
-
     total / max_amplitude
 }
 

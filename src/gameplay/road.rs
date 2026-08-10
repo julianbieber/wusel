@@ -6,6 +6,7 @@
 //! are still checked one by one for water, though — checking only the nodes
 //! would let a road hop a river.
 
+use crate::gameplay::terrain::TerrainSampler;
 use std::{cmp::Ordering, collections::BinaryHeap};
 
 use bevy::prelude::*;
@@ -195,14 +196,15 @@ fn inside_circle_on(a: IVec2, b: IVec2, point: IVec2) -> bool {
 /// `route_padding_tiles`: it keeps the work per road bounded, and it stops a
 /// route from wandering halfway across the map to avoid a hill.
 pub fn route_road(
-    terrain: &TerrainConfig,
+    sampler: &TerrainSampler,
+    _terrain: &TerrainConfig,
     config: &WorldPlanConfig,
     world: &WorldSnapshot,
     from: &City,
     to: &City,
 ) -> Option<RoutedRoad> {
     let lattice = Lattice::new(config, from.centre, to.centre);
-    let elevation = lattice.sample_elevation(terrain);
+    let elevation = lattice.sample_elevation(sampler);
 
     // Both ends are off-lattice — a city centre is wherever the planner put it —
     // so each needs a walkable hop onto the grid. The nearest node is not always
@@ -346,8 +348,7 @@ impl Lattice {
     /// Elevation at every node, up front. `WorldMap` records only which band a
     /// tile fell in, so the height a road is trying to avoid climbing has to
     /// come back from the noise field.
-    fn sample_elevation(&self, terrain: &TerrainConfig) -> Vec<f32> {
-        let sampler = terrain.sampler();
+    fn sample_elevation(&self, sampler: &TerrainSampler) -> Vec<f32> {
         (0..self.node_count())
             .map(|index| {
                 let tile = self.position(self.node_at(index));
@@ -539,6 +540,7 @@ impl Eq for Step {}
 mod tests {
     use super::*;
     use crate::gameplay::city::CitySize;
+    use crate::gameplay::terrain::shared_test_sampler;
 
     fn city(id: u32, x: i32, y: i32) -> City {
         City {
@@ -623,6 +625,7 @@ mod tests {
 
     fn route_across(world: &WorldSnapshot) -> Option<RoutedRoad> {
         route_road(
+            shared_test_sampler(),
             &TerrainConfig::default(),
             &WorldPlanConfig::default(),
             world,
