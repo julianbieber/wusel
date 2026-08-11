@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use bevy::prelude::*;
 use watershed::Terrain;
+use watershed::water::quantize_accumulation;
 
 use crate::gameplay::biome::{BIOME_TABLE, Biome, HeightRecipe};
 use crate::gameplay::document;
@@ -341,11 +342,30 @@ pub struct TerrainConfig {
     pub town_threshold: f32,
     pub town_coast_bonus: f32,
     pub coast_radius: u32,
-    /// How wet a mountain must be for a river to rise there. Together with
-    /// `WorldPlanConfig::river_source_cell_tiles` this is the lever on how many
-    /// rivers the world has: at the default spacing 0.6 gives 3236 springs, 0.55
-    /// gives 4466 and 0.5 gives 5826.
-    pub river_source_threshold: f32,
+    /// TODO(jb-doc): the unit this is in; why it replaces `river_source_threshold`
+    /// rather than renaming it; the measured sweep of drawn-`River` share against it,
+    /// and why a sweep must count what is drawn rather than what clears the cut.
+    pub channel_threshold: f32,
+    /// TODO(jb-doc): why a D8 solve yields no width of its own, and what this ratio
+    /// buys between one reach and the next.
+    pub channel_flow_per_width: f32,
+    /// TODO(jb-doc): what this bounds, and that it is also the per-tile cost of the
+    /// whole width mechanism.
+    pub channel_max_half_width: u32,
+    /// TODO(jb-doc): that this is the whole of the dry valley network and is cut from
+    /// the same field as the channels; the measured sweep; and why the sweep has to be
+    /// read as tiles the cover ladder *moves* rather than tiles it is applied to.
+    pub damp_threshold: f32,
+    /// TODO(jb-doc): what a basin under this does instead of being drawn, and why it
+    /// needs no special handling to be crossed the way the old lattice did.
+    pub lake_min_tiles: u32,
+    /// How deep the standing water has to be before a filled basin is drawn as one,
+    /// on the height field's own 0..1 scale.
+    ///
+    /// TODO(jb-doc): why area cannot separate a lake from the hollow a noise field
+    /// leaves everywhere and depth can; that area alone put 16.4% of the world under
+    /// lake; the measured sweep; and that the curve is steep enough to want small steps.
+    pub lake_min_depth: f32,
 }
 
 impl Default for TerrainConfig {
@@ -404,7 +424,12 @@ impl Default for TerrainConfig {
             town_threshold: 0.62,
             town_coast_bonus: 0.06,
             coast_radius: 2,
-            river_source_threshold: 0.55,
+            channel_threshold: 8000.0,
+            channel_flow_per_width: 8.0,
+            channel_max_half_width: 2,
+            damp_threshold: 2000.0,
+            lake_min_tiles: 256,
+            lake_min_depth: 0.07,
         }
     }
 }
@@ -464,12 +489,17 @@ impl TerrainConfig {
     /// whole change in cost model: the old one answered any coordinate analytically and
     /// so was free to construct and dear to ask, this one is dear to construct and nearly
     /// free to ask. A caller that used to make one per loop must now be handed one.
+    /// TODO(jb-doc): why the water is solved here rather than left to the caller, and
+    /// what a sampler with an unsolved document would quietly produce.
     pub fn sampler_over(&self, size: UVec2) -> TerrainSampler {
         let mut terrain = self.document(size);
         terrain
             .bake()
             .expect("a document this module builds has to bake");
-        TerrainSampler::new(Arc::new(terrain))
+        terrain
+            .solve_water(&document::water_spec(self))
+            .expect("a baked document this module builds has to solve");
+        TerrainSampler::new(Arc::new(terrain), self)
     }
 
     /// The sampler over the whole world.
@@ -483,6 +513,33 @@ impl TerrainConfig {
     }
 }
 
+/// TODO(jb-doc): which raster and which threshold each state comes off, and that the
+/// order is a precedence — what a tile that is both a lake and a channel resolves to,
+/// and why.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SurfaceWater {
+    Dry,
+    Damp,
+    Channel,
+    Lake,
+}
+
+/// TODO(jb-doc): that every kind not named here is a fixed point, what rule that
+/// enforces by omission, and why that lets this be applied to whatever the bands
+/// produced without asking which band it was.
+pub fn dampened(kind: TerrainKind) -> TerrainKind {
+    match kind {
+        // TODO(jb-comment): what a Gravel/Sand -> Scrub step is, and what it does to
+        // where cities can be founded.
+        TerrainKind::Gravel | TerrainKind::Sand => TerrainKind::Scrub,
+        TerrainKind::Scrub => TerrainKind::Grass,
+        // TODO(jb-comment): what a Grass -> Forest step is.
+        TerrainKind::Grass => TerrainKind::Forest,
+        TerrainKind::Marsh => TerrainKind::Reed,
+        other => other,
+    }
+}
+
 /// What one tile turned out to be, before the bands cut it into a kind.
 ///
 /// The blended recipe rides along because the bands need its `beach_width` and its
@@ -490,6 +547,9 @@ impl TerrainConfig {
 pub struct TileSample {
     pub elevation: f32,
     pub vegetation: f32,
+    /// TODO(jb-doc): that the water is read here rather than stamped over the
+    /// finished map, and what that makes `River` and a lake to `classify`.
+    pub water: SurfaceWater,
     /// How much loose material sits on the bedrock here, in the unit range. Below
     /// `bedrock_max` the ladder stops asking the biome what to lay down and shows
     /// the rock instead.
@@ -547,6 +607,52 @@ pub struct TerrainSampler {
     settlement: usize,
     /// The blended recipe columns, in [`document::COLUMNS`] order.
     columns: [usize; document::COLUMN_COUNT],
+    water: WaterRead,
+}
+
+/// TODO(jb-doc): why every field here is precomputed rather than read per tile —
+/// what a `WaterState` accumulation read costs, how many the width test makes, and
+/// what monotonicity of the quantization buys.
+#[derive(Clone)]
+struct WaterRead {
+    /// TODO(jb-doc): what slot `n` of this means.
+    channel: Vec<u16>,
+    damp: u16,
+    lake_min_depth: f32,
+    /// TODO(jb-doc): what the triple means, and why the window is sorted by reach.
+    window: Vec<(i32, i32, usize)>,
+}
+
+impl WaterRead {
+    fn new(config: &TerrainConfig) -> Self {
+        let half = config.channel_max_half_width;
+        let ratio = config.channel_flow_per_width.max(1.0);
+        let channel: Vec<u16> = (0..=half)
+            .map(|reach| quantize_accumulation(config.channel_threshold * ratio.powi(reach as i32)))
+            .collect();
+
+        let half = half as i32;
+        let mut window = Vec::new();
+        for dy in -half..=half {
+            for dx in -half..=half {
+                // TODO(jb-comment): why the window is round rather than square, and
+                // what a square one does at a channel's bends.
+                let reach = ((dx * dx + dy * dy) as f32).sqrt().ceil() as i32;
+                if reach > half {
+                    continue;
+                }
+                window.push((dx, dy, reach as usize));
+            }
+        }
+        window.sort_by_key(|(_, _, reach)| *reach);
+
+        Self {
+            channel,
+            damp: quantize_accumulation(config.damp_threshold),
+            lake_min_depth: config.lake_min_depth,
+            window,
+        }
+    }
 }
 
 impl TerrainSampler {
@@ -555,7 +661,7 @@ impl TerrainSampler {
     /// Every id here is one [`crate::gameplay::document`] declares, so a missing one is
     /// this crate disagreeing with itself rather than a document being wrong — hence the
     /// panic rather than a `Result` no caller could act on.
-    pub fn new(terrain: Arc<Terrain>) -> Self {
+    pub fn new(terrain: Arc<Terrain>, config: &TerrainConfig) -> Self {
         let index = |id: &str| {
             terrain
                 .fields
@@ -578,8 +684,72 @@ impl TerrainSampler {
             cover_class: index(document::COVER_CLASS),
             settlement: index(document::SETTLEMENT),
             columns,
+            water: WaterRead::new(config),
             terrain,
         }
+    }
+
+    /// TODO(jb-doc): who reads these two and why the driver wants the solve's own
+    /// count rather than a count of tiles; what `None` means; and why the wasm `allow`
+    /// is here.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn lakes(&self) -> Option<u32> {
+        self.terrain.water().map(|water| water.lakes())
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn accumulation(&self, x: f32, y: f32) -> Option<f32> {
+        let water = self.terrain.water()?;
+        let size = water.size();
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let (tx, ty) = (x as u32, y as u32);
+        (tx < size.x && ty < size.y).then(|| water.accumulation(tx, ty))
+    }
+
+    /// TODO(jb-doc): what an unsolved document reads as here and why that is the
+    /// fallback; and why reading neighbouring *cells* is allowed where reading a
+    /// neighbouring *tile* would break the chunk rule.
+    pub fn surface_water(&self, x: f32, y: f32) -> SurfaceWater {
+        let Some(water) = self.terrain.water() else {
+            return SurfaceWater::Dry;
+        };
+        let size = water.size();
+        if x < 0.0 || y < 0.0 {
+            return SurfaceWater::Dry;
+        }
+        let (tx, ty) = (x as u32, y as u32);
+        if tx >= size.x || ty >= size.y {
+            return SurfaceWater::Dry;
+        }
+
+        // TODO(jb-comment): why the label alone is not enough, and what the label
+        // means on a noise field.
+        if water.lake_id().get(tx, ty).is_some_and(|id| *id != 0)
+            && water
+                .level()
+                .get(tx, ty)
+                .is_some_and(|depth| *depth >= self.water.lake_min_depth)
+        {
+            return SurfaceWater::Lake;
+        }
+
+        for (dx, dy, reach) in &self.water.window {
+            let nx = tx as i64 + *dx as i64;
+            let ny = ty as i64 + *dy as i64;
+            if nx < 0 || ny < 0 || nx >= size.x as i64 || ny >= size.y as i64 {
+                continue;
+            }
+            if water.accumulation_code(nx as u32, ny as u32) >= self.water.channel[*reach] {
+                return SurfaceWater::Channel;
+            }
+        }
+
+        if water.accumulation_code(tx, ty) >= self.water.damp {
+            return SurfaceWater::Damp;
+        }
+        SurfaceWater::Dry
     }
 
     /// One field at a global tile position, read at the centre of the tile's cell.
@@ -670,6 +840,7 @@ impl TerrainSampler {
             dominant: self.biome(self.region_id, x, y),
             cover: self.biome(self.cover_class, x, y),
             recipe: self.recipe(x, y),
+            water: self.surface_water(x, y),
         }
     }
 }
@@ -708,11 +879,23 @@ pub(crate) fn shared_test_sampler() -> &'static TerrainSampler {
 fn classify(config: &TerrainConfig, sample: &TileSample) -> TerrainKind {
     let elevation = sample.elevation;
 
+    // TODO(jb-comment): why the height bands have to be asked before the flow, and
+    // what testing the flow first does to the ocean.
     if elevation < config.deep_water_max {
-        TerrainKind::DeepWater
-    } else if elevation < config.shallow_water_max {
-        TerrainKind::ShallowWater
-    } else if elevation < config.shallow_water_max + sample.recipe.beach_width {
+        return TerrainKind::DeepWater;
+    }
+    if elevation < config.shallow_water_max {
+        return TerrainKind::ShallowWater;
+    }
+    match sample.water {
+        // TODO(jb-comment): what falls out of a lake being `ShallowWater` and nothing
+        // else knowing what a lake is.
+        SurfaceWater::Lake => return TerrainKind::ShallowWater,
+        SurfaceWater::Channel => return TerrainKind::River,
+        SurfaceWater::Damp | SurfaceWater::Dry => {}
+    }
+
+    let kind = if elevation < config.shallow_water_max + sample.recipe.beach_width {
         TerrainKind::Sand
     } else if elevation < config.lowland_max {
         if sample.soil < config.bedrock_max {
@@ -744,6 +927,13 @@ fn classify(config: &TerrainConfig, sample: &TileSample) -> TerrainKind {
         TerrainKind::Rock
     } else {
         TerrainKind::Snow
+    };
+
+    // TODO(jb-comment): why this is applied to whatever the bands produced rather
+    // than inside one of them.
+    match sample.water {
+        SurfaceWater::Damp => dampened(kind),
+        _ => kind,
     }
 }
 
@@ -757,6 +947,16 @@ fn classify(config: &TerrainConfig, sample: &TileSample) -> TerrainKind {
 pub struct ChunkTerrain {
     pub kinds: Box<[TerrainKind]>,
     pub heights: Box<[u8]>,
+}
+
+/// TODO(jb-doc): the invariant every heightmap reader depends on, why lakes broke it,
+/// what is lost by storing a water tile at the line, and why `River` is excluded.
+fn surface_of(config: &TerrainConfig, kind: TerrainKind, elevation: f32) -> f32 {
+    if kind.is_water() {
+        elevation.min(config.shallow_water_max)
+    } else {
+        elevation
+    }
 }
 
 /// An elevation as the byte the heightmap stores.
@@ -800,7 +1000,11 @@ pub fn generate_chunk(
             let x = (origin.x + (i % chunk_size.x) as i32) as f32;
             let y = (origin.y + (i / chunk_size.x) as i32) as f32;
             let sample = sampler.sample(x, y);
-            (classify(config, &sample), height_byte(sample.elevation))
+            let kind = classify(config, &sample);
+            (
+                kind,
+                height_byte(surface_of(config, kind, sample.elevation)),
+            )
         })
         .unzip();
 
@@ -897,6 +1101,9 @@ mod tests {
     /// The height kept beside a tile is the one it was cut with, so the shading and
     /// the tile under it cannot disagree and no second implementation of "how high
     /// is it here" enters the crate.
+    ///
+    /// TODO(jb-doc): why [`surface_of`] is not a second implementation of the height,
+    /// and why this asserts through it rather than around it.
     #[test]
     fn every_tile_keeps_the_height_it_was_classified_from() {
         let config = TerrainConfig::default();
@@ -907,9 +1114,18 @@ mod tests {
             let x = (ORIGIN.x + (i as u32 % CHUNK.x) as i32) as f32;
             let y = (ORIGIN.y + (i as u32 / CHUNK.x) as i32) as f32;
             let sample = sampler.sample(x, y);
+            let kind = classify(&config, &sample);
 
-            assert_eq!(chunk.kinds[i], classify(&config, &sample));
-            assert_eq!(chunk.heights[i], height_byte(sample.elevation));
+            assert_eq!(chunk.kinds[i], kind);
+            assert_eq!(
+                chunk.heights[i],
+                height_byte(surface_of(&config, kind, sample.elevation))
+            );
+            // TODO(jb-comment): what this second assertion catches that the first
+            // one cannot.
+            if !kind.is_water() {
+                assert_eq!(chunk.heights[i], height_byte(sample.elevation));
+            }
         }
     }
 
@@ -920,6 +1136,9 @@ mod tests {
     /// `107/255` is 0.4196 and `108/255` is 0.4235, so no byte lands on 0.42 and the
     /// quantization cannot resolve which side of it a tile sat. That sliver is one
     /// tile wide and falls on the coastline, where the tileset changes anyway.
+    ///
+    /// TODO(jb-doc): that gh-36 broke this test by putting lakes on the map, and how
+    /// [`surface_of`] restores the biconditional without weakening what is asserted.
     #[test]
     fn water_is_exactly_what_falls_below_the_tint_water_line() {
         let config = TerrainConfig::default();
@@ -1119,16 +1338,15 @@ mod tests {
             TerrainKind::Scrub,
             TerrainKind::Gravel,
             TerrainKind::Reed,
+            // TODO(jb-comment): why River joined this list in gh-36.
+            TerrainKind::River,
         ] {
             assert!(
                 counts[kind.tileset_index() as usize] > 0,
                 "no {kind:?} anywhere in the world"
             );
         }
-        // Town, Road, River and Farmland are deliberately absent from that list:
-        // they are stamped over finished terrain, so this test must keep *not*
-        // seeing them. `the_terrain_never_produces_a_kind_the_plan_stamps` is the
-        // other half of the same rule.
+        // TODO(jb-comment): why Town, Road and Farmland are absent from that list.
     }
 
     /// A tile drawn for a biome no recipe can reach is a tile drawn for nothing.
@@ -1361,6 +1579,166 @@ mod tests {
         counts
     }
 
+    /// Where the water knobs' figures come from, and the sweep behind them.
+    ///
+    /// TODO(jb-doc): why every column of these sweeps comes off one solve, what the
+    /// stage this replaced had to do instead, and why `lake_min_tiles` is not swept.
+    ///
+    /// `cargo test --release -- --ignored --nocapture the_default_config_measures_the_worlds_water`
+    #[test]
+    #[ignore = "generates the whole 4096x4096 world"]
+    fn the_default_config_measures_the_worlds_water() {
+        let config = TerrainConfig::default();
+        let sampler = config.sampler();
+        let tiles = (WORLD_TILES.x as u64) * (WORLD_TILES.y as u64);
+        let share = |count: u64| 100.0 * count as f64 / tiles as f64;
+
+        println!(
+            "\n{} labelled lakes over {tiles} tiles",
+            sampler
+                .lakes()
+                .expect("the shipped sampler solves its water")
+        );
+
+        // TODO(jb-comment): why this walks every tile rather than reusing
+        // `world_kind_counts`.
+        let mut counts = [0u64; TERRAIN_KIND_COUNT as usize];
+        let mut damp = 0u64;
+        let mut lake = 0u64;
+        for y in 0..WORLD_TILES.y {
+            for x in 0..WORLD_TILES.x {
+                let (tx, ty) = (x as f32, y as f32);
+                let sample = sampler.sample(tx, ty);
+                counts[classify(&config, &sample).tileset_index() as usize] += 1;
+                match sample.water {
+                    SurfaceWater::Damp => damp += 1,
+                    // TODO(jb-comment): why the elevation test is needed here.
+                    SurfaceWater::Lake if sample.elevation >= config.shallow_water_max => lake += 1,
+                    _ => {}
+                }
+            }
+        }
+        let river = counts[TerrainKind::River.tileset_index() as usize];
+        println!(
+            "river {river} ({:.3}%), inland lake {lake} ({:.3}%), dry valley {damp} ({:.3}%)",
+            share(river),
+            share(lake),
+            share(damp),
+        );
+        println!(
+            "sea {:.2}% deep and {:.2}% shallow",
+            share(counts[TerrainKind::DeepWater.tileset_index() as usize]),
+            share(counts[TerrainKind::ShallowWater.tileset_index() as usize]) - share(lake),
+        );
+
+        // TODO(jb-comment): why the whole table costs no solve.
+        println!("\nchannel_threshold against the share of the world it draws:");
+        println!("  threshold   half-width 0   shipped half-width");
+        for threshold in [2000.0f32, 4000.0, 8000.0, 16_000.0, 32_000.0] {
+            let bare = water_share(
+                &TerrainConfig {
+                    channel_threshold: threshold,
+                    channel_max_half_width: 0,
+                    ..config.clone()
+                },
+                &sampler,
+            );
+            let wide = water_share(
+                &TerrainConfig {
+                    channel_threshold: threshold,
+                    ..config.clone()
+                },
+                &sampler,
+            );
+            println!("  {threshold:>9.0}   {:>12.3}%   {wide:>17.3}%", bare);
+        }
+
+        // TODO(jb-comment): why this counts tiles the ladder moves rather than tiles
+        // it is applied to, and what the two figures differ by.
+        println!("\ndamp_threshold against the share of the world whose cover it moves:");
+        println!("  threshold   damp   changed");
+        for threshold in [500.0f32, 1000.0, 2000.0, 4000.0, 8000.0] {
+            let swept = TerrainConfig {
+                damp_threshold: threshold,
+                ..config.clone()
+            };
+            let read = TerrainSampler::new(sampler.terrain.clone(), &swept);
+            let (mut damp, mut moved, mut seen) = (0u64, 0u64, 0u64);
+            for y in (0..WORLD_TILES.y).step_by(2) {
+                for x in (0..WORLD_TILES.x).step_by(2) {
+                    seen += 1;
+                    let sample = read.sample(x as f32, y as f32);
+                    if sample.water != SurfaceWater::Damp {
+                        continue;
+                    }
+                    damp += 1;
+                    // TODO(jb-comment): what this second classify stands for.
+                    let dry = TileSample {
+                        water: SurfaceWater::Dry,
+                        ..sample
+                    };
+                    if classify(&swept, &dry) != classify(&swept, &sample) {
+                        moved += 1;
+                    }
+                }
+            }
+            let share = |count: u64| 100.0 * count as f64 / seen as f64;
+            println!(
+                "  {threshold:>9.0}   {:>4.3}%   {:>6.3}%",
+                share(damp),
+                share(moved)
+            );
+        }
+
+        // TODO(jb-comment): why depth needs no solve of its own.
+        println!("\nlake_min_depth against the share of the world under inland water:");
+        for depth in [0.0f32, 0.01, 0.02, 0.04, 0.06, 0.07, 0.08, 0.12] {
+            let swept = TerrainConfig {
+                lake_min_depth: depth,
+                ..config.clone()
+            };
+            let read = TerrainSampler::new(sampler.terrain.clone(), &swept);
+            let (mut count, mut seen) = (0u64, 0u64);
+            for y in (0..WORLD_TILES.y).step_by(2) {
+                for x in (0..WORLD_TILES.x).step_by(2) {
+                    seen += 1;
+                    let sample = read.sample(x as f32, y as f32);
+                    if sample.water == SurfaceWater::Lake
+                        && sample.elevation >= swept.shallow_water_max
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            println!(
+                "  {depth:>5.3}   {:.3}%",
+                100.0 * count as f64 / seen as f64
+            );
+        }
+    }
+
+    /// The share of the world one config's channel cut **draws**, over a solve that has
+    /// already happened.
+    ///
+    /// TODO(jb-doc): why the subsample stride is safe; and why this counts through
+    /// `classify` rather than off `surface_water`, which is a factor of nearly three
+    /// rather than a rounding difference.
+    #[cfg(test)]
+    fn water_share(config: &TerrainConfig, solved: &TerrainSampler) -> f64 {
+        let read = TerrainSampler::new(solved.terrain.clone(), config);
+        let mut count = 0u64;
+        let mut seen = 0u64;
+        for y in (0..WORLD_TILES.y).step_by(2) {
+            for x in (0..WORLD_TILES.x).step_by(2) {
+                seen += 1;
+                if classify(config, &read.sample(x as f32, y as f32)) == TerrainKind::River {
+                    count += 1;
+                }
+            }
+        }
+        100.0 * count as f64 / seen as f64
+    }
+
     /// The stamped kinds belong to the plan and to the simulation, not to the
     /// terrain — if one ever came out of here, a chunk's contents would depend on
     /// its neighbours again.
@@ -1376,12 +1754,11 @@ mod tests {
     }
 
     /// The kinds nothing in [`classify`] may ever return.
-    const STAMPED_KINDS: [TerrainKind; 4] = [
-        TerrainKind::Town,
-        TerrainKind::Road,
-        TerrainKind::River,
-        TerrainKind::Farmland,
-    ];
+    ///
+    /// TODO(jb-doc): why `River` came off this list in gh-36, and what distinction
+    /// survives that keeps the other three on it.
+    const STAMPED_KINDS: [TerrainKind; 3] =
+        [TerrainKind::Town, TerrainKind::Road, TerrainKind::Farmland];
 
     /// Rivers rise where it rains, so the humidity field has to be its own
     /// landscape rather than a second view of the elevation it is sampled

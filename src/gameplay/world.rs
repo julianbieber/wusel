@@ -28,7 +28,7 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
 
-use watershed::Terrain;
+use watershed::{Terrain, WaterSpec};
 
 use crate::{
     camera::{WorldCamera, visible_half_extent},
@@ -205,9 +205,13 @@ pub struct TerrainBake {
     terrain: Option<Terrain>,
     /// What to bake and what to drop, in order. Consumed from the front.
     remaining: VecDeque<document::Stage>,
-    /// How many stages the plan had, so progress can be reported against it.
+    /// TODO(jb-doc): why the water solve is a bake stage rather than a step beside the
+    /// bake, why it has to be last, and what that means for `WorldPlan`.
+    water: Option<WaterSpec>,
+    /// TODO(jb-doc): why the water solve counts towards the total.
     total: usize,
-    in_flight: Option<Task<(Terrain, Result<(), watershed::BakeError>)>>,
+    /// TODO(jb-doc): why the error is a `String`.
+    in_flight: Option<Task<(Terrain, Result<(), String>)>>,
     /// The finished article. Its presence is the signal that the world can be generated,
     /// and it is published as [`WorldSampler`] so a reader needs no knowledge of the bake.
     sampler: Option<TerrainSampler>,
@@ -223,8 +227,9 @@ impl TerrainBake {
         let stages = document::stages(&terrain, &document::GENERATION)
             .expect("a document this crate builds has to plan");
         Self {
-            total: stages.len(),
+            total: stages.len() + 1,
             remaining: stages.into(),
+            water: Some(document::water_spec(config)),
             terrain: Some(terrain),
             in_flight: None,
             sampler: None,
@@ -266,7 +271,11 @@ impl TerrainBake {
 pub struct WorldSampler(pub TerrainSampler);
 
 /// Advances the bake by one stage a frame, and builds the sampler when the last lands.
-fn drive_terrain_bake(mut commands: Commands, mut bake: ResMut<TerrainBake>) {
+fn drive_terrain_bake(
+    mut commands: Commands,
+    mut bake: ResMut<TerrainBake>,
+    config: Res<TerrainConfig>,
+) {
     if bake.is_complete() {
         return;
     }
@@ -282,6 +291,7 @@ fn drive_terrain_bake(mut commands: Commands, mut bake: ResMut<TerrainBake>) {
             // see which stage broke.
             error!("the terrain bake failed: {error}");
             bake.remaining.clear();
+            bake.water = None;
         }
         bake.terrain = Some(terrain);
     }
@@ -290,23 +300,41 @@ fn drive_terrain_bake(mut commands: Commands, mut bake: ResMut<TerrainBake>) {
         return;
     };
 
+    let pool = AsyncComputeTaskPool::get();
+
     let Some(stage) = bake.remaining.pop_front() else {
-        let sampler = TerrainSampler::new(Arc::new(terrain));
+        // TODO(jb-comment): why the water solve cannot be one of the stages above.
+        if let Some(spec) = bake.water.take() {
+            bake.last = Some(WATER_STAGE.to_owned());
+            bake.in_flight = Some(pool.spawn(async move {
+                let result = terrain
+                    .solve_water(&spec)
+                    .map_err(|error| error.to_string());
+                (terrain, result)
+            }));
+            return;
+        }
+
+        let sampler = TerrainSampler::new(Arc::new(terrain), &config);
         commands.insert_resource(WorldSampler(sampler.clone()));
         bake.sampler = Some(sampler);
         return;
     };
 
     bake.last = Some(stage.field.clone());
-    let pool = AsyncComputeTaskPool::get();
     bake.in_flight = Some(pool.spawn(async move {
-        let result = terrain.bake_field(&stage.field);
+        let result = terrain
+            .bake_field(&stage.field)
+            .map_err(|error| error.to_string());
         for id in &stage.release {
             terrain.release(id);
         }
         (terrain, result)
     }));
 }
+
+/// TODO(jb-doc): why this is named rather than a literal.
+pub const WATER_STAGE: &str = "water";
 
 /// Throws the world away. Removing the resources drops whatever tasks they were
 /// holding, so a chunk that finishes generating after this has nowhere to

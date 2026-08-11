@@ -5,14 +5,17 @@
 //! covers a disc and a road spans hundreds of tiles, so both are planned once
 //! the *whole* world exists and then written back over it as tile edits.
 //!
-//! The plan runs while the player is already walking around, so rivers, cities
-//! and roads appear chunk by chunk as each edit lands. It is a state machine
-//! over one session: wait for the terrain, cut the rivers, plan the cities, then
-//! route the roads.
+//! The plan runs while the player is already walking around, so the cities and
+//! the roads appear chunk by chunk as each edit lands. It is a state machine over
+//! one session: wait for the terrain, lay the seams, plan the cities, then route
+//! the roads.
 //!
 //! The order is not arbitrary. Each stage is stamped into `WorldMap` before the
-//! next one is planned, and each takes its snapshot afterwards, so a city sees
-//! the rivers it must not pave and a road sees both.
+//! next one is planned, and each takes its snapshot afterwards, so a road sees the
+//! towns it must not pave.
+//!
+//! TODO(jb-doc): that the water used to be the first two stages here and no longer
+//! is, why it had to be a stage at all, and what changed so that it need not be.
 
 use crate::gameplay::world::WorldSampler;
 use bevy::{
@@ -24,13 +27,11 @@ use crate::{
     gameplay::{
         city::{City, CityMap, PlannedCity, plan_cities},
         deposit::{Deposit, DepositMap, chunk_of_deposit, plan_deposits},
-        drainage::{DrainagePlan, plan_drainage},
         prospect::start_prospect_bake,
-        river::{RiverPlan, plan_rivers},
         road::{RoadNetwork, RoutedRoad, choose_pairs, route_road},
         terrain::TerrainConfig,
         world::{
-            BackgroundGeneration, DirtyChunks, TileEdit, WorldMap, WorldSnapshot, WorldSystems,
+            BackgroundGeneration, DirtyChunks, WorldMap, WorldSnapshot, WorldSystems,
             tile_translation,
         },
     },
@@ -94,195 +95,6 @@ pub struct WorldPlanConfig {
     /// this — which is what makes roads converge on the same crossings rather
     /// than each fording the river wherever it happens to meet it.
     pub road_river_crossing_penalty: f32,
-    /// The world is cut into squares this wide, each proposing at most one
-    /// spring. With `TerrainConfig::river_source_threshold` this is the lever on
-    /// how many rivers the world has, and it has to be pushed harder than it
-    /// looks: the elevation field's longest wavelength is about 25 tiles, so a
-    /// descent reaches water within a few steps and one spring per mountain
-    /// leaves the map bare.
-    ///
-    /// Measured on the default world, in share of tiles that end up river: 48
-    /// gives 0.011%, 24 gives 0.042%, 16 gives 0.090%, 12 gives 0.229% and 8
-    /// gives 0.360%. Roads cover 0.24%, which is the mark for "reads as a
-    /// feature of the map rather than as speckle".
-    pub river_source_cell_tiles: u32,
-    /// Tiles between lattice nodes when a particle descends. Anchored on the
-    /// world origin, so this is also the resolution at which two rivers merge
-    /// instead of running alongside each other.
-    pub river_step_tiles: u32,
-    /// How far a particle may walk before it is abandoned. A backstop against a
-    /// descent the terrain has talked into wandering, not a shape control.
-    pub river_max_steps: u32,
-    /// How many particles must cross a tile for its channel to widen by one.
-    ///
-    /// Low, and it has to be. Flow only accumulates where two descents meet, and
-    /// on this terrain they hardly ever do: at the default spacing the busiest
-    /// segment in the whole world carries 3 particles, so anything above 2 would
-    /// mean every river in the world came out one tile wide. Of ~11k segments,
-    /// 2 gives about 350 that are two tiles across and none wider — the width
-    /// machinery is right, but the landscape rarely feeds it. Long rivers with a
-    /// real hierarchy of tributaries would need an elevation field with
-    /// something longer than a 25-tile wavelength in it.
-    pub river_flow_per_width: u32,
-    /// The drop per tile at which the terrain outvotes the shape rules.
-    ///
-    /// The first of six knobs that are **shape** controls, which is a category
-    /// this config did not have: until now a river's course was whatever
-    /// steepest descent produced, and every knob here was a density, a budget or
-    /// a backstop.
-    ///
-    /// A step's descent is scored against this rather than against the best
-    /// available step, and that choice is the whole reason the rule behaves
-    /// differently in different country. On a steep slope the drops are large
-    /// multiples of it, descent swamps the other two terms, and the river runs
-    /// near the fall line — which is what a river in steep ground does. On
-    /// gentle ground every drop is a fraction of it, the term goes quiet, and
-    /// the heading and meander terms decide. Score against the best candidate
-    /// instead and the terms keep the same proportions everywhere, so a
-    /// mountain torrent meanders exactly as hard as a lowland one.
-    ///
-    /// So it has to be read off the terrain rather than picked. The drop per tile
-    /// along a course on the default world runs 0.0008 at p10, 0.0049 at the
-    /// median and 0.0123 at p90, and the default is that p90 — nine steps in ten
-    /// are gentle enough for the shape terms to have a say, and the steepest
-    /// tenth is left to the hill. Measured against mean excursion, which is the
-    /// number `the_shape_of_the_worlds_rivers` exists to print: 0.002 gives
-    /// 0.202, 0.004 gives 0.205, 0.012 gives 0.228, 0.020 gives 0.249 and 0.040
-    /// gives 0.266. It keeps paying past p90 — but past there the descent term is
-    /// a rounding error, and a river that ignores the ground it is on except to
-    /// avoid climbing is not a river.
-    pub river_reference_drop: f32,
-    /// What continuing in the same direction is worth, against a drop of
-    /// `river_reference_drop`.
-    ///
-    /// This is the term that kills the staircase. Where the true fall direction
-    /// falls between two of the eight lattice directions, steepest descent flips
-    /// between them every node and lays a zigzag with 4-tile teeth; a particle
-    /// that pays to turn picks one and holds it.
-    pub river_heading_weight: f32,
-    /// What leaning to the side the meander field points is worth, on the same
-    /// scale as `river_heading_weight`.
-    ///
-    /// Against the heading term this is the sinuosity dial: heading alone gives
-    /// straighter rivers than steepest descent, meander alone gives a course
-    /// that wanders without committing, and the ratio between them is what makes
-    /// a bend a bend.
-    pub river_meander_weight: f32,
-    /// Noise scale of the meander field, so 1 / this is the wavelength in tiles
-    /// over which the water changes which way it leans — half a wavelength is
-    /// one bend.
-    ///
-    /// The default is ~50 tiles, which is about a screen at zoom 1: a bend you
-    /// can see the whole of without it reading as a wobble in a straight line.
-    pub river_meander_scale: f32,
-    /// How many level steps in a row are wandering rather than pooling.
-    ///
-    /// A particle may now take a step that does not descend, which is what lets
-    /// a river meander across a flood plain instead of flooding it — but only
-    /// this many in a row, or a broad flat would swallow the course entirely and
-    /// leave it stopping in the middle of nowhere at the step cap. Past this the
-    /// water is declared to be standing and the basin is flooded from where the
-    /// particle stands, which is the old behaviour arrived at late.
-    pub river_flat_run_nodes: u32,
-    /// Fewest points a channel segment's curve is sampled at.
-    ///
-    /// A floor, not a count: the sampling is dense enough to leave no gaps on
-    /// its own, and this only matters for a segment short enough that the
-    /// gap-free density would be one or two points.
-    pub river_curve_samples: u32,
-    /// A basin that spills before it holds this much water leaves no lake at
-    /// all. Load-bearing: fbm at this stride is full of dips a tile or two deep,
-    /// and a pond at every one of them would turn each river into a string of
-    /// beads.
-    ///
-    /// **Since `Lattice::spill` this is also the lever on how long a river is**,
-    /// and it is by a distance the strongest one. A basin under it is not merely
-    /// undrawn — the channel is drawn straight across it — so raising this
-    /// converts lakes into crossings, and every lake converted is one that is no
-    /// longer chopping a course in two. Measured on the default world:
-    ///
-    /// ```text
-    ///   min   courses>=8   p90 course   excursion   river     lake
-    ///    64          453      64 tiles       0.228   36418   234714
-    ///   128          560      81 tiles       0.256   40987   218674
-    ///   256          680     108 tiles       0.295   46842   190722
-    ///   512          779     151 tiles       0.358   57167   127460
-    /// ```
-    ///
-    /// It keeps paying, and past 512 it runs out of road: no basin can exceed
-    /// `river_lake_max_tiles`, so above that nothing is ever drawn and the world
-    /// has no inland water at all. 256 is the default because river coverage
-    /// lands at 0.28% against roads' 0.24% — the yardstick every other density
-    /// here was chosen against — where 512 gives 0.34%.
-    ///
-    /// What it costs is honesty about the water: a basin under this is *filled*,
-    /// so the river crosses standing water that is not drawn. At 256 that is a
-    /// hollow up to 16 tiles across, which reads as a river running over a damp
-    /// flat; at 512 it is 23 and starting to be a pond that is missing.
-    pub river_lake_min_tiles: u32,
-    /// A basin that has not found a way out by this size is a closed lake, and
-    /// the river feeding it ends there. This is what stops one unlucky basin
-    /// from flooding half a continent.
-    pub river_lake_max_tiles: u32,
-    /// How many chunks of river are stamped into the world per frame. Doing the
-    /// whole world in one frame would be a visible stall; spread out, it is the
-    /// rivers filling in across the map, which is worth watching.
-    pub river_chunks_stamped_per_frame: u32,
-    /// The world is cut into squares this wide, each proposing at most one valley
-    /// head. Coarser than the river spacing on purpose: these are the trunk
-    /// valleys a landscape reads by, not every rill in it.
-    ///
-    /// With `drain_min_flow`, the lever on how much of the network you see.
-    /// Measured on the default world as a share of tiles, at a step of 16:
-    ///
-    /// ```text
-    ///   cell   floor 2   floor 3
-    ///     48    0.063%    0.014%
-    ///     32    0.227%    0.081%
-    ///     24    0.452%    0.199%
-    ///     16    1.224%    0.633%
-    /// ```
-    ///
-    /// 24 against a floor of 3 gives 0.199%, next to roads at 0.24% — which is the
-    /// same yardstick `river_source_cell_tiles` was chosen against. Note the two
-    /// columns are different pictures at the same density and not a free choice:
-    /// tightening the cell adds *heads* and so lengthens the branching network,
-    /// while dropping the floor draws paths that fewer descents agreed on, which
-    /// adds isolated rills. See `the_drainage_density_against_its_two_knobs`.
-    pub drain_source_cell_tiles: u32,
-    /// Tiles between lattice nodes when a drainage particle descends.
-    ///
-    /// Four times the river stride, and that is what makes the stage work at all.
-    /// A drainage particle never floods, so it stops at the first node with nothing
-    /// lower beside it — and at the river's 4-tile stride the relief layer's own
-    /// fine octaves put a local minimum every few nodes, so the first cut of this
-    /// laid **404 tiles in the entire world** because no two descents ever met. The
-    /// pits are a property of the sampling scale, not of the landscape: at 16 tiles
-    /// the walk sees the broad fall of the ground, particles run for hundreds of
-    /// tiles, and their paths coincide often enough for flow to mean something.
-    ///
-    /// The precision is not missed. A valley is a broad feature, and the lattice is
-    /// still anchored on the world origin, which is the property that actually
-    /// matters — two particles crossing the same ground step between the same
-    /// nodes. It is also 16x less scratch than the river lattice.
-    pub drain_step_tiles: u32,
-    /// How many particles must agree on a node before it is drawn at all.
-    ///
-    /// The floor is what stops this reintroducing the speckle gh-14 is about: every
-    /// valley head walks a path, and drawing all of them would put a one-tile
-    /// squiggle through every square of the world. Only where descents *converge*
-    /// is there a valley worth seeing.
-    pub drain_min_flow: u32,
-    /// How wide a heavily used channel gets. Small — this is a treeline, not a
-    /// river, and a wide one would read as a road.
-    pub drain_max_width: u32,
-    /// How far a particle may walk before it is abandoned. A backstop only: every
-    /// step is strictly downhill, so a walk terminates on the terrain long before
-    /// this.
-    pub drain_max_steps: u32,
-    /// How many chunks of dry valley are stamped per frame, on the same terms as
-    /// the rivers'.
-    pub drain_chunks_stamped_per_frame: u32,
     /// The world is cut into squares this wide, each proposing at most one seam.
     ///
     /// With `deposit_threshold` this is the lever on how many mines the world has,
@@ -345,25 +157,6 @@ impl Default for WorldPlanConfig {
             road_reuse_discount: 0.25,
             route_padding_tiles: 192,
             road_river_crossing_penalty: 60.0,
-            river_source_cell_tiles: 12,
-            river_step_tiles: 4,
-            river_max_steps: 2048,
-            river_flow_per_width: 2,
-            river_reference_drop: 0.012,
-            river_heading_weight: 0.6,
-            river_meander_weight: 1.0,
-            river_meander_scale: 0.02,
-            river_flat_run_nodes: 24,
-            river_curve_samples: 8,
-            river_lake_min_tiles: 256,
-            river_lake_max_tiles: 512,
-            river_chunks_stamped_per_frame: 64,
-            drain_source_cell_tiles: 24,
-            drain_step_tiles: 16,
-            drain_min_flow: 3,
-            drain_max_width: 2,
-            drain_max_steps: 512,
-            drain_chunks_stamped_per_frame: 64,
             deposit_cell_tiles: 64,
             deposit_jitter_tiles: 48,
             deposit_threshold: 0.5,
@@ -378,53 +171,19 @@ impl Default for WorldPlanConfig {
 /// in the next.
 #[derive(Resource)]
 pub enum WorldPlan {
+    /// TODO(jb-doc): what this waits for now that the water is not one of the stages,
+    /// and what the world it is waiting for already contains.
     WaitingForTerrain,
-    Rivers(RiverStamping),
-    /// The dry valleys, between the rivers and the cities. It has to be after the
-    /// rivers so a channel ends where the water starts rather than crossing it, and
-    /// before the cities because it moves tiles onto and off the habitable list —
-    /// a wadi through a desert lays down settleable ground, and a city stage that
-    /// had already run would never see it.
-    Drainage(DrainageStamping),
-    /// The seams, between the drainage and the cities. After the drainage, because a
-    /// wadi changes the ground a salt pan is read off; before the cities, so that a
-    /// later change can let a settlement score read what is under the site. Nothing
-    /// does yet, and siting is unchanged by this stage.
+    /// The seams, and now the first stage that plans anything. Before the cities, so
+    /// that a later change can let a settlement score read what is under the site;
+    /// nothing does yet, and siting is unchanged by this stage.
     ///
-    /// It stamps no tile, so unlike the two stages before it there is nothing to
-    /// spread across frames — the task lands and every seam is spawned at once.
+    /// It stamps no tile, so there is nothing to spread across frames — the task
+    /// lands and every seam is spawned at once.
     Deposits(Task<Vec<Deposit>>),
     Cities(Task<Vec<PlannedCity>>),
     Roads(RoadPlanning),
     Done,
-}
-
-/// The river stage's working set.
-///
-/// One task cuts every river in the world at once — unlike a road, a river needs
-/// nothing from the river before it, since the particles share their flow
-/// through the lattice rather than through the map. What cannot be done at once
-/// is the *stamping*: a world of rivers is on the order of 10^5 edits, so they
-/// are written a batch of chunks at a time and the map fills in over about a
-/// second of play.
-pub struct RiverStamping {
-    in_flight: Option<Task<RiverPlan>>,
-    /// Chunks still to stamp. Reversed on arrival so that `pop` yields them in
-    /// chunk order, and the fill sweeps the world one way rather than jumping
-    /// about.
-    pending: Vec<Vec<TileEdit>>,
-}
-
-/// The drainage stage's working set — the river stage's shape exactly, and for the
-/// same reasons: one task cuts every valley in the world at once because the
-/// particles share their flow through the lattice rather than through the map, and
-/// the stamping is spread because the edit list is large enough that `apply_edits`
-/// would be a visible stall in one frame.
-pub struct DrainageStamping {
-    in_flight: Option<Task<DrainagePlan>>,
-    /// Reversed on arrival so that `pop` yields chunks in order and the fill sweeps
-    /// the world one way rather than jumping about.
-    pending: Vec<Vec<TileEdit>>,
 }
 
 /// The road stage's working set.
@@ -464,9 +223,7 @@ impl Plugin for WorldPlanPlugin {
         app.add_systems(
             Update,
             (
-                start_river_plan,
-                apply_river_plan,
-                apply_drainage_plan,
+                start_deposit_plan,
                 apply_deposit_plan,
                 apply_city_plan,
                 drive_road_plan,
@@ -495,13 +252,15 @@ fn tear_down_plan(mut commands: Commands) {
     commands.remove_resource::<RoadNetwork>();
 }
 
-/// Hands the finished world to the river planner, once there is a finished world
-/// to hand over. This is the first stage, so it is what the whole plan waits on.
-fn start_river_plan(
+/// Hands the finished world to the first planning stage, once there is a finished
+/// world to hand over. This is what the whole plan waits on.
+///
+/// TODO(jb-doc): that the world handed over already has its water in it, and why that
+/// leaves a seam reading the same ground the drainage stage used to change for it.
+fn start_deposit_plan(
     mut plan: ResMut<WorldPlan>,
     map: Res<WorldMap>,
     generation: Res<BackgroundGeneration>,
-    terrain: Res<TerrainConfig>,
     sampler: Option<Res<WorldSampler>>,
     config: Res<WorldPlanConfig>,
 ) {
@@ -514,137 +273,13 @@ fn start_river_plan(
     let world = map
         .snapshot()
         .expect("the background pass reported every chunk generated");
-    let terrain = terrain.clone();
-    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
-    // and no chunk can generate before the bake has published the sampler. Every later
-    // stage is gated on the plan already being past that point.
+    // TODO(jb-comment): why this `expect` is sound rather than optimistic.
     let sampler = sampler
         .expect("the plan only advances once the terrain is baked")
         .0
         .clone();
     let config = config.clone();
 
-    let task = AsyncComputeTaskPool::get()
-        .spawn(async move { plan_rivers(&sampler, &terrain, &config, &world) });
-    *plan = WorldPlan::Rivers(RiverStamping {
-        in_flight: Some(task),
-        pending: Vec::new(),
-    });
-}
-
-/// Stamps the rivers a batch of chunks at a time, and opens the city stage once
-/// the last of them is down.
-///
-/// The city stage starts from here rather than from a system of its own, because
-/// the snapshot it plans against has to be the one *with* the rivers in it — a
-/// city must be clipped by a river the same way it is clipped by a coast.
-fn apply_river_plan(
-    mut plan: ResMut<WorldPlan>,
-    mut map: ResMut<WorldMap>,
-    mut dirty: ResMut<DirtyChunks>,
-    terrain: Res<TerrainConfig>,
-    sampler: Option<Res<WorldSampler>>,
-    config: Res<WorldPlanConfig>,
-) {
-    let WorldPlan::Rivers(state) = &mut *plan else {
-        return;
-    };
-
-    if let Some(task) = &mut state.in_flight {
-        let Some(planned) = block_on(poll_once(task)) else {
-            return;
-        };
-        state.in_flight = None;
-        state.pending = planned.by_chunk;
-        // Popped from the back, so reversing here is what makes the fill sweep
-        // the world in chunk order instead of backwards.
-        state.pending.reverse();
-    }
-
-    for _ in 0..config.river_chunks_stamped_per_frame.max(1) {
-        let Some(edits) = state.pending.pop() else {
-            break;
-        };
-        map.apply_edits(&edits, &mut dirty);
-    }
-
-    if !state.pending.is_empty() {
-        return;
-    }
-
-    let world = map
-        .snapshot()
-        .expect("the world was complete when the plan started");
-    let terrain = terrain.clone();
-    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
-    // and no chunk can generate before the bake has published the sampler. Every later
-    // stage is gated on the plan already being past that point.
-    let sampler = sampler
-        .expect("the plan only advances once the terrain is baked")
-        .0
-        .clone();
-    let config = config.clone();
-    let task = AsyncComputeTaskPool::get()
-        .spawn(async move { plan_drainage(&sampler, &terrain, &config, &world) });
-    *plan = WorldPlan::Drainage(DrainageStamping {
-        in_flight: Some(task),
-        pending: Vec::new(),
-    });
-}
-
-/// Stamps the dry valleys a batch of chunks at a time, and opens the deposit stage
-/// once the last of them is down.
-///
-/// The next stage starts from here for the reason the city stage used to: the
-/// snapshot it reads has to be the one *with* the valleys in it. This stage moves
-/// tiles across the habitable line in both directions — a wadi turns desert `Sand`
-/// into settleable `Scrub` — so a layout taken before it would be reading a
-/// different world from the one on screen. A salt pan is read off exactly the ground
-/// a wadi changes, which is why the seams come after the valleys and not before.
-fn apply_drainage_plan(
-    mut plan: ResMut<WorldPlan>,
-    mut map: ResMut<WorldMap>,
-    mut dirty: ResMut<DirtyChunks>,
-    terrain: Res<TerrainConfig>,
-    sampler: Option<Res<WorldSampler>>,
-    config: Res<WorldPlanConfig>,
-) {
-    let WorldPlan::Drainage(state) = &mut *plan else {
-        return;
-    };
-
-    if let Some(task) = &mut state.in_flight {
-        let Some(planned) = block_on(poll_once(task)) else {
-            return;
-        };
-        state.in_flight = None;
-        state.pending = planned.by_chunk;
-        state.pending.reverse();
-    }
-
-    for _ in 0..config.drain_chunks_stamped_per_frame.max(1) {
-        let Some(edits) = state.pending.pop() else {
-            break;
-        };
-        map.apply_edits(&edits, &mut dirty);
-    }
-
-    if !state.pending.is_empty() {
-        return;
-    }
-
-    let world = map
-        .snapshot()
-        .expect("the world was complete when the plan started");
-    let _terrain = terrain.clone();
-    // Sound rather than optimistic: the first stage waits on `generation.is_complete()`,
-    // and no chunk can generate before the bake has published the sampler. Every later
-    // stage is gated on the plan already being past that point.
-    let sampler = sampler
-        .expect("the plan only advances once the terrain is baked")
-        .0
-        .clone();
-    let config = config.clone();
     let task =
         AsyncComputeTaskPool::get().spawn(async move { plan_deposits(&sampler, &config, &world) });
     *plan = WorldPlan::Deposits(task);
@@ -820,6 +455,7 @@ mod tests {
     use super::*;
 
     use crate::gameplay::terrain::shared_test_sampler;
+    use crate::gameplay::world::WORLD_TILES;
     use crate::gameplay::{city::CitySize, terrain::TerrainKind};
 
     /// The whole plan, against the world the game actually generates.
@@ -833,45 +469,33 @@ mod tests {
     fn the_default_config_lays_out_cities_of_every_size_and_roads_between_them() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
-        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
-
-        // The stages in the order the plan runs them: the cities are laid out
-        // over a world that already has its rivers, because that is the world
-        // the game plans them against.
-        let rivers = plan_rivers(shared_test_sampler(), &terrain, &config, &base);
-        let river_edits: Vec<TileEdit> = rivers.by_chunk.iter().flatten().copied().collect();
-        report_rivers(&base, &rivers, &river_edits);
-        let watered = base.with_edits(&river_edits);
-
-        // The drainage stage sits between the rivers and the cities, and it has to
-        // be here rather than skipped: it moves tiles across the habitable line, so
-        // a city plan taken against `watered` would be planning a different world
-        // from the one the game shows.
-        let drainage = plan_drainage(shared_test_sampler(), &terrain, &config, &watered);
-        let drain_edits: Vec<TileEdit> = drainage.by_chunk.iter().flatten().copied().collect();
-        println!(
-            "{} tiles of dry valley across {} chunks",
-            drain_edits.len(),
-            drainage.by_chunk.len()
-        );
-        assert!(
-            !drain_edits.is_empty(),
-            "the world has no dry valleys at all"
-        );
-        for edit in &drain_edits {
-            assert!(
-                !edit.kind.is_water(),
-                "the drainage stage laid {:?} at {}",
-                edit.kind,
-                edit.tile
-            );
-        }
-        let world = watered.with_edits(&drain_edits);
+        // TODO(jb-comment): why the cities are planned against the generated world
+        // directly, and that this is not the plan skipping a step.
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
+        report_water(&world);
 
         let planned = plan_cities(shared_test_sampler(), &terrain, &config, &world);
         let cities: Vec<City> = planned.iter().map(|p| p.city).collect();
         println!("{} cities", cities.len());
         assert!(!cities.is_empty(), "the world has no cities at all");
+
+        // TODO(jb-comment): why a tier count alone cannot diagnose a missing tier, and
+        // what this reports instead.
+        let cut = |excess: f32| terrain.town_threshold + excess * (1.0 - terrain.town_threshold);
+        let mut best = 0.0f32;
+        for y in (0..WORLD_TILES.y).step_by(16) {
+            for x in (0..WORLD_TILES.x).step_by(16) {
+                best = best.max(shared_test_sampler().settlement(x as f32, y as f32));
+            }
+        }
+        println!(
+            "the settlement field peaks at {best:.4}; with the {:.2} coast bonus that is \
+             {:.4}, against a Borough cut of {:.4} and a Metropolis cut of {:.4}",
+            terrain.town_coast_bonus,
+            best + terrain.town_coast_bonus,
+            cut(0.55),
+            cut(0.78),
+        );
 
         for size in [
             CitySize::Hamlet,
@@ -968,35 +592,35 @@ mod tests {
         );
     }
 
-    /// What the river stage produced, and the checks that only mean anything
-    /// against the world the game actually generates.
-    fn report_rivers(world: &WorldSnapshot, plan: &RiverPlan, edits: &[TileEdit]) {
-        let river = edits
-            .iter()
-            .filter(|edit| edit.kind == TerrainKind::River)
-            .count();
-        let lake = edits
-            .iter()
-            .filter(|edit| edit.kind == TerrainKind::ShallowWater)
-            .count();
+    /// What the flow field left in the generated world, and the checks that only
+    /// mean anything against the world the game actually generates.
+    ///
+    /// TODO(jb-doc): why this counts tiles where its predecessor counted edits.
+    fn report_water(world: &WorldSnapshot) {
+        let mut river = 0usize;
+        let mut water = 0usize;
+        let mut tiles = 0usize;
+        for y in 0..WORLD_TILES.y as i32 {
+            for x in 0..WORLD_TILES.x as i32 {
+                let kind = world
+                    .tile(IVec2::new(x, y))
+                    .expect("the whole world is inside the world");
+                tiles += 1;
+                match kind {
+                    TerrainKind::River => river += 1,
+                    kind if kind.is_water() => water += 1,
+                    _ => {}
+                }
+            }
+        }
+        let share = |count: usize| 100.0 * count as f64 / tiles as f64;
         println!(
-            "{river} tiles of river and {lake} of lake, across {} chunks — {} frames of stamping",
-            plan.by_chunk.len(),
-            plan.by_chunk
-                .len()
-                .div_ceil(WorldPlanConfig::default().river_chunks_stamped_per_frame as usize),
+            "{river} tiles of river ({:.3}% of the world) against {water} of every other \
+             water ({:.2}%)",
+            share(river),
+            share(water),
         );
         assert!(river > 0, "the world has no rivers at all");
-
-        // Water is cut into land: a channel over the sea would run a river
-        // through the middle of the ocean it is supposed to end at.
-        for edit in edits {
-            assert!(
-                !world.tile(edit.tile).expect("inside the world").is_water(),
-                "{} was already water",
-                edit.tile
-            );
-        }
     }
 
     struct Network {

@@ -1829,10 +1829,8 @@ mod measurements {
         biome::Biome,
         city::plan_cities,
         deposit::{Resource, plan_deposits},
-        drainage::plan_drainage,
         industry::EstateOffsets,
         plan::WorldPlanConfig,
-        river::plan_rivers,
         world::{WORLD_TILES, WorldSnapshot, chunk_index_of_tile},
     };
     use bevy::platform::collections::HashMap;
@@ -1859,26 +1857,9 @@ mod measurements {
 
         let industry_config = IndustryConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
-        let river_edits: Vec<TileEdit> =
-            plan_rivers(shared_test_sampler(), &terrain, &plan_config, &base)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let watered = base.with_edits(&river_edits);
-        // The drainage stage is not optional now that the industry reads the ground: a
-        // wadi moves tiles across the habitable line and onto the salt recipe's list,
-        // so a world without it is not the world the game plans against.
-        let drain_edits: Vec<TileEdit> =
-            plan_drainage(shared_test_sampler(), &terrain, &plan_config, &watered)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let planned_world = watered.with_edits(&drain_edits);
+        // TODO(jb-comment): why the water needs no staging here, and why it still
+        // matters to what this measures.
+        let planned_world = WorldSnapshot::generated(&terrain, shared_test_sampler());
         let sites = plan_deposits(shared_test_sampler(), &plan_config, &planned_world);
         let planned = plan_cities(
             shared_test_sampler(),
@@ -2259,11 +2240,9 @@ mod trade_measurements {
     use crate::gameplay::{
         city::plan_cities,
         deposit::{RESOURCE_COUNT, Resource, plan_deposits},
-        drainage::plan_drainage,
         industry::EstateOffsets,
         market::MarketConfig,
         plan::WorldPlanConfig,
-        river::plan_rivers,
         road::{RoadLink, choose_pairs, route_road},
         trade::{Caravan, Stall, TradeConfig, buy, choose, sell},
         world::{WorldSnapshot, chunk_index_of_tile},
@@ -2336,23 +2315,7 @@ mod trade_measurements {
         let market_config = MarketConfig::default();
         let trade_config = TradeConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
-        let river_edits: Vec<TileEdit> =
-            plan_rivers(shared_test_sampler(), &terrain, &plan_config, &base)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let watered = base.with_edits(&river_edits);
-        let drain_edits: Vec<TileEdit> =
-            plan_drainage(shared_test_sampler(), &terrain, &plan_config, &watered)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let planned_world = watered.with_edits(&drain_edits);
+        let planned_world = WorldSnapshot::generated(&terrain, shared_test_sampler());
         let sites = plan_deposits(shared_test_sampler(), &plan_config, &planned_world);
         let planned = plan_cities(
             shared_test_sampler(),

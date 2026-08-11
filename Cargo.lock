@@ -5156,7 +5156,7 @@ dependencies = [
 [[package]]
 name = "watershed"
 version = "0.1.0"
-source = "git+https://github.com/julianbieber/watershed?rev=559e43a1149b1839e68f848d7d7676f6e4926e9c#559e43a1149b1839e68f848d7d7676f6e4926e9c"
+source = "git+https://github.com/julianbieber/watershed?rev=7b58253ddb71d3b083eaae8df905bb01f71939e7#7b58253ddb71d3b083eaae8df905bb01f71939e7"
 dependencies = [
  "glam",
  "rayon",

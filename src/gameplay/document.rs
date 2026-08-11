@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use watershed::layer::{Blend, Layer, LayerOp, Mask, Remap, SlopeMode};
 use watershed::noise::{NoiseKind, NoiseSpec, SampleTransform, WarpSpec};
 use watershed::regions::{Region, RegionOutput, RegionSpec};
-use watershed::{Field, Terrain};
+use watershed::{Field, Terrain, WaterSpec};
 
 use crate::gameplay::biome::{
     BIOME_TABLE, HeightRecipe, WARP_CELLS, WARP_OCTAVES, WARP_X_SALT, WARP_Y_SALT,
@@ -201,7 +201,7 @@ fn shift_of(id: &str) -> u8 {
         SETTLEMENT => 0,
         // 3.1 tiles, so it cannot be coarsened either — and it is read per tile in two
         // places that matter: `river.rs` tests a spring candidate against
-        // `river_source_threshold`, and `growth.rs` a farm, the latter precisely because
+        // the channel cut, and `growth.rs` a farm, the latter precisely because
         // the field's wavelength is shorter than a city's reach. An earlier cut at shift
         // 4 came out 0.045 off the analytic sampler on average, against a threshold of
         // 0.55.
@@ -529,6 +529,16 @@ pub fn build(config: &TerrainConfig, size: UVec2) -> Terrain {
     );
 
     terrain
+}
+
+/// Where the world's water comes from, as the recipe `watershed` solves it by.
+///
+/// TODO(jb-doc): what naming a moisture field buys, and which coupling it replaces;
+/// and why the height field named here has to be the shift-0 one.
+pub fn water_spec(config: &TerrainConfig) -> WaterSpec {
+    WaterSpec::new(HEIGHT)
+        .with_moisture(HUMIDITY)
+        .with_lake_min_cells(config.lake_min_tiles)
 }
 
 /// The fields something outside this module reads once the world is generated.

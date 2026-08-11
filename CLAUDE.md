@@ -106,10 +106,13 @@ layers now, combined per tile:
   extra layers.
 
 `TerrainSampler` is the **only** implementation of "how high, how green, how wet is it here", and
-that is load-bearing outside this module: `river.rs` walks its particles downhill against it and
-`road.rs` costs its steps by it. `TerrainConfig` used to hand out a bare `NoiseField` via
-`elevation_field()`/`humidity_field()`; it hands out a sampler instead, because two implementations
-would mean rivers running up the visible hills. `settlement_field()` is the one field still raw —
+that is load-bearing outside this module: `road.rs` costs its steps by it, and the water solve fills,
+routes and accumulates over the very heightmap it reads. `TerrainConfig` used to hand out a bare
+`NoiseField` via `elevation_field()`/`humidity_field()`; it hands out a sampler instead, because two
+implementations would mean rivers running up the visible hills.
+
+TODO(jb-doc): what became of that hazard once the water was solved over the same field the relief is
+drawn from. `settlement_field()` is the one field still raw —
 `city.rs` compares scores between sites and nothing biome-dependent enters into it.
 
 Then `classify` cuts the result into bands: deep water / shallow water / **sand** / lowland /
@@ -211,25 +214,32 @@ replaced in white. Adding it is one tile and one table row.
 both: biome coherence across rivers and weather falls out of the shared sampler, with neither of those
 modules learning what a biome is.
 
-**Anything with a neighbourhood radius belongs in `gameplay/plan.rs`, not here.** A city is a disc, a
-road spans hundreds of tiles and a river is decided uphill of where it runs; none of them fits in any
-margin, which is why `Town`, `Road` and `River` are stamped over finished terrain rather than
-generated. `the_terrain_never_produces_a_town_a_road_or_a_river` guards it.
+**Anything with a neighbourhood radius belongs in `gameplay/plan.rs`, not here.** A city is a disc and
+a road spans hundreds of tiles; neither fits in any margin, which is why `Town`, `Road` and `Farmland`
+are stamped over finished terrain rather than generated.
+`the_terrain_never_produces_a_kind_the_plan_stamps` guards it.
+
+TODO(jb-doc): why `River` came off that list in gh-36 without the rule being weakened, and what
+distinction survives. See "Water" below.
 
 Everything is driven by the `TerrainConfig` resource — thresholds, scales, seed. Changing a default
 there will break `the_default_config_produces_every_base_kind`, which is the point: it guards against
 a config that quietly yields a single-biome world. The settlement figures live there but are read only
-by `gameplay/city.rs`, and the humidity ones by `gameplay/river.rs` and `gameplay/weather.rs` — the
-rivers rise where it rains and the clouds are drawn from the same field, which is why they agree.
+by `gameplay/city.rs`. The humidity field is read by the water solve, which weights each cell's flow
+by it, and by `gameplay/weather.rs`, which bakes it into the cloud map — so the rivers rise where it
+rains and the clouds are drawn from the same field, which is why they agree.
 
 Everything is driven by `TerrainConfig`; the biome recipe table lives in `biome.rs` and carries its
 measured coverage in `the_default_config_produces_recognisably_different_regions` (`cargo test
 --release -- --ignored --nocapture`, and run it *alone* — three measurement tests in parallel contend
-for CPU and inflate the per-chunk figure). At the defaults the world is 33.3% water, and every added
-tile earns its column: Scrub 12.8%, Sand 9.5%, Rock 7.4%, Gravel 5.2%, Snow 2.8%, Marsh 1.9%, Reed 1.8%.
-Biome coverage is unmoved by gh-14 — Ocean 30.6%, Forest 21.4%, Plains 15.9%, Highland 13.9%,
-Desert 11.9%, Wetland 6.4% — because the substrate layers change what *fills* a region, not where the
-regions are.
+for CPU and inflate the per-chunk figure). At the defaults the world is 34.4% water — 33.3% sea plus
+1.2% inland lake — and the tile coverage is Scrub 12.7%, Forest 12.4%, Grass 9.9%, ShallowWater 9.1%,
+Sand 8.8%, Rock 7.3%, Gravel 5.2%, Snow 2.8%, Mountain 2.5%, Marsh 1.9%, Reed 1.7%, River 0.4%,
+DeepWater 25.3%. Biome coverage is unmoved by gh-14 and by gh-36 — Ocean 30.6%, Forest 21.4%,
+Plains 15.9%, Highland 13.9%, Desert 11.9%, Wetland 6.4%.
+
+TODO(jb-doc): why the biome coverage is unmoved by both reworks; and why Sand is the one tile column
+that moved (9.5% to 8.8%).
 
 What a region is made of, which is what gh-14 was about: Plains runs Scrub 34 / Grass 23 / Forest 20 /
 Sand 13, Desert Sand 39 / Gravel 30 / Scrub 17, Wetland Marsh 26 / Reed 25 / Forest 23. Before the
@@ -243,43 +253,67 @@ unnormalised table, and the plateau turned out to be the chance floor of an 80%-
 `the_default_config_measures_the_structure_gap` prints the normalised curve for the shipped world
 against one with the layers switched off.
 
-This is the only expensive call in the crate, and it keeps getting dearer: 1.75 ms per 64×64 chunk
-originally, 3.70 ms after the biome rework, **6.58 ms** after gh-14's substrate layers — so the
-whole-world background pass is ~60 s. `MAX_BLOCKING_GENERATIONS_PER_FRAME` is 1 and there is no room to
-raise it; one chunk is already most of a 60 fps frame. Treat it as something to keep off the main thread.
+This is the only expensive call in the crate: 1.75 ms per 64×64 chunk originally, 3.70 ms after the
+biome rework, 6.58 ms after gh-14's substrate layers, and 1.40 ms now — of which gh-36's water read is
+0.07 ms. `MAX_BLOCKING_GENERATIONS_PER_FRAME` is still 1.
 
-### Rivers, cities and roads (`gameplay/plan.rs`, `river.rs`, `city.rs`, `road.rs`)
+TODO(jb-doc): why the figure fell rather than rose, why the blocking budget has not been raised to
+match, and what the 0.07 ms buys against what the same scan would cost written the obvious way.
+
+### Water (`gameplay/terrain.rs`, `watershed::water`)
+
+Since gh-36 the world's water is **read off `watershed`'s solved flow field, not stamped**. Three
+read-side cuts on two rasters, consulted per tile by `classify`:
+
+| | |
+|---|---|
+| channel (`River`) | accumulated flow over `channel_threshold`, widened by `channel_flow_per_width` out to `channel_max_half_width` |
+| lake (`ShallowWater`) | a basin labelled by `lake_min_tiles` and filled deeper than `lake_min_depth` |
+| dry valley | the same accumulation over the lower `damp_threshold`, applied through `dampened` |
+
+`river.rs` and `drainage.rs` are gone; `WorldPlan` starts at `Deposits`; the solve is the last stage
+of `TerrainBake`. `WaterSpec` names `humidity` as its moisture field.
+
+TODO(jb-doc): why `River` came off the "stamped, never generated" list and is the only kind ever to
+have done so; what the surviving distinction is that keeps `Town`, `Road` and `Farmland` on it.
+
+TODO(jb-doc): the ordering consequence — why the solve has to be the bake's last stage, and what that
+does to `WorldPlan`.
+
+TODO(jb-doc): why an area cut cannot separate a lake from the hollows a noise field leaves everywhere
+and a depth cut can; that area alone put 16.4% of the world under lake.
+
+TODO(jb-doc): why the height bands have to be asked before the flow.
+
+TODO(jb-doc): why a D8 solve yields no channel width of its own, and why the per-tile window is paid
+in integer compares rather than in `exp_m1` calls.
+
+TODO(jb-doc): how "rivers rise where it rains" survives as a weight rather than as a threshold, and
+why `river_source_threshold` has no successor.
+
+TODO(jb-doc): `surface_of` — the invariant every heightmap reader depends on, why lakes broke it, and
+why `River` is excluded from the fix.
+
+TODO(jb-doc): why the dry valleys survive the deletion of `drainage.rs` intact, and why they are
+measured as tiles the cover ladder *moves* rather than tiles it is applied to.
+
+TODO(jb-doc): why every column of every sweep comes off one solve, and why `lake_min_tiles` is the
+exception.
+
+Defaults carry their sweeps in `TerrainConfig`'s doc comments, from the `#[ignore]`d
+`the_default_config_measures_the_worlds_water`.
+
+### Cities and roads (`gameplay/plan.rs`, `city.rs`, `road.rs`)
 
 Once `WorldMap` is complete, `WorldPlan` walks one session through
-`WaitingForTerrain → Rivers → Drainage → Cities → Roads → Done`, editing tiles under the plan while the
+`WaitingForTerrain → Deposits → Cities → Roads → Done`, editing tiles under the plan while the
 player is already walking around. The in-flight tasks live *inside* the enum, so dropping the resource on leaving
 gameplay cancels them — a route planned for one world can never land in the next.
 
 The stage order is load-bearing: each stamps into `WorldMap` and the next takes its snapshot
-*afterwards*, so a city is clipped by a river the way it is clipped by a coast, and a road sees both.
-That is also why there is no `start_city_plan` — `apply_river_plan` opens the city stage itself, since
-only it knows when the last river tile is down.
+*afterwards*, so a road sees the towns it must not pave. The water is not one of these stages and used
+to be the first two of them — see "Water" above.
 
-- **Rivers** — one spring per `river_source_cell_tiles` square, kept if the tile is `Mountain` and the
-  **humidity** field clears `river_source_threshold`. Each spring is a particle walking downhill on a
-  lattice **anchored on the world origin** (same trick as roads, same reason: two particles that pass
-  through a place step between the same nodes, so paths coincide and flow accumulates). A tile's
-  channel width is its flow, capped at `MAX_RIVER_WIDTH` = 4. A step is **scored** rather than taken
-  steepest, and a segment is drawn as a curve through the node centres — see the notes below.
-- **Dry valleys** (`drainage.rs`) — the branching network the land drains through, drawn as a change of
-  ground cover rather than as water: a wadi through desert sand, a gallery treeline down a lowland
-  valley, reed along a marsh channel. **A drainage particle never floods** — that one rule is the whole
-  design. It removes the expensive half of the river stage and makes it impossible for this pass to add
-  a tile of standing water, which is what lets it land *before* the gh-9 lake retune. It paints cover
-  only, so no drainage edit costs a heightmap upload. `dampened` is the moisture ladder, and everything
-  not named in it is a fixed point — that is how "may not touch the water, the mountain bands, or the
-  plan's own kinds" is enforced, by omission rather than by a list that could fall out of step.
-  0.199% of the world, against roads at 0.24%.
-
-  Note the lattice is **16 tiles, four times the river's**, and that is what makes the stage work at
-  all: with no flood, a particle stops at the first node with nothing lower beside it, and at a 4-tile
-  stride the relief layer's fine octaves put a local minimum every few nodes. The first cut laid 404
-  tiles in the entire world. The pits are a property of the sampling scale, not of the landscape.
 - **Cities** — one candidate per `region_size_tiles` square, jittered by hash, kept if habitable and
   clearing `town_threshold`. Size tier from how far it clears; the outline is a disc whose radius
   wobbles over three hashed harmonics, clipped to habitable tiles. `City` is a component; `CityMap`
@@ -321,85 +355,14 @@ roads and bridges a river just **2** times, so the reuse-on-a-crossing path is v
 with no coverage from the measurement run. The cause is in the terrain, not the router: see the lake note
 below.
 
-Some things about rivers are worth knowing before tuning them:
+TODO(jb-doc): what the old river stage learned that is about the *terrain* rather than about the
+mechanism and so still holds — the continent layer feeding the lakes rather than trunk rivers; why a
+knob measured before the mechanism it feeds was written is not to be trusted (earned twice now);
+measuring bends as excursion rather than sinuosity; and that a river is still not `is_water()`.
 
-- **A particle never steps uphill; it floods.** With nowhere lower to go it fills the basin by
-  priority-flood, and the filled nodes are then **raised to the level they filled to** — a full basin
-  is a flat sheet of water. Without that raise the particle spills to the rim and, on its very next
-  step, walks straight back into the hollow it just filled; that bug capped every river in the world
-  at two steps. Every filled basin is recorded so the next particle can cross it; only ones over
-  `river_lake_min_tiles` are *drawn*, or each river becomes a string of beads.
-- **The terrain cannot feed the width machinery.** With a 25-tile elevation wavelength, a descent
-  meets water in a few steps, so descents rarely meet and the busiest segment in the world carries 3
-  particles. `river_flow_per_width` is 2 for that reason and channels wider than 2 essentially do not
-  occur. Real trunk rivers would need a low-frequency component in the elevation field — a terrain
-  change that moves every existing tile, not a river knob.
-- **The low-frequency component arrived, and it fed the lakes instead.** The biome rework added the
-  continent layer the note above asked for, and the result was not trunk rivers: broad low-frequency
-  minima are broad *basins*, so the priority-flood has far more to fill. The default world went from
-  ~38k river-stage edits to 264k — **26.6k tiles of river against 238k of lake**, roughly 1.4% of the
-  world under inland water. Because a lake is `ShallowWater` and a hard barrier, routes mostly go round
-  the lakes rather than over the rivers, which is why bridging fell to 2 crossings in the whole world
-  (it was 0 before the warp retune moved the regions around). Raising
-  `river_lake_min_tiles` will not help: these basins are large, not marginal. It is a river-stage
-  retune against the new terrain, and it belongs with gh-9 rather than in a heightmap change. Note the
-  count is insensitive to `Wetland`'s flatness — that was tried, and the lake total did not move by a
-  single tile.
-
-  **That last claim was true and is now wrong**, and the reason is worth keeping. It was measured
-  before `Lattice::spill` existed, when raising the threshold only stopped a basin being *drawn*. Now
-  it also links the channel across it, so the knob trades lake for river instead of deleting water:
-  64 → 256 cut inland water by 19% while nearly doubling how far a river runs. The basins really are
-  large — that part stands — but "large" turned out to mean "worth crossing", not "impossible to
-  shift". Do not trust a measurement of a knob taken before the mechanism it feeds was written.
-- **A course is scored, not steepest** (gh-9). At most nodes several neighbours are below, so which
-  one the water takes is free shape — it costs nothing against "never climbs". Spending it on
-  steepness was what made rivers straight on a slope and a 4-tile staircase where the fall line fell
-  between two lattice directions. A step is now scored on **descent** (per tile travelled, against
-  `river_reference_drop`) + **persistence** (off the heading, `river_heading_weight`) + **meander**
-  (leaning to the side, signed by a low-frequency `SignedNoiseField`, `river_meander_weight`).
-  Measuring descent against a *fixed* reference and not against the best candidate is what lets the
-  terrain decide: steep ground swamps the other terms and the river runs the fall line, gentle ground
-  lets them lead. `river_reference_drop` is the p90 drop along a real course, read off the world by
-  the `#[ignore]`d `the_shape_of_the_worlds_rivers` — do not guess it.
-
-  Two consequences that are not optional. The heading gives a particle memory, so two particles
-  meeting would score a node differently and **braid**; hence a node's successor is fixed by the first
-  particle through and followed by every later one. And on flat ground the bias is the only thing
-  steering, so a course will curl into a closed ring — hence a particle may not step onto ground it
-  has already crossed, which turns the ring into a flood.
-- **Measure bends as excursion, never as sinuosity.** The obvious metric is a trap: steepest descent
-  already scored 1.18 sinuosity, because a staircase travels 1.2x the distance it covers without ever
-  leaving the straight line. Excursion — the furthest the course swings off its own straight line —
-  is what tells a bend from a staircase, and `the_bends_come_from_the_scoring_and_not_from_the_lattice`
-  asserts it against the same world with the shape terms switched off rather than against a constant.
-- **The thing that actually lengthened the rivers was none of the above.** A basin under
-  `river_lake_min_tiles` is filled and spilled through but not drawn, and no successor was recorded
-  across it — so the channel had an **invisible hole** every few nodes, and no course ran far enough to
-  hold a bend. Linking the entry node to the outlet (`Lattice::spill`) nearly doubled the courses long
-  enough to have a shape. A basin *over* the threshold is still left unlinked, because that is a lake:
-  the river ends at its shore and a new one leaves the far side. The lattice stride was the other
-  suspect and it is innocent — swept 4 to 16 it changes nothing, because a river floods a pit where a
-  drainage particle stops at one.
-
-  This also turns `river_lake_min_tiles` into **the** length knob, since every basin under it is now
-  crossed rather than ending a course — see its doc comment for the sweep. Raising it 64 → 256 is
-  where most of the length came from.
-
-  After all of it: 46.8k tiles of river (was 26.3k, and 0.28% of the world against roads' 0.24%),
-  190.7k of lake (was 234.7k), 680 courses of 8+ nodes (was 232), p90 course 108 tiles, mean
-  excursion 0.295, 6 road bridges (was 1 — the reuse-on-a-crossing path finally has coverage).
-
-  **Inland water is still the ceiling.** 190.7k tiles of lake against 46.8k of river: a course meets a
-  drawn lake every ~110 tiles now rather than every ~20, which is why bends became visible at all, but
-  a 50-tile meander wavelength still only fits twice between lakes. Getting further is a question
-  about how many basins the continent layer makes, not about river shape, and it wants its own task.
-
-  One knob here is inert and worth knowing about before reaching for it: `river_flat_run_nodes` does
-  not change a single tile of the default world at any value from 0 to 256. Level steps are what let a
-  course wander a flood plain, and on a continuous noise field an exactly-level step essentially never
-  comes up — the cap earns its place against a *synthetic* flat world, where without it the water
-  wanders to the step cap and stops in the middle of nowhere.
+TODO(jb-doc): the two mechanisms deleted with `river.rs` that nobody should rebuild by accident —
+gh-9's scored descent (descent, heading persistence, meander bias) and what failure mode it existed to
+cure, and priority-flood with a raise, which the library does now.
 
 Config defaults in `WorldPlanConfig` carry their measurements in the doc comments; the
 `#[ignore]`d `the_default_config_lays_out_cities_of_every_size_and_roads_between_them` in `plan.rs`
@@ -1312,6 +1275,11 @@ exists while every scenario still passes. Concretely —
   from.** `observe traders` gives each wagon its tile *and the kind of ground under it*,
   because "is it on the road" is what gh-7 turns on and a scenario should not need a
   second tool — nor a human squinting at a coloured dot in a PNG — to answer it.
+  TODO(jb-doc): how `observe water` applies this rule twice over, and why `Damp` can only
+  be reported as a class at the view centre.
+- TODO(jb-doc): gh-36 added no `wait` verb — the water solve went inside `TerrainBake`, so
+  `wait bake` covers it. Why extending the stage a thing joined beats adding one beside it,
+  and what a `wait water` would have let a scenario get wrong.
 
 **Two traps in driving a world with clocks in it**, both found by getting them wrong:
 

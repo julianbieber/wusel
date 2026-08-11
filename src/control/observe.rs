@@ -24,11 +24,12 @@ use crate::{
         prospect::ProspectMaps,
         road::RoadNetwork,
         sun::{PlanetConfig, Sun},
-        terrain::TerrainKind,
+        terrain::{SurfaceWater, TerrainKind},
         trade::{Caravan, Errand, Trader},
         weather::SkySampler,
         world::{
-            BackgroundGeneration, ChunkCoord, TerrainBake, WORLD_CHUNKS, WorldMap, tile_position_at,
+            BackgroundGeneration, ChunkCoord, TerrainBake, WORLD_CHUNKS, WorldMap, WorldSampler,
+            tile_position_at,
         },
     },
     screens::Screen,
@@ -41,6 +42,7 @@ const COVER_THRESHOLD: f32 = 0.1;
 
 pub(super) enum Topic {
     Terrain,
+    Water,
     Plan,
     Camera,
     Cities,
@@ -57,6 +59,7 @@ impl Topic {
     pub(super) fn parse(word: &str) -> Result<Self, String> {
         match word {
             "terrain" => Ok(Self::Terrain),
+            "water" => Ok(Self::Water),
             "plan" => Ok(Self::Plan),
             "camera" => Ok(Self::Camera),
             "cities" => Ok(Self::Cities),
@@ -69,8 +72,8 @@ impl Topic {
             "log" => Ok(Self::Log),
             other => Err(format!(
                 "unknown observation: {other} \
-                 (terrain, plan, camera, cities, deposits, ground, sun, overlay, \
-                 screen, traders, log)"
+                 (terrain, water, plan, camera, cities, deposits, ground, sun, \
+                 overlay, screen, traders, log)"
             )),
         }
     }
@@ -79,6 +82,7 @@ impl Topic {
 pub(super) fn run(world: &mut World, topic: &Topic) -> Value {
     match topic {
         Topic::Terrain => terrain(world),
+        Topic::Water => water(world),
         Topic::Plan => plan(world),
         Topic::Camera => camera(world),
         Topic::Cities => cities(world),
@@ -243,6 +247,75 @@ fn terrain(world: &mut World) -> Value {
         "bake": bake,
         "tiles": tiles,
         "kinds": kinds,
+    })
+}
+
+/// What the flow field put on the map, and what it says about the tile in the middle
+/// of the view.
+///
+/// TODO(jb-doc): why the counts are read off `WorldMap` rather than off the solve;
+/// why the view-centre reading is reported beside them; and why `class` is the only
+/// place `Damp` can be seen at all.
+fn water(world: &mut World) -> Value {
+    let Some(map) = world.get_resource::<WorldMap>() else {
+        return json!({ "loaded": false });
+    };
+
+    let mut river = 0u64;
+    let mut standing = 0u64;
+    let mut tiles = 0u64;
+    let mut generated = 0usize;
+    for chunk in map.generated() {
+        generated += 1;
+        for kind in chunk.iter() {
+            tiles += 1;
+            match kind {
+                TerrainKind::River => river += 1,
+                kind if kind.is_water() => standing += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let centre = {
+        let mut cameras = world.query_filtered::<&Transform, With<WorldCamera>>();
+        cameras
+            .iter(world)
+            .next()
+            .map(|transform| tile_position_at(transform.translation.truncate()))
+    };
+
+    let sampler = world.get_resource::<WorldSampler>();
+    let here = centre.zip(sampler).map(|(tile, sampler)| {
+        json!({
+            "tile": [tile.x as i32, tile.y as i32],
+            "class": match sampler.0.surface_water(tile.x, tile.y) {
+                SurfaceWater::Dry => "dry",
+                SurfaceWater::Damp => "damp",
+                SurfaceWater::Channel => "channel",
+                SurfaceWater::Lake => "lake",
+            },
+            "accumulation": sampler.0.accumulation(tile.x, tile.y),
+        })
+    });
+
+    let share = |count: u64| (tiles > 0).then(|| count as f64 / tiles as f64);
+
+    json!({
+        "loaded": true,
+        "solved": world
+            .get_resource::<WorldSampler>()
+            .map(|sampler| sampler.0.lakes().is_some()),
+        "lakes": world
+            .get_resource::<WorldSampler>()
+            .and_then(|sampler| sampler.0.lakes()),
+        "generated_chunks": generated,
+        "tiles": tiles,
+        "river_tiles": river,
+        "river_fraction": share(river),
+        "standing_water_tiles": standing,
+        "standing_water_fraction": share(standing),
+        "here": here,
     })
 }
 
@@ -663,8 +736,6 @@ fn screen(world: &mut World) -> Value {
 pub(super) fn plan_stage(plan: &WorldPlan) -> &'static str {
     match plan {
         WorldPlan::WaitingForTerrain => "waiting-for-terrain",
-        WorldPlan::Rivers(_) => "rivers",
-        WorldPlan::Drainage(_) => "drainage",
         WorldPlan::Deposits(_) => "deposits",
         WorldPlan::Cities(_) => "cities",
         WorldPlan::Roads(_) => "roads",

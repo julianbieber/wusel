@@ -508,13 +508,7 @@ mod measurements {
     use super::*;
     use crate::gameplay::terrain::TerrainConfig;
     use crate::gameplay::terrain::shared_test_sampler;
-    use crate::gameplay::{
-        city::plan_cities,
-        drainage::plan_drainage,
-        industry::IndustryConfig,
-        river::plan_rivers,
-        world::{TileEdit, WorldSnapshot},
-    };
+    use crate::gameplay::{city::plan_cities, industry::IndustryConfig, world::WorldSnapshot};
 
     /// Where the figures in `WorldPlanConfig`'s deposit doc comments come from.
     ///
@@ -523,32 +517,15 @@ mod measurements {
     /// terrain it made up. Ignored because it generates all 4096 chunks:
     /// `cargo test --release -- --ignored --nocapture`, and run it *alone*.
     ///
-    /// The drainage stage is not optional here for the reason the plan runs it: a
-    /// wadi turns desert `Sand` into `Scrub` and a marsh channel into `Reed`, both of
-    /// which move ground onto and off the salt recipe's list.
+    /// TODO(jb-doc): why the dry valleys no longer have to be staged here, and what
+    /// they still do to the ground a salt recipe is read off.
     #[test]
     #[ignore = "generates the whole 4096x4096 world"]
     fn the_default_config_lays_seams_of_every_resource() {
         let terrain = TerrainConfig::default();
         let config = WorldPlanConfig::default();
 
-        let base = WorldSnapshot::generated(&terrain, shared_test_sampler());
-        let river_edits: Vec<TileEdit> =
-            plan_rivers(shared_test_sampler(), &terrain, &config, &base)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let watered = base.with_edits(&river_edits);
-        let drain_edits: Vec<TileEdit> =
-            plan_drainage(shared_test_sampler(), &terrain, &config, &watered)
-                .by_chunk
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-        let world = watered.with_edits(&drain_edits);
+        let world = WorldSnapshot::generated(&terrain, shared_test_sampler());
 
         // The cities, so the sweep can report the figure the knob is actually chosen
         // against: a seam nobody can reach is one the simulation never sees, so what

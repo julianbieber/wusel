@@ -7,6 +7,8 @@
 //! *tiling* field: it exists so the weather overlay can bake one period into a texture
 //! and scroll it forever, and a terrain library has no use for a world that repeats.
 //!
+//! TODO(jb-doc): that nothing untiled is left, what went with `river.rs` and why.
+//!
 //! The hash stays here because the tiling field needs it and because it is the same
 //! `hash2` the library uses — the two agree by construction, and
 //! `the_lattice_hands_back_the_numbers_it_always_has` guards the numbers on both sides.
@@ -19,51 +21,6 @@ const NOISE_LACUNARITY: f32 = 2.0;
 /// align and gradient noise peaks well below 1. Stretching it around the midpoint
 /// makes the terrain thresholds mean what they say on a [0, 1] scale.
 const NOISE_GAIN: f32 = 2.6;
-
-/// The same fbm read as a **signed** displacement rather than as a height.
-///
-/// Every other field here is remapped to [0, 1], because everything else asks it
-/// "how high / how green / how wet". A meander bias asks "which way does the
-/// water lean here", and that question has no natural zero at 0.5 — it has one at
-/// 0, where the river runs straight. Remapping and then subtracting a half would
-/// give the same numbers only until someone changed [`NOISE_GAIN`], which is
-/// tuned for the terrain thresholds and not for this.
-///
-/// Deliberately few octaves. The value of the field is that its *sign* holds over
-/// tens of tiles and then reverses — that alternation is what a meander is — and
-/// a fine octave on top only adds a wobble that the lattice cannot represent
-/// anyway.
-pub struct SignedNoiseField {
-    offset: Vec2,
-    scale: f32,
-    octaves: u32,
-}
-
-impl SignedNoiseField {
-    pub fn new(seed: u32, salt: u32, scale: f32, octaves: u32) -> Self {
-        let h = hash2(seed as i32, salt as i32);
-        Self {
-            offset: Vec2::new((h & 0xffff) as f32 / 64.0, (h >> 16) as f32 / 64.0),
-            scale,
-            octaves,
-        }
-    }
-
-    /// Sample at a global tile position, in [-1, 1]. Stretched by the same
-    /// reasoning as [`NOISE_GAIN`] — raw fbm rarely gets near its nominal range,
-    /// so an unstretched field would lean the water only feebly and never commit
-    /// to a side.
-    pub fn sample(&self, x: f32, y: f32) -> f32 {
-        let n = fbm(
-            x * self.scale + self.offset.x,
-            y * self.scale + self.offset.y,
-            self.octaves,
-            NOISE_PERSISTENCE,
-            NOISE_LACUNARITY,
-        );
-        (n * NOISE_GAIN).clamp(-1.0, 1.0)
-    }
-}
 
 /// One fbm field that repeats exactly every `period` noise units in both axes.
 ///
@@ -143,14 +100,10 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + t * (b - a)
 }
 
-/// 2D gradient (Perlin-style) noise, returns values roughly in [-1, 1].
-pub fn gradient_noise_2d(x: f32, y: f32) -> f32 {
-    gradient_noise_with(x, y, gradient)
-}
-
-/// The same lattice, with the corner lookups wrapped, so the noise repeats every
-/// `period` units. Generic over the lookup so the untiled path above monomorphizes
-/// to exactly what it was before — this is the only interpolation in the crate.
+/// The lattice with its corner lookups wrapped, so the noise repeats every `period`
+/// units.
+///
+/// TODO(jb-doc): why it is still generic over the lookup now that nothing else uses it.
 fn tiling_gradient_noise_2d(x: f32, y: f32, period: i32) -> f32 {
     gradient_noise_with(x, y, |ix, iy| {
         gradient(ix.rem_euclid(period), iy.rem_euclid(period))
@@ -186,33 +139,8 @@ fn gradient_noise_with(x: f32, y: f32, grad: impl Fn(i32, i32) -> (f32, f32)) ->
     lerp(nx0, nx1, v)
 }
 
-/// Fractal Brownian Motion: sums multiple octaves of gradient noise
-/// with increasing frequency and decreasing amplitude, then normalizes.
-pub fn fbm(
-    x: f32,
-    y: f32,
-    octaves: u32,
-    persistence: f32, // amplitude multiplier per octave, e.g. 0.5
-    lacunarity: f32,  // frequency multiplier per octave, e.g. 2.0
-) -> f32 {
-    let mut total = 0.0;
-    let mut amplitude = 1.0;
-    let mut frequency = 1.0;
-    let mut max_amplitude = 0.0;
-
-    for _ in 0..octaves {
-        total += gradient_noise_2d(x * frequency, y * frequency) * amplitude;
-        max_amplitude += amplitude;
-        amplitude *= persistence;
-        frequency *= lacunarity;
-    }
-
-    // Normalize so output stays roughly in [-1, 1] regardless of octave count.
-    total / max_amplitude
-}
-
-/// [`fbm`], with every octave's lattice wrapped so the sum repeats every `period`
-/// units. Octave `n` runs at `period * lacunarity^n` lattice cells, which is why the
+/// Fractal Brownian Motion, with every octave's lattice wrapped so the sum repeats
+/// every `period` Octave `n` runs at `period * lacunarity^n` lattice cells, which is why the
 /// period has to be a power of two.
 pub fn tiling_fbm(
     x: f32,
