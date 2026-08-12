@@ -31,7 +31,7 @@ use crate::{
         sun::{PlanetConfig, Sun},
         trade::RoadGraph,
         weather::WeatherMaps,
-        world::{BackgroundGeneration, tile_translation},
+        world::{BackgroundGeneration, TerrainBake, tile_translation},
     },
     screens::Screen,
 };
@@ -85,6 +85,8 @@ pub(super) enum Command {
 }
 
 pub(super) enum Condition {
+    /// The field bake — the stage every tile waits on.
+    Bake,
     Terrain,
     Plan,
     Sky,
@@ -398,6 +400,7 @@ impl Command {
 impl Condition {
     fn parse(word: &str) -> Result<Self, String> {
         match word {
+            "bake" => Ok(Self::Bake),
             "terrain" => Ok(Self::Terrain),
             "plan" => Ok(Self::Plan),
             "sky" => Ok(Self::Sky),
@@ -407,13 +410,14 @@ impl Condition {
             "main" | "help" | "gameplay" => Ok(Self::Screen(screen(word)?)),
             other => Err(format!(
                 "unknown wait condition: {other} \
-                 (terrain, plan, sky, ground, prospect, traders, main, help, gameplay)"
+                 (bake, terrain, plan, sky, ground, prospect, traders, main, help, gameplay)"
             )),
         }
     }
 
     fn name(&self) -> &'static str {
         match self {
+            Self::Bake => "bake",
             Self::Terrain => "terrain",
             Self::Plan => "plan",
             Self::Sky => "sky",
@@ -426,6 +430,14 @@ impl Condition {
 
     fn met(&self, world: &World) -> bool {
         match self {
+            // The field bake, which every tile in the world waits on: a chunk cannot be
+            // generated until the document it is cut from has been evaluated, and that
+            // runs on the task pool a field at a time. `wait terrain` is *not* a
+            // substitute — it is satisfied by a world with no chunks left to generate,
+            // and before the bake lands there are none being generated at all.
+            Self::Bake => world
+                .get_resource::<TerrainBake>()
+                .is_some_and(TerrainBake::is_complete),
             Self::Terrain => world
                 .get_resource::<BackgroundGeneration>()
                 .is_some_and(BackgroundGeneration::is_complete),
@@ -456,6 +468,16 @@ impl Condition {
     /// a bug report nobody can act on.
     fn progress(&self, world: &World) -> String {
         match self {
+            Self::Bake => match world.get_resource::<TerrainBake>() {
+                Some(bake) => {
+                    let (done, total) = bake.progress();
+                    match bake.last_field() {
+                        Some(field) => format!("baked {done} of {total} fields, last was {field}"),
+                        None => format!("baked {done} of {total} fields"),
+                    }
+                }
+                None => "no world is loaded".into(),
+            },
             Self::Terrain => match world.get_resource::<BackgroundGeneration>() {
                 Some(generation) => format!("{} chunks still to generate", generation.remaining()),
                 None => "no world is loaded".into(),

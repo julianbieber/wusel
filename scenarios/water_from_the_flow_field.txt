@@ -1,0 +1,55 @@
+# The rivers and lakes exist before the plan does.
+#
+# Run with:  just drive run scenarios/water_from_the_flow_field.txt
+#
+# TODO(jb-comment): what this scenario asserts that a capture cannot, and why asking
+# `observe water` before the plan has run is the whole point of it.
+
+fixed-delta 1/60
+
+enter gameplay
+
+# The field bake, and the water solve that is its last stage.
+wait bake
+
+# TODO(jb-comment): what `observe plan` must and must not say at this point.
+observe plan
+
+# `observe log` drains, so it has to come before any other call to it.
+observe log
+
+# TODO(jb-comment): why the river count is worth reading here, over a world only
+# partly generated.
+observe water
+
+wait terrain
+
+observe water
+observe terrain
+
+capture /tmp/wusel-scenario/water-origin.png
+
+# TODO(jb-comment): what a lake should look like on the height overlay, and which
+# invariant that is checking.
+overlay height
+capture /tmp/wusel-scenario/water-height.png
+observe overlay
+overlay off
+
+# TODO(jb-comment): the relation between this field and the water, and why the pair
+# is worth capturing together.
+overlay moisture
+capture /tmp/wusel-scenario/water-moisture.png
+overlay off
+
+# 480 frames at 512 units a second is ~4096 units, which is 512 tiles east.
+hold D 480
+observe camera
+observe water
+capture /tmp/wusel-scenario/water-east.png
+
+wait plan
+observe plan
+observe water
+
+observe log

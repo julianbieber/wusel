@@ -25,6 +25,7 @@
 //!
 //! Nothing here outlives [`Screen::Gameplay`] except the knobs.
 
+use crate::gameplay::world::WorldSampler;
 use bevy::{
     asset::RenderAssetUsages,
     image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor},
@@ -215,6 +216,10 @@ impl Plugin for WeatherPlugin {
         app.init_resource::<WeatherConfig>();
         app.add_plugins(ExtractResourcePlugin::<WeatherMaps>::default());
         app.add_systems(OnEnter(Screen::Gameplay), start_weather_bake);
+        app.add_systems(
+            Update,
+            start_weather_maps_bake.run_if(resource_added::<WorldSampler>),
+        );
         app.add_systems(OnExit(Screen::Gameplay), end_weather);
         app.add_systems(
             Update,
@@ -244,10 +249,26 @@ fn start_weather_bake(
     // as any other. It goes in beside the clock and out beside it, so nothing can
     // read one session's weather against the next session's world.
     commands.insert_resource(SkySampler::new(&terrain, &config));
+}
 
+/// Starts the map bake, the frame the terrain's own bake finishes.
+///
+/// **Not in `OnEnter` any more, and the reason is the document.** The probability map is
+/// `TerrainSampler::humidity` over the whole world, and since the sampler reads a baked
+/// document there is nothing to read until that bake lands. The sky is clear until then,
+/// which is the fallback this module already documents — so the wait costs nothing that
+/// was not already a stated state.
+fn start_weather_maps_bake(
+    mut commands: Commands,
+    sampler: Res<WorldSampler>,
+    terrain: Res<TerrainConfig>,
+    config: Res<WeatherConfig>,
+) {
+    let sampler = sampler.0.clone();
     let terrain = terrain.clone();
     let config = config.clone();
-    let task = AsyncComputeTaskPool::get().spawn(async move { bake_maps(&terrain, &config) });
+    let task =
+        AsyncComputeTaskPool::get().spawn(async move { bake_maps(&sampler, &terrain, &config) });
     commands.insert_resource(WeatherBake(task));
 }
 
@@ -490,19 +511,20 @@ impl SkySampler {
 /// Bakes both maps. Called on the compute pool: this is ~260k fbm samples for the
 /// probability map alone, which is ~50 ms — the same order as the chunk generation
 /// the first gameplay frame is already doing, and no reason to add to it.
-fn bake_maps(terrain: &TerrainConfig, config: &WeatherConfig) -> BakedMaps {
+fn bake_maps(
+    sampler: &TerrainSampler,
+    terrain: &TerrainConfig,
+    config: &WeatherConfig,
+) -> BakedMaps {
     BakedMaps {
-        probability: bake_probability_map(terrain, config),
+        probability: bake_probability_map(sampler, config),
         shape: bake_shape_map(terrain, config),
     }
 }
 
-fn bake_probability_map(terrain: &TerrainConfig, config: &WeatherConfig) -> Image {
+fn bake_probability_map(sampler: &TerrainSampler, config: &WeatherConfig) -> Image {
     let side = config.probability_texels_per_side.max(1);
     let tiles_per_texel = WORLD_TILES.x as f32 / side as f32;
-    // Hoisted out of the loop: one sampler for the whole map, since building it
-    // costs six noise fields and a biome map.
-    let sampler = terrain.sampler();
 
     let mut texels = Vec::with_capacity((side * side) as usize);
     for y in 0..side {
@@ -510,7 +532,7 @@ fn bake_probability_map(terrain: &TerrainConfig, config: &WeatherConfig) -> Imag
             // The texel's centre, so the map is the humidity field at the points it
             // claims to sample rather than at their corners.
             let tile = (Vec2::new(x as f32, y as f32) + Vec2::splat(0.5)) * tiles_per_texel;
-            texels.push(to_byte(cloud_probability_at(&sampler, tile)));
+            texels.push(to_byte(cloud_probability_at(sampler, tile)));
         }
     }
 

@@ -17,6 +17,9 @@ tracing = { version = "0.1", features = [
     "max_level_debug",
     "release_max_level_warn",
 ] }
+# TODO(jb-comment): why this is pinned to a revision rather than tracking a branch, and
+# what bumping it costs — both repos move together while the split is in progress.
+watershed = { git = "https://github.com/julianbieber/watershed", rev = "7b58253ddb71d3b083eaae8df905bb01f71939e7" }
 
 # Idiomatic Bevy code often triggers these lints, and the CI workflow treats them as errors.
 # In some cases they may still signal poor code quality however, so consider commenting out these lines.
